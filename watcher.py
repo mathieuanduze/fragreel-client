@@ -94,7 +94,7 @@ class DemoHandler(FileSystemEventHandler):
             self._handle(Path(event.dest_path))
 
 
-def watch(demo_dir: Path, steamid: str) -> None:
+def watch(demo_dir: Path, steamid: str, stop_event=None) -> None:
     log.info(f"Watching: {demo_dir} | SteamID: {steamid}")
     notify("FragReel", f"Monitorando demos em {demo_dir.name}. Pode jogar!")
 
@@ -105,6 +105,8 @@ def watch(demo_dir: Path, steamid: str) -> None:
 
     try:
         while observer.is_alive():
+            if stop_event and stop_event.is_set():
+                break
             time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
         pass

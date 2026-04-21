@@ -7,7 +7,7 @@ from config import DASHBOARD_URL
 
 
 def notify(title: str, message: str, match_id: "str | None" = None) -> None:
-    """Show a desktop notification. Clicking it opens the dashboard."""
+    """Show a desktop notification."""
     try:
         from plyer import notification
         notification.notify(
@@ -17,10 +17,13 @@ def notify(title: str, message: str, match_id: "str | None" = None) -> None:
             timeout=10,
         )
     except Exception:
-        # plyer not available or notification failed — silent fallback
         print(f"[notify] {title}: {message}")
 
 
 def open_match(match_id: str) -> None:
-    url = f"{DASHBOARD_URL.rstrip('/dashboard')}/match/{match_id}"
+    url = f"{DASHBOARD_URL.rstrip('/')}/match/{match_id}"
     webbrowser.open(url)
+
+
+def open_dashboard() -> None:
+    webbrowser.open(DASHBOARD_URL)
