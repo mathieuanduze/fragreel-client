@@ -61,7 +61,7 @@ def _upload_demo(
         if status not in ("parsed", "queued"):
             return
 
-        # ── Extrair clipes se o recorder estiver ativo ─────────────────────
+        # ── Extrair e fazer upload dos clipes ──────────────────────────────
         clips: list[Path] = []
         if recorder is not None and getattr(recorder, "is_recording", False) and n_hlights > 0:
             try:
@@ -70,8 +70,10 @@ def _upload_demo(
                     match_dur = _estimate_match_duration(highlights)
                     out_dir   = CLIPS_DIR / match_id
                     clips     = recorder.extract_clips(highlights, match_dur, out_dir)  # type: ignore[attr-defined]
+                    if clips:
+                        _upload_clips(match_id, clips)
             except Exception as e:
-                log.error(f"Erro ao extrair clipes: {e}")
+                log.error(f"Erro ao extrair/enviar clipes: {e}")
 
         # ── Notificação ─────────────────────────────────────────────────────
         if clips:
@@ -112,6 +114,26 @@ def _fetch_highlights(match_id: str) -> list[dict]:
             pass
         time.sleep(5)
     return []
+
+
+def _upload_clips(match_id: str, clips: list[Path]) -> None:
+    """Faz upload dos clipes extraídos para a API."""
+    log.info(f"Enviando {len(clips)} clipes para a API...")
+    uploaded = 0
+    for clip in clips:
+        try:
+            with clip.open("rb") as f:
+                resp = requests.post(
+                    f"{API_URL}/clips/{match_id}",
+                    files={"file": (clip.name, f, "video/mp4")},
+                    timeout=300,
+                )
+            resp.raise_for_status()
+            uploaded += 1
+            log.info(f"Clipe enviado: {clip.name}")
+        except Exception as e:
+            log.error(f"Falha ao enviar {clip.name}: {e}")
+    log.info(f"{uploaded}/{len(clips)} clipes enviados com sucesso.")
 
 
 def _estimate_match_duration(highlights: list[dict]) -> float:
