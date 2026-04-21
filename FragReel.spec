@@ -1,8 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec for FragReel Windows client
-# Build with: pyinstaller FragReel.spec
-
-block_cipher = None
+# Built automatically by GitHub Actions on every push to main.
+# To build locally on Windows: pyinstaller FragReel.spec
 
 a = Analysis(
     ['main.py'],
@@ -20,13 +19,10 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
@@ -42,11 +38,11 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,          # False = sem janela preta no Windows
+    console=False,          # Sem janela preta no Windows
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,              # Adicionar .ico aqui quando tiver
+    icon=None,
 )
