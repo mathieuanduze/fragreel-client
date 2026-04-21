@@ -1,17 +1,23 @@
 """
 File watcher — monitors the CS2 demo folder and triggers processing
 whenever a new .dem file is fully written.
+
+Após o upload:
+  1. API parseia a demo e retorna highlights com timestamps
+  2. Se o Recorder estiver ativo, extrai os clipes de vídeo automaticamente
+  3. Clipes salvos em ~/Videos/FragReel/{match_id}/
 """
 import time
 import threading
 import logging
 from pathlib import Path
+from typing import Optional
 
 import requests
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileMovedEvent
 
-from config import API_URL, MIN_DEMO_BYTES, POLL_INTERVAL
+from config import API_URL, MIN_DEMO_BYTES, POLL_INTERVAL, CLIPS_DIR
 from notifier import notify, open_match
 
 log = logging.getLogger("fragreel.watcher")
@@ -28,9 +34,13 @@ def _is_ready(path: Path) -> bool:
         return False
 
 
-def _upload_demo(demo_path: Path, steamid: str) -> None:
+def _upload_demo(
+    demo_path: Path,
+    steamid: str,
+    recorder: "Optional[object]" = None,
+) -> None:
     log.info(f"Uploading demo: {demo_path.name}")
-    notify("FragReel", f"Nova partida detectada: {demo_path.stem}. Processando highlights...")
+    notify("FragReel", f"Nova partida detectada! Analisando highlights...")
 
     try:
         with demo_path.open("rb") as f:
@@ -44,26 +54,78 @@ def _upload_demo(demo_path: Path, steamid: str) -> None:
         data = resp.json()
         log.info(f"API response: {data}")
 
-        match_id = data.get("match_id") or demo_path.stem
-        if data.get("status") in ("parsed", "queued"):
+        match_id   = data.get("match_id") or demo_path.stem
+        n_hlights  = data.get("highlights", 0)
+        status     = data.get("status")
+
+        if status not in ("parsed", "queued"):
+            return
+
+        # ── Extrair clipes se o recorder estiver ativo ─────────────────────
+        clips: list[Path] = []
+        if recorder is not None and getattr(recorder, "is_recording", False) and n_hlights > 0:
+            try:
+                highlights = _fetch_highlights(match_id)
+                if highlights:
+                    match_dur = _estimate_match_duration(highlights)
+                    out_dir   = CLIPS_DIR / match_id
+                    clips     = recorder.extract_clips(highlights, match_dur, out_dir)  # type: ignore[attr-defined]
+            except Exception as e:
+                log.error(f"Erro ao extrair clipes: {e}")
+
+        # ── Notificação ─────────────────────────────────────────────────────
+        if clips:
             notify(
-                "FragReel · Highlights prontos!",
-                f"{data.get('highlights', '?')} highlights encontrados. Clique para ver.",
+                "FragReel · Clipes prontos! 🎬",
+                f"{len(clips)} clipes salvos. Abrindo no site...",
                 match_id=match_id,
             )
-            open_match(match_id)
+        elif n_hlights > 0:
+            notify(
+                "FragReel · Highlights prontos!",
+                f"{n_hlights} highlights encontrados em {data.get('map','?')}.",
+                match_id=match_id,
+            )
+        else:
+            notify("FragReel", "Demo processada. Nenhum highlight encontrado.")
+
+        open_match(match_id)
 
     except requests.exceptions.ConnectionError:
-        log.error("FragReel API offline. Demo será reprocessada quando o servidor voltar.")
+        log.error("FragReel API offline.")
         notify("FragReel", "API offline. Verifique sua conexão.")
     except Exception as e:
         log.error(f"Upload failed: {e}")
         notify("FragReel", f"Erro ao processar demo: {e}")
 
 
+def _fetch_highlights(match_id: str) -> list[dict]:
+    """Busca os highlights da API com retry (parse pode demorar alguns segundos)."""
+    for attempt in range(6):
+        try:
+            r = requests.get(f"{API_URL}/matches/{match_id}", timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("highlights"):
+                return data["highlights"]
+        except Exception:
+            pass
+        time.sleep(5)
+    return []
+
+
+def _estimate_match_duration(highlights: list[dict]) -> float:
+    """Usa o timestamp mais alto dos highlights como estimativa de duração da partida."""
+    if not highlights:
+        return 1800.0   # 30 min fallback
+    max_end = max(h.get("end", 0) for h in highlights)
+    return max_end + 60.0   # +60s de margem após o último highlight
+
+
 class DemoHandler(FileSystemEventHandler):
-    def __init__(self, steamid: str):
-        self.steamid = steamid
+    def __init__(self, steamid: str, recorder: "Optional[object]" = None):
+        self.steamid   = steamid
+        self.recorder  = recorder
         self._processing: set[str] = set()
         self._lock = threading.Lock()
 
@@ -77,7 +139,7 @@ class DemoHandler(FileSystemEventHandler):
         def run():
             try:
                 if _is_ready(path):
-                    _upload_demo(path, self.steamid)
+                    _upload_demo(path, self.steamid, recorder=self.recorder)
             finally:
                 with self._lock:
                     self._processing.discard(key)
@@ -94,11 +156,17 @@ class DemoHandler(FileSystemEventHandler):
             self._handle(Path(event.dest_path))
 
 
-def watch(demo_dir: Path, steamid: str, stop_event=None) -> None:
+def watch(
+    demo_dir: Path,
+    steamid: str,
+    stop_event=None,
+    recorder: "Optional[object]" = None,
+) -> None:
     log.info(f"Watching: {demo_dir} | SteamID: {steamid}")
-    notify("FragReel", f"Monitorando demos em {demo_dir.name}. Pode jogar!")
+    rec_status = "Gravação ativa 🔴" if recorder else "Sem gravação"
+    notify("FragReel", f"Monitorando CS2. {rec_status}. Pode jogar!")
 
-    handler = DemoHandler(steamid=steamid)
+    handler = DemoHandler(steamid=steamid, recorder=recorder)
     observer = Observer()
     observer.schedule(handler, str(demo_dir), recursive=False)
     observer.start()

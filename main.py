@@ -70,9 +70,30 @@ def main() -> None:
 
         start_tray_thread(on_quit=on_quit, on_open=open_dashboard, demo_dir=demo_dir_str)
 
+    # ── Recorder (grava CS2 em background se habilitado) ────────────
+    recorder = None
+    from config import RECORDING_ENABLED
+    if RECORDING_ENABLED:
+        from recorder import Recorder
+        from cs2_monitor import start_monitor_thread
+        recorder = Recorder()
+
+        def _on_cs2_start():
+            recorder.start()
+            # Atualiza status no tray se disponível
+            log.info("CS2 detectado → gravação iniciada")
+
+        def _on_cs2_stop():
+            # Não para imediatamente: espera o .dem ser processado
+            # O recorder.stop() é chamado pelo watcher depois da extração
+            log.info("CS2 fechado → aguardando processamento do .dem")
+
+        start_monitor_thread(_on_cs2_start, _on_cs2_stop, stop_event=_stop_event)
+        log.info("Recorder pronto. Aguardando CS2...")
+
     # ── Start watcher ───────────────────────────────────────────────
     from watcher import watch
-    watch(demo_dir=demo_dir, steamid=steamid, stop_event=_stop_event)
+    watch(demo_dir=demo_dir, steamid=steamid, stop_event=_stop_event, recorder=recorder)
 
 
 if __name__ == "__main__":
