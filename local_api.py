@@ -190,8 +190,18 @@ def create_app(
 
         render_id = body.get("render_id") or uuid.uuid4().hex[:12]
         force = bool(body.get("force", False))
+        # `reel_props` is the full ReelProps payload from the server's
+        # /matches/{id}/render-plan endpoint (match, selectedRanks, mood,
+        # playerName, orientation). Runner injects per-segment .mov paths
+        # into match.highlights[*].gameplayVideoSrc before calling Remotion.
+        reel_props = body.get("reel_props")
         try:
-            session = render_coordinator.start(plan, render_id, force_kill_cs2=force)
+            session = render_coordinator.start(
+                plan,
+                render_id,
+                force_kill_cs2=force,
+                reel_props=reel_props,
+            )
         except RenderCoordinator.CS2BusyError as e:
             return {
                 "error": "cs2_running",
@@ -223,6 +233,7 @@ def create_app(
 def _build_render_coordinator() -> Optional[RenderCoordinator]:
     """Auto-detect CS2 + HLAE + output dir and build a coordinator.
 
+    On first run, downloads HLAE + ffmpeg into vendor/ via setup_vendor.
     Returns None if the PC isn't set up for rendering (e.g., dev machine
     without CS2 installed) — the endpoints then return 503 and the web UI
     degrades gracefully.
@@ -233,9 +244,23 @@ def _build_render_coordinator() -> Optional[RenderCoordinator]:
         log.warning("no CS2 installation detected; render endpoints disabled")
         return None
     cs2_install = roots[0]
-    hlae_dir = Path(__file__).parent / "vendor" / "hlae"
+
+    # First-run vendor bootstrap. Only attempts download on Windows since
+    # HLAE is a Win32 binary; on other OSes we just check for a pre-staged
+    # vendor (e.g. CI builds on linux for testing the code paths).
+    try:
+        from setup_vendor import default_layout, ensure_vendor
+        layout = default_layout()
+        if not layout.is_complete():
+            log.info("vendor incomplete at %s — downloading HLAE + ffmpeg", layout.vendor_root)
+            ensure_vendor(layout=layout)
+        hlae_dir = layout.hlae_dir
+    except Exception as e:
+        log.warning("setup_vendor failed (%s); render endpoints disabled", e)
+        return None
+
     if not hlae_dir.exists():
-        log.warning("vendor/hlae not found at %s; render endpoints disabled", hlae_dir)
+        log.warning("vendor/hlae missing at %s; render endpoints disabled", hlae_dir)
         return None
     output_dir = Path.home() / "Desktop" / "FragReel"
     editor_dir = Path(__file__).parent.parent / "main" / "editor"

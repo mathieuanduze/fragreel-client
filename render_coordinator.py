@@ -72,7 +72,9 @@ class RenderSession:
     progress: float = 0.0
     frames_captured: int = 0
     frames_expected: int = 0
-    output_mov: Path | None = None
+    segments_total: int = 0
+    segments_done: int = 0  # how many takes have a finished .mov
+    output_movs: tuple[Path, ...] = ()  # one per segment
     output_mp4: Path | None = None
     error: str | None = None
     started_at: float | None = None
@@ -86,7 +88,9 @@ class RenderSession:
             "progress": round(self.progress, 3),
             "frames_captured": self.frames_captured,
             "frames_expected": self.frames_expected,
-            "output_mov": str(self.output_mov) if self.output_mov else None,
+            "segments_total": self.segments_total,
+            "segments_done": self.segments_done,
+            "output_movs": [str(p) for p in self.output_movs],
             "output_mp4": str(self.output_mp4) if self.output_mp4 else None,
             "error": self.error,
             "started_at": self.started_at,
@@ -152,6 +156,7 @@ class RenderCoordinator:
         render_id: str,
         *,
         force_kill_cs2: bool = False,
+        reel_props: dict | None = None,
     ) -> RenderSession:
         """Start a render if one isn't already active. Returns the session.
 
@@ -180,10 +185,11 @@ class RenderCoordinator:
                 stage="preparing capture script",
                 started_at=time.time(),
                 frames_expected=self._estimate_frames(plan),
+                segments_total=len(plan.segments),
             )
             self._thread = threading.Thread(
                 target=self._run,
-                args=(plan,),
+                args=(plan, reel_props),
                 daemon=True,
                 name=f"fragreel-render-{render_id}",
             )
@@ -202,7 +208,7 @@ class RenderCoordinator:
 
     # -- stage runner -------------------------------------------------------
 
-    def _run(self, plan: RenderPlan) -> None:
+    def _run(self, plan: RenderPlan, reel_props: dict | None = None) -> None:
         try:
             self._runner = HlaeRunner(self.config)
 
@@ -257,7 +263,7 @@ class RenderCoordinator:
             )
             self._update(
                 progress=PROGRESS_STAGING + PROGRESS_LAUNCHING + PROGRESS_CAPTURING,
-                stage=f"captured {result.frame_count} frames",
+                stage=f"captured {result.total_frames} frames across {len(result.takes)} take(s)",
             )
 
             # Always close CS2 once capture is done — the user shouldn't have
@@ -267,23 +273,35 @@ class RenderCoordinator:
             if self._cancel_requested.is_set():
                 return self._mark_cancelled()
 
-            # Stage 4: ffmpeg TGA → ProRes .mov
-            mov_path = self.output_dir / f"{plan.demo_basename}.mov"
-            self._update(state="converting", stage="encoding ProRes", progress=PROGRESS_STAGING + PROGRESS_LAUNCHING + PROGRESS_CAPTURING + PROGRESS_CONVERTING / 2)
+            # Stage 4: ffmpeg TGA → ProRes .mov (one per take)
+            mov_dir = self.output_dir / plan.demo_basename
+            self._update(
+                state="converting",
+                stage=f"encoding {len(result.takes)} ProRes file(s)",
+                progress=PROGRESS_STAGING + PROGRESS_LAUNCHING + PROGRESS_CAPTURING
+                + PROGRESS_CONVERTING / 2,
+            )
             try:
-                self._runner.convert_tga_to_prores(result, mov_path)
+                result = self._runner.convert_takes_to_prores(
+                    result, mov_dir, basename=plan.demo_basename,
+                )
+                movs = tuple(t.mov_path for t in result.takes if t.mov_path)
                 with self._lock:
                     if self._session:
-                        self._session.output_mov = mov_path
+                        self._session.output_movs = movs
+                        self._session.segments_done = len(movs)
             except RuntimeError as e:
                 # Very common failure mode when ffmpeg isn't installed yet;
                 # keep the TGAs available so user can convert later and don't
                 # destroy progress by raising.
                 log.warning("ffmpeg stage skipped: %s", e)
                 self._update(stage=f"capture only (ffmpeg missing: {e})")
-                self._mark_done_partial(result.take_dir)
+                self._mark_done_partial(result.takes[0].take_dir if result.takes else None)
                 return
-            self._update(progress=PROGRESS_STAGING + PROGRESS_LAUNCHING + PROGRESS_CAPTURING + PROGRESS_CONVERTING)
+            self._update(
+                progress=PROGRESS_STAGING + PROGRESS_LAUNCHING + PROGRESS_CAPTURING
+                + PROGRESS_CONVERTING,
+            )
 
             if self._cancel_requested.is_set():
                 return self._mark_cancelled()
@@ -294,21 +312,24 @@ class RenderCoordinator:
                 self._update(state="rendering", stage="composing final MP4")
                 try:
                     self._runner.render_remotion(
-                        gameplay_mov=mov_path,
+                        result=result,
                         output_mp4=mp4_path,
                         editor_dir=self.editor_dir,
+                        base_props=reel_props or {},
                     )
                     with self._lock:
                         if self._session:
                             self._session.output_mp4 = mp4_path
                 except Exception as e:
-                    # Remotion isn't fully wired yet (needs full render plan
-                    # shape from server) — don't fail the whole render if it
-                    # doesn't run.
+                    # Remotion failures shouldn't lose the .mov files the
+                    # user already has — log and degrade.
                     log.warning("remotion stage skipped: %s", e)
-                    self._update(stage=f"MOV only (remotion skipped: {e})")
+                    self._update(stage=f"MOVs ready (remotion skipped: {e})")
             else:
-                self._update(stage=f"MOV ready at {mov_path.name} (no editor_dir for Remotion)")
+                self._update(
+                    stage=f"{len(result.takes)} MOV(s) ready at {mov_dir.name}/ "
+                    f"(no editor_dir for Remotion)"
+                )
 
             self._mark_done()
         except Exception as e:
@@ -358,7 +379,7 @@ class RenderCoordinator:
             self._session.progress = 1.0
             self._session.finished_at = time.time()
 
-    def _mark_done_partial(self, take_dir: Path) -> None:
+    def _mark_done_partial(self, take_dir: Path | None) -> None:
         """End state when capture succeeded but ffmpeg/Remotion couldn't run."""
         with self._lock:
             if self._session is None:

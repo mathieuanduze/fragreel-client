@@ -21,6 +21,7 @@ This file is a skeleton / MVP. The CS2 launch automation is a TODO — see
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import shutil
@@ -94,13 +95,42 @@ class RenderPlan:
 
 
 @dataclass(frozen=True)
-class CaptureResult:
-    """What the HLAE capture produced on disk."""
+class TakeOutput:
+    """One HLAE take = one capture segment (= one highlight).
 
+    HLAE creates a fresh `takeNNNN/` dir each time `mirv_streams record start`
+    fires. With one start/stop cycle per segment, segment_index N maps to
+    the (pre_take_index + 1 + N)-th take dir under <record_name>/.
+
+    `mov_path` is None until `convert_takes_to_prores()` fills it.
+    """
+
+    segment_index: int
     take_dir: Path  # <CS2>/game/bin/win64/<record_name>/takeNNNN
-    stream_dir: Path  # take_dir / <stream_name> — contains TGAs
+    stream_dir: Path  # take_dir / <stream_name> — contains the TGAs
     frame_count: int
-    audio_path: Path | None  # take_dir / audio.wav
+    audio_path: Path | None  # take_dir / audio.wav (when present)
+    mov_path: Path | None = None  # filled by convert_takes_to_prores
+
+
+@dataclass(frozen=True)
+class CaptureResult:
+    """All takes produced by one render plan, in segment order (0..N-1)."""
+
+    takes: tuple[TakeOutput, ...]
+
+    @property
+    def total_frames(self) -> int:
+        return sum(t.frame_count for t in self.takes)
+
+    def with_movs(self, movs: dict[int, Path]) -> "CaptureResult":
+        """Return a new CaptureResult where takes have mov_path filled in
+        from the {segment_index: mov_path} mapping."""
+        new_takes = tuple(
+            dataclasses.replace(t, mov_path=movs.get(t.segment_index, t.mov_path))
+            for t in self.takes
+        )
+        return CaptureResult(takes=new_takes)
 
 
 @dataclass(frozen=True)
@@ -307,49 +337,109 @@ class HlaeRunner:
         poll_sec: float = 2.0,
         on_progress: Callable[[int, int], None] | None = None,
     ) -> CaptureResult:
-        """Poll the recording dir for a new, stable take.
+        """Poll the recording dir until ALL N takes (one per segment) are stable.
 
-        Strategy: find the highest `takeNNNN` index under
-        `<CS2>/game/bin/win64/<record_name>/`. Capture is done when that
-        directory has at least one TGA AND its file count is stable across
-        two polls (HLAE has stopped writing).
+        HLAE creates a new `takeNNNN/` each time `mirv_streams record start`
+        fires. With one start/stop per segment, we expect exactly
+        `len(plan.segments)` new take dirs above `pre_take_index`. Returns
+        a CaptureResult whose `takes` are sorted by take index ASC and
+        labelled with the matching segment_index (0..N-1).
 
-        `pre_take_index` = highest index seen BEFORE launching, so we can
-        skip leftovers from previous captures. If None, `_snapshot_take_index`
-        is called at the start of this method.
+        Stability rule (per take): TGA count must be unchanged across two
+        consecutive polls (>= poll_sec * 2 quiescence). The last take to
+        stabilise gates completion. Earlier takes are considered final once
+        the *next* take dir appears (HLAE has moved on).
+
+        `pre_take_index` = highest take number seen BEFORE launching CS2,
+        so leftovers from previous renders aren't picked up. If None,
+        `_snapshot_take_index` is called now.
         """
         record_root = self.config.recording_parent / plan.record_name
         if pre_take_index is None:
             pre_take_index = self._snapshot_take_index(record_root)
 
+        expected = len(plan.segments)
+        if expected == 0:
+            raise ValueError("plan has no segments")
+
         deadline = time.monotonic() + timeout_sec
-        last_frames = -1
-        stable_since: float | None = None
+        # Per-take state: take_number -> (last_frames, stable_since)
+        take_state: dict[int, tuple[int, float | None]] = {}
+        last_total = -1
 
         while time.monotonic() < deadline:
-            take_dir = self._find_latest_take(record_root, skip_up_to=pre_take_index)
-            if take_dir is not None:
+            takes = self._list_new_takes(record_root, skip_up_to=pre_take_index)
+
+            # Track each take's frame count + stability window. Only the
+            # *highest* take seen so far can still be growing — once a
+            # higher-numbered take exists, lower ones are guaranteed stable
+            # (HLAE has called record end on them).
+            highest_n = max((n for n, _ in takes), default=-1)
+            current_total = 0
+            for n, take_dir in takes:
                 stream_dir = take_dir / plan.stream_name
-                if stream_dir.is_dir():
-                    frames = self._count_tgas(stream_dir)
-                    if on_progress is not None:
-                        on_progress(frames, last_frames)
-                    if frames > 0 and frames == last_frames:
-                        stable_since = stable_since or time.monotonic()
-                        if time.monotonic() - stable_since >= poll_sec * 2:
-                            audio = take_dir / "audio.wav"
-                            return CaptureResult(
-                                take_dir=take_dir,
-                                stream_dir=stream_dir,
-                                frame_count=frames,
-                                audio_path=audio if audio.exists() else None,
-                            )
-                    else:
-                        stable_since = None
-                    last_frames = frames
+                frames = self._count_tgas(stream_dir) if stream_dir.is_dir() else 0
+                current_total += frames
+                prev_frames, prev_stable = take_state.get(n, (-1, None))
+                # A take below the current highest is definitively stable.
+                if n < highest_n:
+                    take_state[n] = (frames, time.monotonic())
+                    continue
+                if frames > 0 and frames == prev_frames:
+                    take_state[n] = (frames, prev_stable or time.monotonic())
+                else:
+                    take_state[n] = (frames, None)
+
+            if on_progress is not None and current_total != last_total:
+                on_progress(current_total, last_total)
+                last_total = current_total
+
+            if len(takes) >= expected:
+                # Got every expected take dir. Now verify the last one has
+                # had a stable frame count for at least 2 polls.
+                last_n, _ = takes[-1]
+                _, stable_since = take_state.get(last_n, (0, None))
+                if stable_since is not None and (
+                    time.monotonic() - stable_since >= poll_sec * 2
+                ):
+                    return self._build_capture_result(plan, takes, pre_take_index)
+
             time.sleep(poll_sec)
 
-        raise TimeoutError(f"capture did not stabilize within {timeout_sec}s under {record_root}")
+        raise TimeoutError(
+            f"capture did not produce {expected} stable takes within "
+            f"{timeout_sec}s under {record_root} (got {len(take_state)} takes)"
+        )
+
+    def _build_capture_result(
+        self,
+        plan: RenderPlan,
+        takes: list[tuple[int, Path]],
+        pre_take_index: int,
+    ) -> CaptureResult:
+        """Sorted (take_n, take_dir) → CaptureResult with segment_index mapping."""
+        takes_sorted = sorted(takes, key=lambda x: x[0])
+        outputs: list[TakeOutput] = []
+        for segment_index, (n, take_dir) in enumerate(takes_sorted):
+            stream_dir = take_dir / plan.stream_name
+            audio = take_dir / "audio.wav"
+            outputs.append(
+                TakeOutput(
+                    segment_index=segment_index,
+                    take_dir=take_dir,
+                    stream_dir=stream_dir,
+                    frame_count=self._count_tgas(stream_dir) if stream_dir.is_dir() else 0,
+                    audio_path=audio if audio.exists() else None,
+                )
+            )
+        log.info(
+            "capture complete: %d takes (pre_index=%d, range take%04d..take%04d)",
+            len(outputs),
+            pre_take_index,
+            takes_sorted[0][0],
+            takes_sorted[-1][0],
+        )
+        return CaptureResult(takes=tuple(outputs))
 
     @staticmethod
     def _snapshot_take_index(record_root: Path) -> int:
@@ -367,20 +457,23 @@ class HlaeRunner:
         return highest
 
     @staticmethod
-    def _find_latest_take(record_root: Path, *, skip_up_to: int) -> Path | None:
-        """Return the take dir with index > skip_up_to, highest first."""
+    def _list_new_takes(
+        record_root: Path, *, skip_up_to: int
+    ) -> list[tuple[int, Path]]:
+        """All take dirs with index > skip_up_to, sorted by index ASC."""
         if not record_root.is_dir():
-            return None
-        best: tuple[int, Path] | None = None
+            return []
+        out: list[tuple[int, Path]] = []
         for child in record_root.iterdir():
             if child.is_dir() and child.name.startswith("take"):
                 try:
                     n = int(child.name[4:])
                 except ValueError:
                     continue
-                if n > skip_up_to and (best is None or n > best[0]):
-                    best = (n, child)
-        return best[1] if best else None
+                if n > skip_up_to:
+                    out.append((n, child))
+        out.sort(key=lambda x: x[0])
+        return out
 
     @staticmethod
     def _count_tgas(stream_dir: Path) -> int:
@@ -390,35 +483,75 @@ class HlaeRunner:
 
     def render_remotion(
         self,
-        gameplay_mov: Path,
+        result: CaptureResult,
         output_mp4: Path,
         editor_dir: Path,
-        composition: str = "HighlightsReel",
-        props: dict | None = None,
         *,
+        composition: str = "HighlightsReel",
+        base_props: dict | None = None,
         npm_exe: str = "npx",
     ) -> Path:
         """Run `npx remotion render` against the editor repo.
 
-        The `editor_dir` is the `editor/` subdirectory of the main FragReel
-        repo (not the client). Props typically include `gameplayVideoSrc`
-        (pointing at `gameplay_mov`), the highlights array, kills, mood,
-        music track, orientation. The server's `/matches/{id}/render-plan`
-        endpoint is the source of truth for this shape.
+        Wires per-segment `.mov` outputs into the matching highlight via
+        `match.highlights[i].gameplayVideoSrc`. `base_props` should be the
+        full ReelProps payload from the server's render-plan endpoint —
+        typically `{match, selectedRanks, mood, playerName, orientation}`.
+        We mutate `match.highlights` in place to inject the absolute file://
+        path that Remotion's `<OffthreadVideo>` will resolve.
 
-        Raises on ffmpeg/remotion errors. Returns the output MP4 path.
+        Mapping rule: `result.takes[k].segment_index` indexes into the
+        SELECTED highlights array (sorted by rank, like the editor does).
+        The server's render-plan must guarantee that the segment order
+        matches the highlight selection order — which it does, because
+        the cfg generator iterates segments in start_tick order which is
+        rank-stable.
+
+        Raises on missing inputs or remotion errors. Returns the MP4 path.
         """
         if not editor_dir.is_dir():
             raise FileNotFoundError(f"editor dir not found: {editor_dir}")
-        if not gameplay_mov.exists():
-            raise FileNotFoundError(f"gameplay .mov not found: {gameplay_mov}")
+        if base_props is None:
+            base_props = {}
 
-        # Remotion reads props via --props '<json>' (single JSON arg). We
-        # merge the caller's props with the gameplay video path it almost
-        # certainly needs but might forget to set.
-        merged: dict = {"gameplayVideoSrc": str(gameplay_mov)}
-        if props:
-            merged.update(props)
+        merged = dict(base_props)
+        match = dict(merged.get("match", {}))
+        highlights = list(match.get("highlights", []))
+
+        if highlights:
+            # Selected highlights are the ones the segments map to. Editor
+            # filters by selectedRanks then sorts by rank ASC; we replicate
+            # that here so segment_index → highlight index is unambiguous.
+            selected_ranks = merged.get("selectedRanks") or [h.get("rank") for h in highlights]
+            selected_ranks_set = set(selected_ranks)
+            ordered_selected = sorted(
+                (h for h in highlights if h.get("rank") in selected_ranks_set),
+                key=lambda h: h.get("rank", 0),
+            )
+
+            for take in result.takes:
+                if take.mov_path is None:
+                    log.warning(
+                        "segment %d has no mov_path — Remotion will fall back "
+                        "to placeholder gradient", take.segment_index,
+                    )
+                    continue
+                if take.segment_index >= len(ordered_selected):
+                    log.warning(
+                        "segment %d has no matching highlight (only %d selected)",
+                        take.segment_index, len(ordered_selected),
+                    )
+                    continue
+                target_rank = ordered_selected[take.segment_index].get("rank")
+                # file:// URI works on Windows (file:///C:/...) and POSIX.
+                src_uri = take.mov_path.absolute().as_uri()
+                for h in highlights:
+                    if h.get("rank") == target_rank:
+                        h["gameplayVideoSrc"] = src_uri
+                        break
+
+            match["highlights"] = highlights
+            merged["match"] = match
 
         cmd: list[str] = [
             npm_exe,
@@ -429,38 +562,73 @@ class HlaeRunner:
             "--props",
             json.dumps(merged),
         ]
-        log.info("remotion render: %s", " ".join(cmd))
+        log.info(
+            "remotion render: composition=%s out=%s takes_with_mov=%d",
+            composition, output_mp4,
+            sum(1 for t in result.takes if t.mov_path is not None),
+        )
         output_mp4.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(cmd, cwd=editor_dir, check=True, shell=False)
         return output_mp4
 
-    def convert_tga_to_prores(
+    def convert_takes_to_prores(
         self,
         result: CaptureResult,
-        output_path: Path,
+        output_dir: Path,
         *,
+        basename: str = "highlight",
         source_framerate: int = 300,
         cleanup_tgas: bool = True,
-    ) -> Path:
-        """ffmpeg: TGA sequence + audio → ProRes 4444 .mov for Remotion.
+    ) -> CaptureResult:
+        """ffmpeg every take in `result` → one ProRes 4444 .mov per segment.
 
-        Per Edicao_FragReel_Best_Practices: ProRes 4444 preserves alpha and
-        decodes fast in the Chromium build Remotion uses. Source framerate
-        must match `host_framerate` that captured the TGAs.
+        Outputs land at `<output_dir>/<basename>_seg<NN>.mov`. Returns a
+        new CaptureResult with each TakeOutput.mov_path filled in.
 
-        `cleanup_tgas=True` (default): once ffmpeg succeeds, wipes the
-        take directory. Without this, each render leaves 5–10 GB of
-        single-use TGAs on disk (1920×1080 × ~1400 frames ≈ 8 GB).
+        Per Edicao_FragReel_Best_Practices: ProRes 4444 preserves alpha
+        and decodes fast in the Chromium build Remotion uses. Source
+        framerate must match `host_framerate` that captured the TGAs.
+
+        `cleanup_tgas=True` (default): once ffmpeg succeeds for a take,
+        wipes that take's directory. Without this, each render leaves
+        5–10 GB of single-use TGAs per segment on disk.
         """
+        if not result.takes:
+            raise ValueError("CaptureResult has no takes to convert")
+
         ffmpeg = self.config.resolved_ffmpeg()
         if ffmpeg is None:
             raise RuntimeError(
                 "ffmpeg not found (checked --ffmpeg-exe, bundled, and $PATH)"
             )
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
+        movs: dict[int, Path] = {}
+        for take in result.takes:
+            mov_path = output_dir / f"{basename}_seg{take.segment_index:02d}.mov"
+            self._convert_one_take(
+                take=take,
+                output_path=mov_path,
+                ffmpeg=ffmpeg,
+                source_framerate=source_framerate,
+                cleanup_tgas=cleanup_tgas,
+            )
+            movs[take.segment_index] = mov_path
+
+        return result.with_movs(movs)
+
+    def _convert_one_take(
+        self,
+        *,
+        take: TakeOutput,
+        output_path: Path,
+        ffmpeg: Path,
+        source_framerate: int,
+        cleanup_tgas: bool,
+    ) -> None:
+        """Single TGA-sequence → ProRes pass for one TakeOutput."""
         # Numbered TGA pattern (HLAE writes 00000.tga, 00001.tga, ...)
-        input_pattern = str(result.stream_dir / "%05d.tga")
+        input_pattern = str(take.stream_dir / "%05d.tga")
 
         cmd: list[str] = [
             str(ffmpeg),
@@ -468,8 +636,8 @@ class HlaeRunner:
             "-framerate", str(source_framerate),
             "-i", input_pattern,
         ]
-        if result.audio_path is not None:
-            cmd += ["-i", str(result.audio_path), "-c:a", "aac", "-b:a", "192k"]
+        if take.audio_path is not None:
+            cmd += ["-i", str(take.audio_path), "-c:a", "aac", "-b:a", "192k"]
         cmd += [
             "-c:v", "prores_ks",
             "-profile:v", "4444",
@@ -477,24 +645,26 @@ class HlaeRunner:
             str(output_path),
         ]
 
-        log.info("ffmpeg TGA→ProRes: %s", " ".join(cmd))
+        log.info(
+            "ffmpeg TGA→ProRes seg=%d frames=%d → %s",
+            take.segment_index, take.frame_count, output_path.name,
+        )
         subprocess.run(cmd, check=True)
 
-        if cleanup_tgas and result.take_dir.exists():
-            import shutil as _shutil
+        if cleanup_tgas and take.take_dir.exists():
             try:
-                size_before = sum(p.stat().st_size for p in result.take_dir.rglob("*") if p.is_file())
-                _shutil.rmtree(result.take_dir, ignore_errors=True)
+                size_before = sum(
+                    p.stat().st_size for p in take.take_dir.rglob("*") if p.is_file()
+                )
+                shutil.rmtree(take.take_dir, ignore_errors=True)
                 log.info(
-                    "cleaned up %.1f GB of source TGAs at %s",
-                    size_before / (1024 ** 3), result.take_dir.name,
+                    "cleaned %.1f GB of TGAs at %s",
+                    size_before / (1024 ** 3), take.take_dir.name,
                 )
             except OSError as e:
-                # Non-fatal: the .mov is already written, user just has
-                # leftover files to clean manually.
-                log.warning("could not clean take dir %s: %s", result.take_dir, e)
-
-        return output_path
+                # Non-fatal: the .mov is already written; user just has
+                # leftover files they can clean manually.
+                log.warning("could not clean take dir %s: %s", take.take_dir, e)
 
 
 # ---------------------------------------------------------------------------
@@ -524,10 +694,16 @@ if __name__ == "__main__":
         default=Path(__file__).parent / "vendor" / "hlae",
     )
     ap.add_argument(
-        "--output-mov",
+        "--output-mov-dir",
         type=Path,
         default=None,
-        help="If set, convert captured TGAs to ProRes .mov at this path",
+        help="If set, convert all takes to ProRes .mov files under this dir "
+             "(<dir>/<basename>_seg00.mov, _seg01.mov, ...)",
+    )
+    ap.add_argument(
+        "--mov-basename",
+        default=None,
+        help="Basename for output .mov files (default: demo basename)",
     )
     ap.add_argument(
         "--stage",
@@ -592,24 +768,35 @@ if __name__ == "__main__":
                 on_progress=_progress,
             )
             log.info(
-                "capture done: take=%s frames=%d audio=%s",
-                result.take_dir.name,
-                result.frame_count,
-                result.audio_path,
+                "capture done: %d takes, total frames=%d",
+                len(result.takes),
+                result.total_frames,
             )
-            mov_path: Path | None = None
-            if args.stage in ("convert", "remotion", "all") and args.output_mov:
-                mov_path = runner.convert_tga_to_prores(result, args.output_mov)
-                log.info("ProRes written: %s", mov_path)
-
-            if args.stage in ("remotion", "all") and args.output_mp4 and mov_path:
-                mp4 = runner.render_remotion(
-                    gameplay_mov=mov_path,
-                    output_mp4=args.output_mp4,
-                    editor_dir=args.editor_dir,
-                    composition=args.composition,
+            for t in result.takes:
+                log.info(
+                    "  seg=%d take=%s frames=%d audio=%s",
+                    t.segment_index, t.take_dir.name, t.frame_count, t.audio_path,
                 )
-                log.info("final MP4: %s", mp4)
+
+            if args.stage in ("convert", "remotion", "all") and args.output_mov_dir:
+                basename = args.mov_basename or plan.demo_basename
+                result = runner.convert_takes_to_prores(
+                    result, args.output_mov_dir, basename=basename,
+                )
+                for t in result.takes:
+                    log.info("ProRes written: %s", t.mov_path)
+
+            if args.stage in ("remotion", "all") and args.output_mp4:
+                if not any(t.mov_path for t in result.takes):
+                    log.warning("no .mov outputs available; skipping Remotion stage")
+                else:
+                    mp4 = runner.render_remotion(
+                        result=result,
+                        output_mp4=args.output_mp4,
+                        editor_dir=args.editor_dir,
+                        composition=args.composition,
+                    )
+                    log.info("final MP4: %s", mp4)
         finally:
             if not args.keep_cs2 and strategy is LaunchStrategy.INJECT:
                 runner.terminate_cs2()
