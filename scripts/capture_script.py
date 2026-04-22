@@ -111,7 +111,10 @@ def _emit_addAtTick(tick: int, command: str) -> str:
     return f"mirv_cmd addAtTick {tick} {command}"
 
 
-def _start_commands(plan: CaptureScriptPlan) -> list[str]:
+def _setup_commands(plan: CaptureScriptPlan) -> list[str]:
+    """Run ONCE at the first segment's start tick (or earlier) — installs the
+    stream + names the record dir + pins the killfeed. Re-running these per
+    segment would noop-warn at best and confuse HLAE state at worst."""
     cmds = [
         f"mirv_streams add normal {plan.stream_name}",
         f"mirv_streams record name {plan.record_name}",
@@ -121,7 +124,14 @@ def _start_commands(plan: CaptureScriptPlan) -> list[str]:
             f"mirv_deathmsg lifetime {plan.killfeed_lifetime_sec}",
             f"mirv_deathmsg localPlayer {plan.user_account_id}",
         ]
-    cmds += [
+    return cmds
+
+
+def _start_commands(plan: CaptureScriptPlan) -> list[str]:
+    """Per-segment: lock engine + start a new take. Each `mirv_streams record
+    start` creates a fresh `<record_name>/takeNNNN/` so the runner can map
+    one take per highlight."""
+    cmds = [
         f"host_framerate {plan.host_framerate}",
         "host_timescale 0",
         "mirv_streams record start",
@@ -166,6 +176,7 @@ def build_cfg_content(plan: CaptureScriptPlan) -> str:
         "",
     ]
 
+    setup_cmds = _setup_commands(plan)
     start_cmds = _start_commands(plan)
     end_cmds = _end_commands(plan)
 
@@ -176,6 +187,16 @@ def build_cfg_content(plan: CaptureScriptPlan) -> str:
         )
         lines.append(_emit_addAtTick(1, f"demo_gototick {plan.pre_seek_tick}"))
         lines.append("")
+
+    # One-time setup: schedule a few ticks before the first segment so HLAE
+    # has the stream + record name + killfeed pin ready before recording
+    # starts. Falls back to tick 1 if there's no headroom.
+    first_start = plan.segments[0].start_tick
+    setup_tick = max(1, first_start - 2)
+    lines.append(f"// one-time setup at tick {setup_tick}")
+    for c in setup_cmds:
+        lines.append(_emit_addAtTick(setup_tick, c))
+    lines.append("")
 
     for i, seg in enumerate(plan.segments):
         lines.append(f"// segment {i}: ticks {seg.start_tick} .. {seg.end_tick}")

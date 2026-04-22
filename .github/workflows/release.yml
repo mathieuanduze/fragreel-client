@@ -20,11 +20,30 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
           cache: pip
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: pip install -r requirements.txt
+
+      # Cache the ~200MB vendor/ tree across runs so we only download HLAE +
+      # ffmpeg once per pinned-version. Cache key includes setup_vendor.py
+      # because that's where the URLs live — bumping the pin invalidates
+      # the cache automatically.
+      - name: Cache vendor/ (HLAE + ffmpeg)
+        id: vendor-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: vendor-${{ runner.os }}-${{ hashFiles('setup_vendor.py') }}
+
+      - name: Download HLAE + ffmpeg into vendor/
+        if: steps.vendor-cache.outputs.cache-hit != 'true'
+        run: python setup_vendor.py
+        # ~150MB HLAE zip + ~80MB ffmpeg essentials zip → 5–8 min on cold cache.
+
+      - name: Verify vendor/ is complete
+        run: python setup_vendor.py --check
 
       - name: Build .exe with PyInstaller
         run: pyinstaller --noconfirm --clean FragReel.spec
@@ -36,7 +55,13 @@ jobs:
             Write-Error "FragReel.exe not produced"
             exit 1
           }
-          Get-Item dist\FragReel.exe | Select-Object Name, Length, LastWriteTime
+          $exe = Get-Item dist\FragReel.exe
+          $exe | Select-Object Name, Length, LastWriteTime
+          # Sanity: post-vendor bundle should clear ~250MB. A sub-50MB build
+          # means PyInstaller skipped the vendor/ datas tree silently.
+          if ($exe.Length -lt 100MB) {
+            Write-Warning "FragReel.exe is suspiciously small ($($exe.Length) bytes) — vendor/ may not be bundled"
+          }
 
       - name: Upload unsigned artifact
         id: upload-unsigned
