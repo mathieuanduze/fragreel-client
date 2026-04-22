@@ -193,22 +193,28 @@ def scan_all(
     cache_hits = 0
     candidates: list[Path] = []
 
+    log.info(f"scan_all iniciado — steamid={steamid}, dirs={[str(d) for d in demo_dirs]}")
+
     # Coletar .dem de todas as pastas
     for d in demo_dirs:
         try:
+            found_in_dir = 0
             for p in d.glob("*.dem"):
                 if p.stat().st_size >= MIN_SIZE:
                     candidates.append(p)
+                    found_in_dir += 1
+            log.info(f"  • {d}: {found_in_dir} .dem ≥ {MIN_SIZE // 1024}KB")
         except Exception as e:
             log.warning(f"Falha ao listar {d}: {e}")
 
     # Ordenar por mtime descendente
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    log.info(f"Total candidatos: {len(candidates)}. Cache tem {len(cache)} entries.")
 
     results: list[ScannedMatch] = []
     t0 = time.time()
 
-    for p in candidates:
+    for i, p in enumerate(candidates, 1):
         if len(results) >= max_results:
             log.info(f"Limite de {max_results} atingido — parando scan")
             break
@@ -218,17 +224,22 @@ def scan_all(
             cache_hits += 1
             cached = cache[sha]
             if cached.get("match_id"):
-                # Já processada
+                log.info(f"  [{i}/{len(candidates)}] {p.name} — já processada (cache hit)")
                 continue
             if cached.get("skipped_reason"):
-                # Já sabemos que é de outra pessoa
+                log.info(f"  [{i}/{len(candidates)}] {p.name} — já marcada como skip: {cached.get('skipped_reason')}")
                 continue
 
+        log.info(f"  [{i}/{len(candidates)}] {p.name} ({round(p.stat().st_size / (1024*1024), 1)} MB) — parseando…")
+        t_parse = time.time()
         match = _parse_demo_summary(p, steamid)
+        dt = round(time.time() - t_parse, 1)
         if match:
+            log.info(f"     ✓ ok em {dt}s — {match.map_name} {match.score_ct}-{match.score_t} K{match.player_kills}/D{match.player_deaths}")
             results.append(match)
             # Não marca como processada ainda — só quando usuário confirmar upload
         else:
+            log.info(f"     ✗ skip em {dt}s")
             # Marca no cache pra não re-parsear
             cache[sha] = {"skipped_reason": "not_user_demo_or_parse_failed"}
 

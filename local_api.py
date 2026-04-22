@@ -61,11 +61,19 @@ def create_app(steamid: str, demo_dirs: list[Path], queue: UploadQueue) -> Flask
 
     @app.get("/demos")
     def demos():
-        if request.args.get("refresh") == "1" or _cache["matches"] is None:
-            data = _do_scan()
-        else:
-            data = _cache["matches"]
-        return jsonify({"matches": data, "scanning": _cache["scanning"]})
+        try:
+            if request.args.get("refresh") == "1" or _cache["matches"] is None:
+                log.info("/demos — disparando scan_all (cache miss ou refresh=1)")
+                data = _do_scan()
+            else:
+                log.info(f"/demos — servindo do cache ({len(_cache['matches'])} entries)")
+                data = _cache["matches"]
+            return jsonify({"matches": data, "scanning": _cache["scanning"]})
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            log.error(f"/demos EXCEÇÃO: {e}\n{tb}")
+            return {"error": "scan_failed", "detail": str(e)}, 500
 
     @app.post("/demos/<sha>/upload")
     def trigger_upload(sha: str):

@@ -64,9 +64,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     handlers=_handlers,
 )
-# Werkzeug loga cada request — em modo windowed ele tentaria escrever no que
-# antes era None; agora é seguro, mas mantemos quieto pra não poluir o log.
-logging.getLogger("werkzeug").setLevel(logging.ERROR)
+# Werkzeug loga cada request — em modo windowed o NullStream patch acima
+# garante que isso é seguro. Mantemos em INFO pra ter visibilidade durante
+# debug (qual endpoint foi chamado, quanto tempo, status).
 
 log = logging.getLogger("fragreel")
 log.info(f"=== FragReel iniciando · log em {LOG_FILE} ===")
