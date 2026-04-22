@@ -20,7 +20,7 @@ from typing import Optional
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from scanner import scan_all, _sha1_quick
+from scanner import scan_all
 from uploader import UploadQueue
 
 log = logging.getLogger("fragreel.local_api")
@@ -96,7 +96,11 @@ def create_app(steamid: str, demo_dirs: list[Path], queue: UploadQueue) -> Flask
 
     @app.post("/demos/<sha>/upload")
     def trigger_upload(sha: str):
-        matches = _cache["matches"] or _do_scan()
+        # Lê do mesmo state do /demos — refatoramos pro modelo async em
+        # v0.1.6 mas esquecemos de atualizar essa função (estava usando
+        # _cache que não existe mais → NameError).
+        with state_lock:
+            matches = list(state["matches"])
         match = next((m for m in matches if m["sha1"] == sha), None)
         if not match:
             return {"error": "demo_not_found"}, 404
