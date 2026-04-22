@@ -1,32 +1,50 @@
 """
 FragReel Client — entry point.
 
-Fluxo (Escopo A+):
+Modelo on-demand:
   1. Detecta SteamID + todas as pastas onde o CS2 salva .dem
-  2. Inicia a UploadQueue (worker único)
-  3. Na primeira execução (cache vazio): scan retroativo das pastas, enfileira
-     demos que pertencem ao usuário
-  4. Inicia o watcher monitorando todas as pastas em paralelo — qualquer .dem
-     novo (auto-salvo, replay UI, download HLTV/FACEIT) entra na mesma fila
+  2. Inicia a UploadQueue (worker único, on-demand via API local)
+  3. Sobe API HTTP local em 127.0.0.1:5775 — fragreel.vercel.app conversa com ela
+  4. Aguarda comandos vindos da web (lista demos, dispara upload de uma específica)
 
 Usage:
   python main.py                                    # auto-detecta tudo
   python main.py --demo-dir ./demos --steamid 765…  # dev: pasta local
   python main.py --no-tray                          # sem ícone na bandeja
-  python main.py --no-scan                          # pula scan retroativo
 """
 import argparse
 import logging
+import os
 import sys
 import threading
+import traceback
 from pathlib import Path
+
+
+def _log_dir() -> Path:
+    """Pasta persistente para logs (e futuro cache).
+    Windows: %APPDATA%/FragReel/  ·  outros: ~/.fragreel/"""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", Path.home())) / "FragReel"
+    else:
+        base = Path.home() / ".fragreel"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+LOG_FILE = _log_dir() / "fragreel.log"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
 )
 log = logging.getLogger("fragreel")
+log.info(f"=== FragReel iniciando · log em {LOG_FILE} ===")
 
 _stop_event = threading.Event()
 
@@ -66,7 +84,12 @@ def main() -> None:
         if steamid:
             log.info(f"SteamID detectado: {steamid}")
         else:
-            log.error("SteamID não detectado. Passe --steamid manualmente.")
+            msg = ("SteamID não detectado.\n\n"
+                   "Verifique se o Steam está instalado e se você logou pelo menos 1 vez.\n"
+                   "Se o problema persistir, rode pelo terminal com:\n"
+                   "  FragReel.exe --steamid SEU_STEAMID64")
+            log.error(msg.replace("\n", " "))
+            _show_fatal(msg)
             sys.exit(1)
 
     # ── Pastas a monitorar ──────────────────────────────────────────
@@ -122,5 +145,30 @@ def main() -> None:
         queue.stop()
 
 
+def _show_fatal(message: str) -> None:
+    """Mostra um messagebox com o erro antes de sair (Windows)."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                f"FragReel não conseguiu iniciar.\n\n{message}\n\nLog completo em:\n{LOG_FILE}",
+                "FragReel — Erro",
+                0x10,  # MB_ICONERROR
+            )
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        tb = traceback.format_exc()
+        log.error(f"FATAL: {e}\n{tb}")
+        _show_fatal(f"{type(e).__name__}: {e}")
+        sys.exit(1)
