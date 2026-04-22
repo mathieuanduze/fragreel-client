@@ -34,14 +34,17 @@ def _log_dir() -> Path:
 
 LOG_FILE = _log_dir() / "fragreel.log"
 
+# Em modo windowed (PyInstaller console=False), sys.stdout/stderr podem ser None.
+# Adiciona o StreamHandler só se houver console; assim o build sem janela não quebra.
+_handlers: list[logging.Handler] = [logging.FileHandler(LOG_FILE, encoding="utf-8")]
+if sys.stdout is not None:
+    _handlers.insert(0, logging.StreamHandler(sys.stdout))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-    ],
+    handlers=_handlers,
 )
 log = logging.getLogger("fragreel")
 log.info(f"=== FragReel iniciando · log em {LOG_FILE} ===")
@@ -135,6 +138,15 @@ def main() -> None:
     from local_api import serve as serve_local_api
     serve_local_api(steamid=steamid, demo_dirs=demo_dirs, queue=queue, stop_event=_stop_event)
     log.info("Pronto. Aguardando ações via fragreel.vercel.app …")
+
+    # Notificação desktop confirmando que o client está vivo — sem isso, em modo
+    # windowed (sem terminal preto) o user pode achar que não aconteceu nada.
+    try:
+        from notifier import notify
+        notify("FragReel está rodando",
+               "Pronto! Abra fragreel.vercel.app/library pra ver suas demos.")
+    except Exception:
+        pass
 
     # Bloqueia até receber stop (do tray ou Ctrl+C)
     try:
