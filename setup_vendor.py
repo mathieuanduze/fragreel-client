@@ -44,9 +44,10 @@ log = logging.getLogger("fragreel.setup_vendor")
 # advancedfx.org publishes releases on GitHub; using the tag URL keeps us
 # pinned to the exact build PC-Claude validated.
 HLAE_VERSION = "2.189.9"
+# Asset filename uses underscores (hlae_2_189_9.zip), tag uses dots (v2.189.9)
 HLAE_URL = (
     "https://github.com/advancedfx/advancedfx/releases/download/"
-    f"v{HLAE_VERSION}/hlae_{HLAE_VERSION}.zip"
+    f"v{HLAE_VERSION}/hlae_{HLAE_VERSION.replace('.', '_')}.zip"
 )
 # SHA256 left empty until first run computes it; mismatch logs a warning
 # but doesn't fatal — we trust GitHub's TLS for the download integrity.
