@@ -25,10 +25,12 @@ from uploader import UploadQueue
 
 log = logging.getLogger("fragreel.local_api")
 
+import re
+
 ALLOWED_ORIGINS = [
     "https://fragreel.vercel.app",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
+    re.compile(r"^https://.*\.vercel\.app$"),
+    re.compile(r"^http://(localhost|127\.0\.0\.1):\d+$"),
 ]
 
 
