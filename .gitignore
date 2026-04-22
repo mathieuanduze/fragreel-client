@@ -24,3 +24,11 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# HLAE + ffmpeg binaries — ~200MB, re-installable via setup script
+# (planned for Round 4d). The vendor/ folder is expected to exist at
+# runtime but its contents are downloaded, not checked in.
+vendor/
+
+# Captured frames / intermediates during dev
+fragreel/

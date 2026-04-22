@@ -1,0 +1,10 @@
+{
+  "_note": "Sample render plan for testing hlae_runner.py. Real plans come from POST /matches/{id}/render-plan on the server.",
+  "demo_path": "C:/Program Files (x86)/Steam/steamapps/common/Counter-Strike Global Offensive/game/csgo/replays/match730_003815550071324278854_1416271529_202.dem",
+  "segments": [
+    { "start_tick": 10000, "end_tick": 10300 }
+  ],
+  "user_steamid64": "76561198271607343",
+  "record_name": "fragreel",
+  "stream_name": "default"
+}
