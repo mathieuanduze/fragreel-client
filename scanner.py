@@ -28,7 +28,7 @@ log = logging.getLogger("fragreel.scanner")
 
 CACHE_DIR = Path.home() / ".fragreel"
 CACHE_FILE = CACHE_DIR / "scanned.json"
-CACHE_VERSION = 4           # bump pra invalidar entries antigas (v4: skipped sem polars em v0.1.7)
+CACHE_VERSION = 5           # bump: v5 guarda meta completa pra reaproveitar em demos já processadas
 MIN_SIZE = 50 * 1024        # 50KB — abaixo disso é arquivo temp ou corrompido
 MAX_SCAN_PER_RUN = 50       # limite pra primeira execução não travar
 
@@ -45,6 +45,8 @@ class ScannedMatch:
     player_kills: int
     player_deaths: int
     size_mb: float
+    match_id: Optional[str] = None        # preenchido se já foi processada (upload OK)
+    processed_at: Optional[float] = None  # epoch segundos do upload
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -234,8 +236,49 @@ def scan_all(
         if sha in cache:
             cache_hits += 1
             cached = cache[sha]
-            if cached.get("match_id"):
-                log.info(f"  [{i}/{len(candidates)}] {p.name} — já processada (cache hit)")
+            meta = cached.get("meta")
+            if meta:
+                # Reusa metadata cacheada (parse caro evitado).
+                # Demos já processadas continuam aparecendo na lista — usuário pode
+                # ver o FragReel pronto ou gerar um novo formato.
+                try:
+                    match_cached = ScannedMatch(
+                        demo_path=meta.get("demo_path", str(p)),
+                        sha1=meta.get("sha1", sha),
+                        mtime=meta.get("mtime", p.stat().st_mtime),
+                        map_name=meta.get("map_name", "unknown"),
+                        score_ct=int(meta.get("score_ct") or 0),
+                        score_t=int(meta.get("score_t") or 0),
+                        player_kills=int(meta.get("player_kills") or 0),
+                        player_deaths=int(meta.get("player_deaths") or 0),
+                        size_mb=float(meta.get("size_mb") or 0.0),
+                        match_id=cached.get("match_id"),
+                        processed_at=cached.get("processed_at"),
+                    )
+                    # Atualiza demo_path caso o usuário tenha movido o arquivo
+                    match_cached.demo_path = str(p)
+                    tag = "processada" if match_cached.match_id else "cache"
+                    log.info(f"  [{i}/{len(candidates)}] {p.name} — {tag} hit (sem reparse)")
+                    results.append(match_cached)
+                    continue
+                except Exception as e:
+                    log.warning(f"  [{i}/{len(candidates)}] {p.name} — meta cacheada inválida ({e}); reparseando")
+            elif cached.get("match_id"):
+                # Cache antigo (sem meta): mantém como processada com placeholder
+                log.info(f"  [{i}/{len(candidates)}] {p.name} — processada (cache legacy, sem meta)")
+                results.append(ScannedMatch(
+                    demo_path=str(p),
+                    sha1=sha,
+                    mtime=p.stat().st_mtime,
+                    map_name="unknown",
+                    score_ct=0,
+                    score_t=0,
+                    player_kills=0,
+                    player_deaths=0,
+                    size_mb=round(p.stat().st_size / (1024 * 1024), 1),
+                    match_id=cached.get("match_id"),
+                    processed_at=cached.get("processed_at"),
+                ))
                 continue
             if cached.get("skipped_reason"):
                 log.info(f"  [{i}/{len(candidates)}] {p.name} — já marcada como skip: {cached.get('skipped_reason')}")
@@ -255,7 +298,8 @@ def scan_all(
         if match:
             log.info(f"     [OK] {dt}s — {match.map_name} {match.score_ct}-{match.score_t} K{match.player_kills}/D{match.player_deaths}")
             results.append(match)
-            # Nao marca como processada ainda — so quando usuario confirmar upload
+            # Cacheia meta completa pra próxima execução não reparsear.
+            cache[sha] = {"meta": match.to_dict()}
         else:
             log.info(f"     [SKIP] {dt}s")
             # Marca no cache pra nao re-parsear
@@ -271,9 +315,14 @@ def scan_all(
 
 
 def mark_processed(sha1: str, match_id: str) -> None:
-    """Depois do upload bem-sucedido, marca essa demo como processada no cache."""
+    """Depois do upload bem-sucedido, marca essa demo como processada no cache.
+    Preserva a meta cacheada pra que `scan_all` continue retornando a demo
+    (com match_id) e o usuário possa abrir o FragReel pronto."""
     cache = _load_cache()
-    cache[sha1] = {"match_id": match_id, "processed_at": time.time()}
+    entry = cache.get(sha1) or {}
+    entry["match_id"] = match_id
+    entry["processed_at"] = time.time()
+    cache[sha1] = entry
     _save_cache(cache)
 
 

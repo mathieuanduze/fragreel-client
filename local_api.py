@@ -22,6 +22,7 @@ from flask_cors import CORS
 
 from scanner import scan_all
 from uploader import UploadQueue
+from version import __version__ as CLIENT_VERSION
 
 log = logging.getLogger("fragreel.local_api")
 
@@ -76,7 +77,16 @@ def create_app(steamid: str, demo_dirs: list[Path], queue: UploadQueue) -> Flask
 
     @app.get("/health")
     def health():
-        return {"ok": True, "steamid": steamid, "dirs": [str(d) for d in demo_dirs]}
+        return {
+            "ok": True,
+            "steamid": steamid,
+            "dirs": [str(d) for d in demo_dirs],
+            "version": CLIENT_VERSION,
+        }
+
+    @app.get("/version")
+    def version():
+        return {"version": CLIENT_VERSION}
 
     @app.get("/demos")
     def demos():
