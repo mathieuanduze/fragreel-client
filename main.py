@@ -21,6 +21,24 @@ import traceback
 from pathlib import Path
 
 
+# ─── PyInstaller windowed-mode safety ─────────────────────────────────────────
+# Quando o build é feito com console=False, sys.stdout / sys.stderr são None.
+# Werkzeug (servidor Flask), watchdog e várias libs escrevem em stderr a cada
+# request — sem essa guarda, a primeira chamada HTTP estoura AttributeError e
+# mata a thread da API silenciosamente (sintoma: "Client conectado" → cai).
+class _NullStream:
+    def write(self, *_a, **_k): return 0
+    def flush(self): pass
+    def isatty(self): return False
+    def fileno(self): raise OSError("no fileno on null stream")
+
+if sys.stdout is None:
+    sys.stdout = _NullStream()
+if sys.stderr is None:
+    sys.stderr = _NullStream()
+# ───────────────────────────────────────────────────────────────────────────────
+
+
 def _log_dir() -> Path:
     """Pasta persistente para logs (e futuro cache).
     Windows: %APPDATA%/FragReel/  ·  outros: ~/.fragreel/"""
@@ -34,18 +52,22 @@ def _log_dir() -> Path:
 
 LOG_FILE = _log_dir() / "fragreel.log"
 
-# Em modo windowed (PyInstaller console=False), sys.stdout/stderr podem ser None.
-# Adiciona o StreamHandler só se houver console; assim o build sem janela não quebra.
-_handlers: list[logging.Handler] = [logging.FileHandler(LOG_FILE, encoding="utf-8")]
-if sys.stdout is not None:
-    _handlers.insert(0, logging.StreamHandler(sys.stdout))
-
+_handlers: list[logging.Handler] = [
+    logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    # stdout pode ser _NullStream em modo windowed — não tem efeito visual,
+    # mas mantém handler chain consistente e pega tty quando há um.
+    logging.StreamHandler(sys.stdout),
+]
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
     handlers=_handlers,
 )
+# Werkzeug loga cada request — em modo windowed ele tentaria escrever no que
+# antes era None; agora é seguro, mas mantemos quieto pra não poluir o log.
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
 log = logging.getLogger("fragreel")
 log.info(f"=== FragReel iniciando · log em {LOG_FILE} ===")
 
