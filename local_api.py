@@ -27,7 +27,7 @@ from flask_cors import CORS
 
 from hlae_runner import HlaeRunnerConfig, RenderPlan
 from render_coordinator import RenderCoordinator
-from scanner import scan_all
+from scanner import scan_all, _load_cache as _load_scan_cache
 from uploader import UploadQueue
 from version import __version__ as CLIENT_VERSION
 
@@ -105,8 +105,9 @@ def create_app(
         refresh = request.args.get("refresh") == "1"
         with state_lock:
             need_scan = refresh or (not state["scan_done"] and not state["scanning"])
+            base_matches = list(state["matches"])
             snapshot = {
-                "matches": list(state["matches"]),
+                "matches": base_matches,
                 "scanning": state["scanning"] or need_scan,
                 "scan_done": state["scan_done"],
                 "error": state["scan_error"],
@@ -114,6 +115,27 @@ def create_app(
         if need_scan:
             log.info(f"/demos — disparando bg-scan (refresh={refresh}, scan_done={snapshot['scan_done']})")
             threading.Thread(target=_bg_scan, daemon=True, name="bg-scan").start()
+
+        # Merge fresh upload status from disk cache. The bg-scan only runs once;
+        # after it completes, mark_processed() writes match_id/processed_at to
+        # scanned.json on disk but state["matches"] is never updated, so the web
+        # would keep seeing match_id=null and fall through to the server fallback
+        # instead of triggering local /render. Cheap re-read fixes that.
+        try:
+            disk_cache = _load_scan_cache()
+            patched = []
+            for m in snapshot["matches"]:
+                entry = disk_cache.get(m.get("sha1"))
+                if entry:
+                    mid = entry.get("match_id")
+                    pat = entry.get("processed_at")
+                    if mid and not m.get("match_id"):
+                        m = {**m, "match_id": mid, "processed_at": pat}
+                patched.append(m)
+            snapshot["matches"] = patched
+        except Exception as e:
+            log.warning(f"/demos — falha ao mesclar match_id do cache em disco: {e}")
+
         return jsonify(snapshot)
 
     @app.post("/demos/<sha>/upload")
