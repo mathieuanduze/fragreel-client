@@ -13,7 +13,6 @@ a = Analysis(
         'pystray._win32',
         'PIL._tkinter_finder',
         'watchdog.observers.winapi',
-        'pkg_resources.py2_warn',
     ],
     hookspath=[],
     hooksconfig={},

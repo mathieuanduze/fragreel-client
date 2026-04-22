@@ -1,0 +1,89 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the GitHub Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build .exe with PyInstaller
+        run: pyinstaller --noconfirm --clean FragReel.spec
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\FragReel.exe")) {
+            Write-Error "FragReel.exe not produced"
+            exit 1
+          }
+          Get-Item dist\FragReel.exe | Select-Object Name, Length, LastWriteTime
+
+      - name: Upload unsigned artifact
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: FragReel-unsigned
+          path: dist/FragReel.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────
+  # SignPath signing — uncomment after the project is approved.
+  # Docs: https://about.signpath.io/documentation/build-system-integration/github
+  # Required GitHub repo secrets:
+  #   SIGNPATH_API_TOKEN
+  # Required vars:
+  #   SIGNPATH_ORG_ID, SIGNPATH_PROJECT_SLUG, SIGNPATH_POLICY_SLUG
+  # ─────────────────────────────────────────────────────────────────
+  # sign:
+  #   needs: build
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Submit to SignPath
+  #       uses: signpath/github-action-submit-signing-request@v1
+  #       with:
+  #         api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+  #         organization-id: ${{ vars.SIGNPATH_ORG_ID }}
+  #         project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+  #         signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+  #         github-artifact-id: ${{ needs.build.outputs.artifact-id }}
+  #         wait-for-completion: true
+  #         output-artifact-directory: signed
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: FragReel-unsigned
+          path: ./release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/FragReel.exe
+          draft: false
+          prerelease: false
+          generate_release_notes: true
