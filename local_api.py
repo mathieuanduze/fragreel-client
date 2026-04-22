@@ -38,22 +38,41 @@ def create_app(steamid: str, demo_dirs: list[Path], queue: UploadQueue) -> Flask
     app = Flask(__name__)
     CORS(app, origins=ALLOWED_ORIGINS)
 
-    # Cache em memória do scan (custoso) + lock pra evitar scan paralelo
-    _cache: dict = {"matches": None, "scanning": False}
-    _cache_lock = threading.Lock()
+    # Estado do scan — atualizado pelo background thread, lido pelo /demos.
+    # `scan_done` vira True depois do PRIMEIRO scan completo (sucesso ou erro).
+    state: dict = {
+        "matches": [],
+        "scanning": False,
+        "scan_done": False,
+        "scan_error": None,
+    }
+    state_lock = threading.Lock()
 
-    def _do_scan() -> list[dict]:
-        with _cache_lock:
-            if _cache["scanning"]:
-                return _cache.get("matches") or []
-            _cache["scanning"] = True
+    def _bg_scan():
+        with state_lock:
+            if state["scanning"]:
+                log.info("[bg-scan] ja rodando, pulando")
+                return
+            state["scanning"] = True
+            state["scan_error"] = None
+        log.info("[bg-scan] iniciando…")
         try:
             matches = scan_all(demo_dirs, steamid)
             data = [m.to_dict() for m in matches]
-            _cache["matches"] = data
-            return data
+            with state_lock:
+                state["matches"] = data
+            log.info(f"[bg-scan] OK — {len(data)} demos do usuario")
+        except BaseException as e:
+            import traceback
+            log.error(f"[bg-scan] CRASH: {type(e).__name__}: {e}")
+            log.error(traceback.format_exc())
+            with state_lock:
+                state["scan_error"] = f"{type(e).__name__}: {e}"
         finally:
-            _cache["scanning"] = False
+            with state_lock:
+                state["scanning"] = False
+                state["scan_done"] = True
+            log.info("[bg-scan] terminado")
 
     @app.get("/health")
     def health():
@@ -61,19 +80,19 @@ def create_app(steamid: str, demo_dirs: list[Path], queue: UploadQueue) -> Flask
 
     @app.get("/demos")
     def demos():
-        try:
-            if request.args.get("refresh") == "1" or _cache["matches"] is None:
-                log.info("/demos — disparando scan_all (cache miss ou refresh=1)")
-                data = _do_scan()
-            else:
-                log.info(f"/demos — servindo do cache ({len(_cache['matches'])} entries)")
-                data = _cache["matches"]
-            return jsonify({"matches": data, "scanning": _cache["scanning"]})
-        except Exception as e:
-            import traceback
-            tb = traceback.format_exc()
-            log.error(f"/demos EXCEÇÃO: {e}\n{tb}")
-            return {"error": "scan_failed", "detail": str(e)}, 500
+        refresh = request.args.get("refresh") == "1"
+        with state_lock:
+            need_scan = refresh or (not state["scan_done"] and not state["scanning"])
+            snapshot = {
+                "matches": list(state["matches"]),
+                "scanning": state["scanning"] or need_scan,
+                "scan_done": state["scan_done"],
+                "error": state["scan_error"],
+            }
+        if need_scan:
+            log.info(f"/demos — disparando bg-scan (refresh={refresh}, scan_done={snapshot['scan_done']})")
+            threading.Thread(target=_bg_scan, daemon=True, name="bg-scan").start()
+        return jsonify(snapshot)
 
     @app.post("/demos/<sha>/upload")
     def trigger_upload(sha: str):

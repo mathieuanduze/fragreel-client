@@ -91,22 +91,29 @@ def _parse_demo_summary(path: Path, steamid: str) -> Optional[ScannedMatch]:
       - Parse falhar
       - SteamID não estiver na demo
     """
+    log.info(f"    [parse] {path.name}: importando demoparser2…")
     try:
         from demoparser2 import DemoParser  # type: ignore
     except ImportError:
-        log.error("demoparser2 NÃO INSTALADO — nenhuma demo será detectada. "
-                  "Build do .exe está incompleto (faltou demoparser2 nos requirements/spec).")
+        log.error("demoparser2 NAO INSTALADO — nenhuma demo sera detectada. "
+                  "Build do .exe esta incompleto (faltou demoparser2 nos requirements/spec).")
+        return None
+    except Exception as e:
+        log.error(f"    [parse] import demoparser2 levantou {type(e).__name__}: {e}")
         return None
 
     try:
+        log.info(f"    [parse] criando DemoParser…")
         parser = DemoParser(str(path))
 
-        # player_death é barato e já traz tudo que precisamos
+        log.info(f"    [parse] parse_event(player_death)…")
+        # player_death e barato e ja traz tudo que precisamos
         events = parser.parse_event(
             "player_death",
             player=["name", "steamid"],
             other=["total_rounds_played"],
         )
+        log.info(f"    [parse] eventos recebidos (tipo: {type(events).__name__})")
 
         # Compat pandas / polars / list
         if hasattr(events, "to_dict"):
@@ -168,8 +175,12 @@ def _parse_demo_summary(path: Path, steamid: str) -> Optional[ScannedMatch]:
             player_deaths=deaths,
             size_mb=round(path.stat().st_size / (1024 * 1024), 1),
         )
-    except Exception as e:
-        log.warning(f"Parse falhou para {path.name}: {e}")
+    except BaseException as e:
+        # BaseException pega tambem KeyboardInterrupt/SystemExit que demoparser2
+        # (Rust) pode levantar via PyErr_SetInterrupt em casos extremos.
+        import traceback
+        log.error(f"    [parse] EXCECAO em {path.name}: {type(e).__name__}: {e}")
+        log.error(traceback.format_exc())
         return None
 
 
@@ -232,15 +243,22 @@ def scan_all(
 
         log.info(f"  [{i}/{len(candidates)}] {p.name} ({round(p.stat().st_size / (1024*1024), 1)} MB) — parseando…")
         t_parse = time.time()
-        match = _parse_demo_summary(p, steamid)
+        match: Optional[ScannedMatch] = None
+        try:
+            match = _parse_demo_summary(p, steamid)
+        except BaseException as e:
+            import traceback
+            log.error(f"     EXCECAO inesperada no parse: {type(e).__name__}: {e}")
+            log.error(traceback.format_exc())
+            match = None
         dt = round(time.time() - t_parse, 1)
         if match:
-            log.info(f"     ✓ ok em {dt}s — {match.map_name} {match.score_ct}-{match.score_t} K{match.player_kills}/D{match.player_deaths}")
+            log.info(f"     [OK] {dt}s — {match.map_name} {match.score_ct}-{match.score_t} K{match.player_kills}/D{match.player_deaths}")
             results.append(match)
-            # Não marca como processada ainda — só quando usuário confirmar upload
+            # Nao marca como processada ainda — so quando usuario confirmar upload
         else:
-            log.info(f"     ✗ skip em {dt}s")
-            # Marca no cache pra não re-parsear
+            log.info(f"     [SKIP] {dt}s")
+            # Marca no cache pra nao re-parsear
             cache[sha] = {"skipped_reason": "not_user_demo_or_parse_failed"}
 
     _save_cache(cache)
