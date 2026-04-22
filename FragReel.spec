@@ -17,6 +17,13 @@ a = Analysis(
         'flask_cors',
         'werkzeug.serving',
         'demoparser2',
+        # pyarrow é dep transitiva do demoparser2 — sem ela, parse_event
+        # estoura PanicException("No module named 'pyarrow'") via Rust.
+        # Listamos pyarrow.lib explicitamente porque PyInstaller frequentemente
+        # falha em descobrir as .pyd nativas só pelo nome do pacote.
+        'pyarrow',
+        'pyarrow.lib',
+        'pyarrow.compute',
     ],
     hookspath=[],
     hooksconfig={},

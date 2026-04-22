@@ -6,4 +6,8 @@ pillow>=10.0.0
 flask>=3.0.0
 flask-cors>=4.0.0
 demoparser2>=0.41.0
+# pyarrow é dep transitiva do demoparser2 (parse_event retorna Arrow table
+# internamente). Sem ela, o Rust faz .unwrap() num Err e estoura PanicException
+# no parse — sintoma: ModuleNotFoundError: No module named 'pyarrow'.
+pyarrow>=15.0.0
 pyinstaller>=6.0.0
