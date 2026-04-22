@@ -80,9 +80,10 @@ The signed release `.exe` is produced by GitHub Actions on every `v*.*.*` tag â€
 | File | Purpose |
 |------|---------|
 | `main.py` | Entry point â€” wires the tray icon, watcher, and API client |
-| `watcher.py` | Monitors CS2 demo folders and uploads new `.dem` files |
-| `cs2_monitor.py` | Detects CS2 process start/end via `psutil` |
-| `steam_detect.py` | Auto-discovers Steam install path, demo folders, and the logged-in SteamID |
+| `watcher.py` | Monitors all CS2 demo folders and enqueues new `.dem` files |
+| `uploader.py` | Single-worker upload queue with retry, dedup, and event callbacks |
+| `scanner.py` | Retroactive scan + hash-based dedup cache (`~/.fragreel/scanned.json`) |
+| `steam_detect.py` | Auto-discovers Steam install path, all demo folders, and the logged-in SteamID |
 | `tray.py` | System tray icon (pystray) |
 | `notifier.py` | Desktop notifications (plyer) |
 | `config.py` | Environment-overridable configuration |

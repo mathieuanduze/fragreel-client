@@ -1,11 +1,19 @@
 """
 FragReel Client — entry point.
 
+Fluxo (Escopo A+):
+  1. Detecta SteamID + todas as pastas onde o CS2 salva .dem
+  2. Inicia a UploadQueue (worker único)
+  3. Na primeira execução (cache vazio): scan retroativo das pastas, enfileira
+     demos que pertencem ao usuário
+  4. Inicia o watcher monitorando todas as pastas em paralelo — qualquer .dem
+     novo (auto-salvo, replay UI, download HLTV/FACEIT) entra na mesma fila
+
 Usage:
-  python main.py                        # auto-detect Steam + CS2
-  python main.py --demo-dir /path/demos --steamid 76561198XXXXXXXXX
-  python main.py --demo-dir ./demos     # dev: watch local folder
-  python main.py --no-tray              # disable system tray
+  python main.py                                    # auto-detecta tudo
+  python main.py --demo-dir ./demos --steamid 765…  # dev: pasta local
+  python main.py --no-tray                          # sem ícone na bandeja
+  python main.py --no-scan                          # pula scan retroativo
 """
 import argparse
 import logging
@@ -23,77 +31,108 @@ log = logging.getLogger("fragreel")
 _stop_event = threading.Event()
 
 
+def _on_upload_event(event: str, payload: dict) -> None:
+    """Callback global da fila — log + (futuramente) notificações desktop."""
+    if event == "queued":
+        log.info(f"⏳ na fila ({payload['source']}): {Path(payload['path']).name} — pos {payload['position']}")
+    elif event == "uploading":
+        log.info(f"⬆ enviando (tentativa {payload['attempt']}): {Path(payload['path']).name}")
+    elif event == "done":
+        name = Path(payload["path"]).name
+        log.info(f"✅ {name} → {payload['highlights']} highlights")
+        try:
+            from notifier import notify
+            notify("FragReel", f"{name}: {payload['highlights']} highlights prontos!")
+        except Exception:
+            pass
+    elif event == "skipped":
+        log.info(f"⤼ pulada ({payload.get('reason')}): {Path(payload['path']).name}")
+    elif event == "failed":
+        log.error(f"❌ falhou: {Path(payload['path']).name} — {payload.get('error')}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="FragReel Client")
-    parser.add_argument("--demo-dir", help="Path to folder to watch for .dem files")
-    parser.add_argument("--steamid",  help="Your SteamID64 (auto-detected if omitted)")
-    parser.add_argument("--no-tray",  action="store_true", help="Disable system tray icon")
+    parser.add_argument("--demo-dir", help="Pasta única para watch (sobrescreve auto-detect)")
+    parser.add_argument("--steamid",  help="SteamID64 (auto-detect se omitido)")
+    parser.add_argument("--no-tray",  action="store_true", help="Desabilita ícone do tray")
+    parser.add_argument("--no-scan",  action="store_true", help="Pula o scan retroativo")
     args = parser.parse_args()
 
-    # ── Resolve Steam ID ────────────────────────────────────────────
+    # ── Steam ID ────────────────────────────────────────────────────
     steamid = args.steamid
     if not steamid:
         from steam_detect import find_active_steamid
         steamid = find_active_steamid() or ""
         if steamid:
-            log.info(f"Detected SteamID: {steamid}")
+            log.info(f"SteamID detectado: {steamid}")
         else:
-            log.warning("Could not detect SteamID. Pass --steamid manually.")
+            log.error("SteamID não detectado. Passe --steamid manualmente.")
+            sys.exit(1)
 
-    # ── Resolve demo directory ──────────────────────────────────────
-    demo_dir_str = args.demo_dir
-    if not demo_dir_str:
-        from steam_detect import find_cs2_demo_dir
-        detected = find_cs2_demo_dir()
-        if detected:
-            demo_dir_str = str(detected)
-            log.info(f"Detected CS2 demo folder: {demo_dir_str}")
-        else:
+    # ── Pastas a monitorar ──────────────────────────────────────────
+    if args.demo_dir:
+        demo_dirs = [Path(args.demo_dir)]
+    else:
+        from steam_detect import find_all_demo_dirs
+        demo_dirs = find_all_demo_dirs()
+        if not demo_dirs:
             fallback = Path(__file__).parent.parent / "demos"
             fallback.mkdir(exist_ok=True)
-            demo_dir_str = str(fallback)
-            log.warning(f"CS2 not found. Watching dev folder: {demo_dir_str}")
+            demo_dirs = [fallback]
+            log.warning(f"CS2 não encontrado. Usando pasta dev: {fallback}")
 
-    demo_dir = Path(demo_dir_str)
-    if not demo_dir.exists():
-        log.error(f"Demo directory does not exist: {demo_dir}")
-        sys.exit(1)
+    log.info(f"Monitorando {len(demo_dirs)} pasta(s):")
+    for d in demo_dirs:
+        log.info(f"  • {d}")
 
-    # ── System tray ─────────────────────────────────────────────────
+    # ── Upload queue ────────────────────────────────────────────────
+    from uploader import UploadQueue
+    queue = UploadQueue(steamid=steamid, on_event=_on_upload_event)
+    queue.start()
+
+    # ── Tray ────────────────────────────────────────────────────────
     if not args.no_tray:
-        from notifier import open_dashboard
-        from tray import start_tray_thread
+        try:
+            from notifier import open_dashboard
+            from tray import start_tray_thread
 
-        def on_quit():
-            log.info("Quit requested from tray.")
-            _stop_event.set()
+            def on_quit():
+                log.info("Quit solicitado pelo tray.")
+                _stop_event.set()
 
-        start_tray_thread(on_quit=on_quit, on_open=open_dashboard, demo_dir=demo_dir_str)
+            start_tray_thread(
+                on_quit=on_quit,
+                on_open=open_dashboard,
+                demo_dir=str(demo_dirs[0]),
+            )
+        except Exception as e:
+            log.warning(f"Tray indisponível ({e}) — seguindo sem ícone")
 
-    # ── Recorder (grava CS2 em background se habilitado) ────────────
-    recorder = None
-    from config import RECORDING_ENABLED
-    if RECORDING_ENABLED:
-        from recorder import Recorder
-        from cs2_monitor import start_monitor_thread
-        recorder = Recorder()
+    # ── Scan retroativo (primeira execução) ─────────────────────────
+    if not args.no_scan:
+        from scanner import scan_all, CACHE_FILE
+        first_run = not CACHE_FILE.exists()
+        if first_run:
+            log.info("Primeira execução — escaneando demos antigas…")
+        else:
+            log.info("Verificando se há demos antigas ainda não processadas…")
 
-        def _on_cs2_start():
-            recorder.start()
-            # Atualiza status no tray se disponível
-            log.info("CS2 detectado → gravação iniciada")
+        try:
+            matches = scan_all(demo_dirs, steamid)
+            for m in matches:
+                queue.enqueue(Path(m.demo_path), source="scan_retroativo")
+            if matches:
+                log.info(f"📼 {len(matches)} partidas antigas enfileiradas")
+        except Exception as e:
+            log.error(f"Scan retroativo falhou: {e}")
 
-        def _on_cs2_stop():
-            # Não para imediatamente: espera o .dem ser processado
-            # O recorder.stop() é chamado pelo watcher depois da extração
-            log.info("CS2 fechado → aguardando processamento do .dem")
-
-        start_monitor_thread(_on_cs2_start, _on_cs2_stop, stop_event=_stop_event)
-        log.info("Recorder pronto. Aguardando CS2...")
-
-    # ── Start watcher ───────────────────────────────────────────────
+    # ── Watcher (bloqueia até stop_event) ───────────────────────────
     from watcher import watch
-    watch(demo_dir=demo_dir, steamid=steamid, stop_event=_stop_event, recorder=recorder)
+    try:
+        watch(demo_dirs=demo_dirs, queue=queue, stop_event=_stop_event)
+    finally:
+        queue.stop()
 
 
 if __name__ == "__main__":
