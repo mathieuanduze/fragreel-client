@@ -28,7 +28,7 @@ log = logging.getLogger("fragreel.scanner")
 
 CACHE_DIR = Path.home() / ".fragreel"
 CACHE_FILE = CACHE_DIR / "scanned.json"
-CACHE_VERSION = 3           # bump pra invalidar entries antigas (v3: skipped sem pyarrow em v0.1.6)
+CACHE_VERSION = 4           # bump pra invalidar entries antigas (v4: skipped sem polars em v0.1.7)
 MIN_SIZE = 50 * 1024        # 50KB — abaixo disso é arquivo temp ou corrompido
 MAX_SCAN_PER_RUN = 50       # limite pra primeira execução não travar
 
