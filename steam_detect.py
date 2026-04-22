@@ -42,30 +42,59 @@ def find_steam_root() -> "Path | None":
     return _steam_root_linux()
 
 
-def find_cs2_demo_dir() -> "Path | None":
-    """
-    Returns the CS2 folder where demos are saved.
-    CS2 demo path: <steam>/steamapps/common/Counter-Strike Global Offensive/game/csgo
-    """
+def _cs2_roots() -> list[Path]:
+    """Todas as instalações CS2 detectadas (main library + libraryfolders.vdf)."""
     root = find_steam_root()
     if not root:
-        return None
+        return []
 
-    cs2_path = root / "steamapps/common/Counter-Strike Global Offensive/game/csgo"
-    if cs2_path.exists():
-        return cs2_path
+    roots: list[Path] = []
+    main = root / "steamapps/common/Counter-Strike Global Offensive"
+    if main.exists():
+        roots.append(main)
 
-    # Check additional Steam library folders from libraryfolders.vdf
     vdf_path = root / "steamapps/libraryfolders.vdf"
     if vdf_path.exists():
         text = vdf_path.read_text(encoding="utf-8", errors="ignore")
-        for path_match in re.finditer(r'"path"\s+"([^"]+)"', text):
-            lib = Path(path_match.group(1))
-            candidate = lib / "steamapps/common/Counter-Strike Global Offensive/game/csgo"
-            if candidate.exists():
-                return candidate
+        for m in re.finditer(r'"path"\s+"([^"]+)"', text):
+            lib = Path(m.group(1).replace("\\\\", "\\"))
+            cand = lib / "steamapps/common/Counter-Strike Global Offensive"
+            if cand.exists() and cand not in roots:
+                roots.append(cand)
+    return roots
 
-    return None
+
+def find_cs2_demo_dir() -> "Path | None":
+    """Retorna a primeira pasta de demos detectada (compat antigo)."""
+    dirs = find_all_demo_dirs()
+    return dirs[0] if dirs else None
+
+
+def find_all_demo_dirs() -> list[Path]:
+    """
+    Retorna TODAS as pastas candidatas onde demos do CS2 podem aparecer:
+      - .../csgo/                       (partidas auto-salvas + match730_*.dem baixadas)
+      - .../csgo/replays/               (replays salvos via UI do CS2)
+      - .../Downloads/                  (usuário baixou .dem do HLTV/FACEIT manualmente)
+
+    Todas as pastas existentes são retornadas — o watcher monitora todas em paralelo.
+    """
+    dirs: list[Path] = []
+    for cs2_root in _cs2_roots():
+        for sub in ("game/csgo", "game/csgo/replays"):
+            p = cs2_root / sub
+            if p.exists() and p not in dirs:
+                dirs.append(p)
+
+    # Downloads (onde HLTV/FACEIT demos normalmente caem)
+    if sys.platform == "win32":
+        downloads = Path.home() / "Downloads"
+    else:
+        downloads = Path.home() / "Downloads"
+    if downloads.exists() and downloads not in dirs:
+        dirs.append(downloads)
+
+    return dirs
 
 
 def find_active_steamid() -> "str | None":
@@ -98,5 +127,8 @@ def find_active_steamid() -> "str | None":
 
 if __name__ == "__main__":
     print("Steam root:", find_steam_root())
-    print("CS2 demos:", find_cs2_demo_dir())
+    print("CS2 roots:", _cs2_roots())
+    print("Demo dirs:")
+    for d in find_all_demo_dirs():
+        print("  -", d)
     print("SteamID:  ", find_active_steamid())
