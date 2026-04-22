@@ -68,12 +68,26 @@ class UploadQueue:
 
     def __init__(self, steamid: str, on_event: Optional[OnEvent] = None):
         self.steamid = steamid
-        self.on_event = on_event or (lambda _e, _p: None)
+        self._user_on_event = on_event or (lambda _e, _p: None)
         self._queue: queue.Queue[UploadJob] = queue.Queue()
         self._worker: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._enqueued_paths: set[str] = set()
         self._lock = threading.Lock()
+        # Job status por sha1 — consultado pelo /jobs/{sha} do local_api
+        self._jobs: dict[str, dict] = {}
+
+    def on_event(self, event: str, payload: dict) -> None:
+        """Wrapper que atualiza self._jobs antes de chamar o callback do user."""
+        sha = payload.get("sha")
+        if sha:
+            with self._lock:
+                self._jobs[sha] = {**self._jobs.get(sha, {}), "event": event, **payload}
+        self._user_on_event(event, payload)
+
+    def get_job(self, sha: str) -> Optional[dict]:
+        with self._lock:
+            return dict(self._jobs[sha]) if sha in self._jobs else None
 
     # ── API pública ──────────────────────────────────────────────────────
 
@@ -106,9 +120,10 @@ class UploadQueue:
                 return False
             if size < MIN_DEMO_BYTES:
                 return False
+            sha = _sha1_quick(demo_path)
             if is_already_processed(demo_path):
                 log.info(f"Pulando (já processada antes): {demo_path.name}")
-                self.on_event("skipped", {"path": str(demo_path), "reason": "already_processed"})
+                self.on_event("skipped", {"path": str(demo_path), "sha": sha, "reason": "already_processed"})
                 return False
             self._enqueued_paths.add(key)
 
@@ -116,7 +131,7 @@ class UploadQueue:
         self._queue.put(job)
         position = self._queue.qsize()
         log.info(f"Enfileirado [{source}]: {demo_path.name} (posição {position})")
-        self.on_event("queued", {"path": str(demo_path), "position": position, "source": source})
+        self.on_event("queued", {"path": str(demo_path), "sha": sha, "position": position, "source": source})
         return True
 
     def pending(self) -> int:
@@ -145,24 +160,24 @@ class UploadQueue:
 
     def _process(self, job: UploadJob) -> None:
         path = job.demo_path
+        sha = _sha1_quick(path) if path.exists() else ""
         if not path.exists():
             log.warning(f"Sumiu antes de uploadar: {path}")
             return
 
-        # Aguarda o arquivo estabilizar (CS2 pode estar terminando de escrever)
         if job.source == "watcher" and not _is_stable(path):
             log.warning(f"Não estabilizou: {path.name}")
-            self.on_event("failed", {"path": str(path), "error": "file_not_stable"})
+            self.on_event("failed", {"path": str(path), "sha": sha, "error": "file_not_stable"})
             return
 
         for attempt in range(1, MAX_RETRIES + 1):
             job.attempts = attempt
-            self.on_event("uploading", {"path": str(path), "attempt": attempt})
+            self.on_event("uploading", {"path": str(path), "sha": sha, "attempt": attempt})
             t0 = time.time()
             try:
                 with path.open("rb") as f:
                     resp = requests.post(
-                        f"{API_URL}/demo/upload",
+                        f"{API_URL}/demo/analyze",
                         files={"file": (path.name, f, "application/octet-stream")},
                         params={"steamid": self.steamid},
                         timeout=180,
@@ -172,13 +187,13 @@ class UploadQueue:
                 match_id = data.get("match_id") or path.stem
                 highlights = data.get("highlights", 0)
 
-                # Marca no cache pra nunca mais re-uploadar
-                mark_processed(_sha1_quick(path), match_id)
+                mark_processed(sha, match_id)
 
                 duration = round(time.time() - t0, 1)
                 log.info(f"✓ {path.name} → match_id={match_id} ({highlights} highlights, {duration}s)")
                 self.on_event("done", {
                     "path": str(path),
+                    "sha": sha,
                     "match_id": match_id,
                     "highlights": highlights,
                     "duration_s": duration,
@@ -190,11 +205,10 @@ class UploadQueue:
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_BACKOFF * attempt)
             except requests.exceptions.HTTPError as e:
-                # 4xx é definitivo — não retenta
                 if 400 <= e.response.status_code < 500:
                     msg = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
                     log.error(f"Falha definitiva em {path.name}: {msg}")
-                    self.on_event("failed", {"path": str(path), "error": msg})
+                    self.on_event("failed", {"path": str(path), "sha": sha, "error": msg})
                     return
                 log.warning(f"HTTP {e.response.status_code} (tentativa {attempt})")
                 if attempt < MAX_RETRIES:
@@ -204,8 +218,7 @@ class UploadQueue:
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_BACKOFF * attempt)
 
-        # Esgotou retries
-        self.on_event("failed", {"path": str(path), "error": "max_retries_exceeded"})
+        self.on_event("failed", {"path": str(path), "sha": sha, "error": "max_retries_exceeded"})
 
 
 def _is_stable(path: Path, wait: float = 2.0) -> bool:

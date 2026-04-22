@@ -1,0 +1,117 @@
+"""
+Local HTTP API — exposta em 127.0.0.1:5775 só pra que a web (fragreel.vercel.app)
+consiga ver as demos no PC do usuário e disparar upload on-demand.
+
+Endpoints:
+  GET  /health                      → ping
+  GET  /demos                       → lista (cache em memória; ?refresh=1 força re-scan)
+  POST /demos/{sha}/upload          → enfileira upload da demo
+  GET  /jobs/{sha}                  → status do job (queued/uploading/done/failed)
+
+CORS: liberado só pra fragreel.vercel.app + http://localhost:3000 (dev).
+"""
+from __future__ import annotations
+
+import logging
+import threading
+from pathlib import Path
+from typing import Optional
+
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
+from scanner import scan_all, _sha1_quick
+from uploader import UploadQueue
+
+log = logging.getLogger("fragreel.local_api")
+
+ALLOWED_ORIGINS = [
+    "https://fragreel.vercel.app",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+
+def create_app(steamid: str, demo_dirs: list[Path], queue: UploadQueue) -> Flask:
+    app = Flask(__name__)
+    CORS(app, origins=ALLOWED_ORIGINS)
+
+    # Cache em memória do scan (custoso) + lock pra evitar scan paralelo
+    _cache: dict = {"matches": None, "scanning": False}
+    _cache_lock = threading.Lock()
+
+    def _do_scan() -> list[dict]:
+        with _cache_lock:
+            if _cache["scanning"]:
+                return _cache.get("matches") or []
+            _cache["scanning"] = True
+        try:
+            matches = scan_all(demo_dirs, steamid)
+            data = [m.to_dict() for m in matches]
+            _cache["matches"] = data
+            return data
+        finally:
+            _cache["scanning"] = False
+
+    @app.get("/health")
+    def health():
+        return {"ok": True, "steamid": steamid, "dirs": [str(d) for d in demo_dirs]}
+
+    @app.get("/demos")
+    def demos():
+        if request.args.get("refresh") == "1" or _cache["matches"] is None:
+            data = _do_scan()
+        else:
+            data = _cache["matches"]
+        return jsonify({"matches": data, "scanning": _cache["scanning"]})
+
+    @app.post("/demos/<sha>/upload")
+    def trigger_upload(sha: str):
+        matches = _cache["matches"] or _do_scan()
+        match = next((m for m in matches if m["sha1"] == sha), None)
+        if not match:
+            return {"error": "demo_not_found"}, 404
+        path = Path(match["demo_path"])
+        if not path.exists():
+            return {"error": "file_missing"}, 410
+        ok = queue.enqueue(path, source="web")
+        if not ok:
+            existing = queue.get_job(sha)
+            if existing:
+                return jsonify(existing), 200
+            return {"error": "could_not_enqueue"}, 409
+        return jsonify(queue.get_job(sha) or {"event": "queued", "sha": sha}), 202
+
+    @app.get("/jobs/<sha>")
+    def job_status(sha: str):
+        job = queue.get_job(sha)
+        if not job:
+            return {"error": "no_such_job"}, 404
+        return jsonify(job)
+
+    return app
+
+
+def serve(
+    steamid: str,
+    demo_dirs: list[Path],
+    queue: UploadQueue,
+    host: str = "127.0.0.1",
+    port: int = 5775,
+    stop_event: Optional[threading.Event] = None,
+) -> threading.Thread:
+    """Inicia o servidor numa thread daemon e retorna a thread."""
+    app = create_app(steamid, demo_dirs, queue)
+
+    def _run():
+        from werkzeug.serving import make_server
+        server = make_server(host, port, app, threaded=True)
+        log.info(f"Local API rodando em http://{host}:{port}")
+        if stop_event:
+            t = threading.Thread(target=lambda: (stop_event.wait(), server.shutdown()), daemon=True)
+            t.start()
+        server.serve_forever()
+
+    thread = threading.Thread(target=_run, daemon=True, name="fragreel-local-api")
+    thread.start()
+    return thread

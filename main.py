@@ -56,7 +56,6 @@ def main() -> None:
     parser.add_argument("--demo-dir", help="Pasta única para watch (sobrescreve auto-detect)")
     parser.add_argument("--steamid",  help="SteamID64 (auto-detect se omitido)")
     parser.add_argument("--no-tray",  action="store_true", help="Desabilita ícone do tray")
-    parser.add_argument("--no-scan",  action="store_true", help="Pula o scan retroativo")
     args = parser.parse_args()
 
     # ── Steam ID ────────────────────────────────────────────────────
@@ -109,28 +108,16 @@ def main() -> None:
         except Exception as e:
             log.warning(f"Tray indisponível ({e}) — seguindo sem ícone")
 
-    # ── Scan retroativo (primeira execução) ─────────────────────────
-    if not args.no_scan:
-        from scanner import scan_all, CACHE_FILE
-        first_run = not CACHE_FILE.exists()
-        if first_run:
-            log.info("Primeira execução — escaneando demos antigas…")
-        else:
-            log.info("Verificando se há demos antigas ainda não processadas…")
+    # ── Local API (web descobre demos + dispara uploads via 127.0.0.1:5775) ──
+    from local_api import serve as serve_local_api
+    serve_local_api(steamid=steamid, demo_dirs=demo_dirs, queue=queue, stop_event=_stop_event)
+    log.info("Pronto. Aguardando ações via fragreel.vercel.app …")
 
-        try:
-            matches = scan_all(demo_dirs, steamid)
-            for m in matches:
-                queue.enqueue(Path(m.demo_path), source="scan_retroativo")
-            if matches:
-                log.info(f"📼 {len(matches)} partidas antigas enfileiradas")
-        except Exception as e:
-            log.error(f"Scan retroativo falhou: {e}")
-
-    # ── Watcher (bloqueia até stop_event) ───────────────────────────
-    from watcher import watch
+    # Bloqueia até receber stop (do tray ou Ctrl+C)
     try:
-        watch(demo_dirs=demo_dirs, queue=queue, stop_event=_stop_event)
+        _stop_event.wait()
+    except KeyboardInterrupt:
+        pass
     finally:
         queue.stop()
 
