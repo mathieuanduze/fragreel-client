@@ -28,6 +28,7 @@ log = logging.getLogger("fragreel.scanner")
 
 CACHE_DIR = Path.home() / ".fragreel"
 CACHE_FILE = CACHE_DIR / "scanned.json"
+CACHE_VERSION = 2           # bump pra invalidar entries antigas (ex: skipped sem demoparser2)
 MIN_SIZE = 50 * 1024        # 50KB — abaixo disso é arquivo temp ou corrompido
 MAX_SCAN_PER_RUN = 50       # limite pra primeira execução não travar
 
@@ -70,13 +71,18 @@ def _load_cache() -> dict[str, dict]:
     if not CACHE_FILE.exists():
         return {}
     try:
-        return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        raw = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        # Filtra entries de versão antiga (ex: skipped por demoparser2 ausente em v0.1.1)
+        return {k: v for k, v in raw.items() if v.get("v") == CACHE_VERSION}
     except Exception:
         return {}
 
 
 def _save_cache(cache: dict[str, dict]) -> None:
     CACHE_DIR.mkdir(exist_ok=True)
+    # Garante que toda entry tem o version stamp
+    for v in cache.values():
+        v.setdefault("v", CACHE_VERSION)
     CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
 
 
@@ -88,7 +94,8 @@ def _parse_demo_summary(path: Path, steamid: str) -> Optional[ScannedMatch]:
     try:
         from demoparser2 import DemoParser  # type: ignore
     except ImportError:
-        log.warning("demoparser2 não instalado — pulando parse local (modo dev)")
+        log.error("demoparser2 NÃO INSTALADO — nenhuma demo será detectada. "
+                  "Build do .exe está incompleto (faltou demoparser2 nos requirements/spec).")
         return None
 
     try:
@@ -162,7 +169,7 @@ def _parse_demo_summary(path: Path, steamid: str) -> Optional[ScannedMatch]:
             size_mb=round(path.stat().st_size / (1024 * 1024), 1),
         )
     except Exception as e:
-        log.debug(f"Parse falhou para {path.name}: {e}")
+        log.warning(f"Parse falhou para {path.name}: {e}")
         return None
 
 

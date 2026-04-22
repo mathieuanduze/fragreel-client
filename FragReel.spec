@@ -16,6 +16,7 @@ a = Analysis(
         'flask',
         'flask_cors',
         'werkzeug.serving',
+        'demoparser2',
     ],
     hookspath=[],
     hooksconfig={},
