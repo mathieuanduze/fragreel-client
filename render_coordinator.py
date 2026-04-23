@@ -33,6 +33,7 @@ If any stage throws, state becomes 'error' with `error` holding the message.
 from __future__ import annotations
 
 import logging
+import shutil
 import threading
 import time
 import traceback
@@ -41,7 +42,7 @@ from pathlib import Path
 from typing import Callable
 
 from cs2_launcher import InjectedProcess, find_running_cs2_pids, kill_running_cs2
-from hlae_runner import HlaeRunner, HlaeRunnerConfig, LaunchStrategy, RenderPlan
+from hlae_runner import HlaeRunner, HlaeRunnerConfig, LaunchStrategy, RenderPlan, TakeOutput
 
 
 log = logging.getLogger(__name__)
@@ -56,12 +57,12 @@ PROGRESS_RENDERING = 0.10
 PROGRESS_DONE = 1.00
 
 # For capturing, we need a total-frame estimate to map frames → progress.
-# At host_framerate=120 and tickrate=64, each tick ≈ 120/64 = 1.875 frames.
+# At host_framerate=60 and tickrate=64, each tick ≈ 60/64 ≈ 0.94 frames.
 # IMPORTANT: must match DEFAULT_HOST_FRAMERATE in capture_script.py — wrong
 # value here only affects progress %, not the capture itself, but a 4x
 # mismatch makes the bar stay at 24% forever (the v0.2.3 → 0.2.4 lesson).
 CS2_TICKRATE = 64
-CAPTURE_FPS = 120
+CAPTURE_FPS = 60
 FRAMES_PER_TICK = CAPTURE_FPS / CS2_TICKRATE
 
 # Wall-clock cap for the capture stage. Even on a modest PC, capturing 4
@@ -69,6 +70,28 @@ FRAMES_PER_TICK = CAPTURE_FPS / CS2_TICKRATE
 # 4-highlight reel. 60 min gives 2x margin. v0.2.3 had 15 min, which cut
 # off mid-segment-0 on PCs that couldn't sustain >300 fps wall-clock.
 CAPTURE_TIMEOUT_SEC = 3600.0
+
+# Disk preflight: 1080p TGA from CS2 ≈ 6.2 MB / frame. Round to 7 MB for
+# safety + filesystem overhead. With v0.2.6 streaming convert, peak TGA
+# usage = the SINGLE largest segment plus the next segment being captured
+# while the previous one converts. We size for ~2 segments worth of TGAs
+# + 5 GB safety buffer (engine logs, audio.wav, ProRes scratch).
+BYTES_PER_FRAME_TGA = 7_000_000
+# ProRes 4444 1080p ≈ 105 Mbps = ~110 KB/frame at 120 fps. Round up.
+BYTES_PER_FRAME_PRORES = 200_000
+DISK_SAFETY_BUFFER_BYTES = 5 * 1024 ** 3  # 5 GB
+
+
+class InsufficientDiskError(RuntimeError):
+    """Not enough free disk on either the CS2 capture drive or the output drive."""
+
+    def __init__(self, issues: list[dict]):
+        self.issues = issues
+        msg = "; ".join(
+            f"{i['kind']} on {i['drive']}: need ~{i['needed_gb']:.1f} GB, have {i['free_gb']:.1f} GB"
+            for i in issues
+        )
+        super().__init__(f"insufficient disk: {msg}")
 
 
 @dataclass
@@ -159,6 +182,81 @@ class RenderCoordinator:
                     "render_id": current.render_id}
         return {"ready": True}
 
+    def preflight_disk(self, plan: RenderPlan) -> dict:
+        """Estimate disk needed for `plan` and compare against free space.
+
+        v0.2.5 produced an ENOSPC mid-conversion (`ffmpeg exit 4294967268`
+        = -28) when the user had 3.4 GB free during a 2-segment 120-fps
+        capture. v0.2.6 streaming-converts each take as soon as it
+        finalizes and deletes its TGAs, so peak usage = the largest
+        segment + ~2 GB scratch instead of sum of all segments.
+
+        Returns:
+            {ok: bool, issues: [{drive, needed_gb, free_gb, kind}], ...}
+            ok=True means the render should fit. issues lists every drive
+            that's short, with a precise "needed" estimate.
+        """
+        if not plan.segments:
+            return {"ok": True, "issues": [], "note": "no segments"}
+
+        seg_ticks = [e - s for s, e in plan.segments]
+        max_seg_frames = int(max(seg_ticks) * FRAMES_PER_TICK)
+        total_frames = int(sum(seg_ticks) * FRAMES_PER_TICK)
+
+        # CS2 drive: streaming convert means peak = 1 active segment being
+        # captured + at most 1 segment queued for conversion (synchronous
+        # callback blocks polling but ffmpeg is fast enough vs CS2 capture
+        # at host_framerate=120 that this rarely overlaps). Size for 2
+        # segments worth as a safety margin.
+        peak_tga_bytes = 2 * max_seg_frames * BYTES_PER_FRAME_TGA + DISK_SAFETY_BUFFER_BYTES
+        # Output drive: all ProRes .mov files land here + the final MP4.
+        # MP4 is much smaller (~30 MB) so we just round into the buffer.
+        output_bytes = total_frames * BYTES_PER_FRAME_PRORES + DISK_SAFETY_BUFFER_BYTES
+
+        cs2_drive = self.config.recording_parent
+        try:
+            cs2_drive.mkdir(parents=True, exist_ok=True)
+            cs2_free = shutil.disk_usage(cs2_drive).free
+        except OSError:
+            cs2_free = 0
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            output_free = shutil.disk_usage(self.output_dir).free
+        except OSError:
+            output_free = 0
+
+        issues: list[dict] = []
+        if cs2_free < peak_tga_bytes:
+            issues.append({
+                "drive": str(cs2_drive),
+                "needed_gb": peak_tga_bytes / 1e9,
+                "free_gb": cs2_free / 1e9,
+                "kind": "tga_capture",
+            })
+        # Skip the output check if the same drive is already in `issues`
+        # — same physical disk, same problem.
+        same_drive = (
+            cs2_free
+            and cs2_free == output_free
+            and str(cs2_drive)[:3].lower() == str(self.output_dir)[:3].lower()
+        )
+        if not same_drive and output_free < output_bytes:
+            issues.append({
+                "drive": str(self.output_dir),
+                "needed_gb": output_bytes / 1e9,
+                "free_gb": output_free / 1e9,
+                "kind": "prores_output",
+            })
+
+        return {
+            "ok": not issues,
+            "issues": issues,
+            "estimated_total_frames": total_frames,
+            "max_segment_frames": max_seg_frames,
+            "peak_tga_gb": peak_tga_bytes / 1e9,
+            "output_gb": output_bytes / 1e9,
+        }
+
     def start(
         self,
         plan: RenderPlan,
@@ -186,6 +284,13 @@ class RenderCoordinator:
                     kill_running_cs2()
                 else:
                     raise self.CS2BusyError(pids)
+
+            # Disk preflight — fail fast with actionable info instead of
+            # crashing mid-conversion with ENOSPC (the v0.2.5 failure mode).
+            disk = self.preflight_disk(plan)
+            if not disk["ok"]:
+                log.error("disk preflight failed: %s", disk["issues"])
+                raise InsufficientDiskError(disk["issues"])
 
             self._cancel_requested.clear()
             self._session = RenderSession(
@@ -245,8 +350,17 @@ class RenderCoordinator:
             if self._cancel_requested.is_set():
                 return self._mark_cancelled()
 
-            # Stage 3: wait for capture to complete
+            # Stage 3+4 fused (v0.2.6+): wait for capture WHILE converting
+            # each take inline as soon as it finalizes. Caps peak disk at
+            # ~1 segment of TGAs instead of N segments. The previous flow
+            # (wait-all-then-convert-all) blew up with ENOSPC when the
+            # user had < ~50 GB free for a 2-segment 120 fps capture.
             self._update(state="capturing", stage="capturing gameplay")
+
+            mov_dir = self.output_dir / plan.demo_basename
+            mov_dir.mkdir(parents=True, exist_ok=True)
+            converted_movs: dict[int, Path] = {}
+
             def on_progress(now: int, prev: int) -> None:
                 if self._cancel_requested.is_set():
                     return
@@ -258,21 +372,64 @@ class RenderCoordinator:
                         frac = min(1.0, now / self._session.frames_expected)
                     else:
                         frac = 0.5
+                    # Capture+convert share the 0.07–0.92 budget. Convert
+                    # gets a small slice because it overlaps capture.
                     self._session.progress = (
                         PROGRESS_STAGING
                         + PROGRESS_LAUNCHING
-                        + PROGRESS_CAPTURING * frac
+                        + (PROGRESS_CAPTURING + PROGRESS_CONVERTING) * frac
                     )
 
-            result = self._runner.wait_for_capture(
-                plan,
-                pre_take_index=pre_take,
-                timeout_sec=CAPTURE_TIMEOUT_SEC,
-                on_progress=on_progress,
-            )
+            def on_take_finalized(take: TakeOutput) -> None:
+                """Stream-convert this take immediately so its TGAs free
+                up while CS2 keeps capturing the next segment."""
+                if self._cancel_requested.is_set():
+                    return
+                mov_path = mov_dir / f"{plan.demo_basename}_seg{take.segment_index:02d}.mov"
+                log.info(
+                    "stream-convert seg=%d frames=%d → %s",
+                    take.segment_index, take.frame_count, mov_path.name,
+                )
+                self._update(
+                    state="converting",
+                    stage=f"encoding seg{take.segment_index:02d} ({take.frame_count} frames)",
+                )
+                self._runner.convert_one_take(
+                    take=take,
+                    output_path=mov_path,
+                    cleanup_tgas=True,
+                )
+                converted_movs[take.segment_index] = mov_path
+                with self._lock:
+                    if self._session:
+                        self._session.segments_done = len(converted_movs)
+                        self._session.output_movs = tuple(
+                            converted_movs[k] for k in sorted(converted_movs)
+                        )
+                # Resume capturing-state label for the next polling cycle.
+                self._update(state="capturing", stage="capturing gameplay")
+
+            try:
+                result = self._runner.wait_for_capture(
+                    plan,
+                    pre_take_index=pre_take,
+                    timeout_sec=CAPTURE_TIMEOUT_SEC,
+                    on_progress=on_progress,
+                    on_take_finalized=on_take_finalized,
+                )
+            except RuntimeError as e:
+                # Streaming-convert error during capture (ffmpeg failure).
+                # Surface it instead of swallowing — the partial output
+                # in mov_dir lets us debug, but the reel is incomplete.
+                log.error("stream-convert failed mid-capture: %s", e)
+                raise
+
+            # Backfill mov_paths into the result dataclass.
+            result = result.with_movs(converted_movs)
+
             self._update(
-                progress=PROGRESS_STAGING + PROGRESS_LAUNCHING + PROGRESS_CAPTURING,
-                stage=f"captured {result.total_frames} frames across {len(result.takes)} take(s)",
+                progress=PROGRESS_STAGING + PROGRESS_LAUNCHING + PROGRESS_CAPTURING + PROGRESS_CONVERTING,
+                stage=f"captured + encoded {result.total_frames} frames across {len(result.takes)} segment(s)",
             )
 
             # Always close CS2 once capture is done — the user shouldn't have
@@ -281,36 +438,6 @@ class RenderCoordinator:
 
             if self._cancel_requested.is_set():
                 return self._mark_cancelled()
-
-            # Stage 4: ffmpeg TGA → ProRes .mov (one per take)
-            mov_dir = self.output_dir / plan.demo_basename
-            self._update(
-                state="converting",
-                stage=f"encoding {len(result.takes)} ProRes file(s)",
-                progress=PROGRESS_STAGING + PROGRESS_LAUNCHING + PROGRESS_CAPTURING
-                + PROGRESS_CONVERTING / 2,
-            )
-            try:
-                result = self._runner.convert_takes_to_prores(
-                    result, mov_dir, basename=plan.demo_basename,
-                )
-                movs = tuple(t.mov_path for t in result.takes if t.mov_path)
-                with self._lock:
-                    if self._session:
-                        self._session.output_movs = movs
-                        self._session.segments_done = len(movs)
-            except RuntimeError as e:
-                # Very common failure mode when ffmpeg isn't installed yet;
-                # keep the TGAs available so user can convert later and don't
-                # destroy progress by raising.
-                log.warning("ffmpeg stage skipped: %s", e)
-                self._update(stage=f"capture only (ffmpeg missing: {e})")
-                self._mark_done_partial(result.takes[0].take_dir if result.takes else None)
-                return
-            self._update(
-                progress=PROGRESS_STAGING + PROGRESS_LAUNCHING + PROGRESS_CAPTURING
-                + PROGRESS_CONVERTING,
-            )
 
             if self._cancel_requested.is_set():
                 return self._mark_cancelled()

@@ -13,7 +13,7 @@ right after `playdemo`. Paths are relative to `<CS2>/game/csgo/cfg/`.
 
 Capture pipeline per segment:
 
-- At `start_tick`: lock spectator camera to the user (`spec_player_by_accountid`
+- At `start_tick`: lock spectator camera to the user (`spec_player "<name>"`
   + `spec_mode 4`), lock engine (`host_framerate` + `host_timescale 0`),
   start recording. The killfeed and stream are installed once before the
   first segment.
@@ -22,7 +22,14 @@ Capture pipeline per segment:
   to skip the silent gap to the next segment instead of letting CS2 play
   it back at normal speed (1 round ≈ 115s of wasted wall-clock).
 
-The user's Steam Account ID (SteamID3) is what CS2 expects in
+Spec target: CS2 (Source 2) does NOT ship `spec_player_by_accountid` —
+that was a CS:GO / Source 1 command. v0.2.5 used it and the camera ended
+up free-cammed at the spawn point because `spec_mode 4` activated without
+a target. v0.2.6 switched to `spec_player "<name>"` which is the actual
+CS2 console command. The killfeed pin (`mirv_deathmsg localPlayer <id>`)
+still uses the SteamID3 / Account ID — that's HLAE-side and correct.
+
+The user's Steam Account ID (SteamID3) is what HLAE expects in
 `mirv_deathmessage localPlayer <id>`. Convert from SteamID64 with
 `account_id = steamid64 - 76561197960265728`.
 """
@@ -36,12 +43,20 @@ from typing import Iterable
 
 DEFAULT_RECORD_NAME = "fragreel"
 DEFAULT_STREAM_NAME = "default"
-# 120 fps capture: 1.875x slow-motion vs CS2's 64 tps. Cinético o suficiente
-# pra clipes de kill ficarem dramáticos sem tornar o render impraticável.
-# Antes (v0.2.3): 300 fps (4.69x slow-mo) — pegava ~60 min de wall-clock pra
-# capturar 4 segments num PC modesto e batia o timeout do coordinator. Era
-# qualidade premium mas matava UX.
-DEFAULT_HOST_FRAMERATE = 120
+# 60 fps capture: 0.94x speed vs CS2's 64 tps — basically real-time, no
+# slow-motion. Chosen as default in v0.2.6 because 1080p TGA + 60 fps
+# = ~3000 frames per 50s segment ≈ 18 GB peak with v0.2.6 streaming
+# convert. 120 fps doubled that and pushed users with < 30 GB free out
+# of the product entirely.
+#
+# History:
+#   - v0.2.3: 300 fps (4.69x slow-mo) — ~60 min capture, hit timeout
+#   - v0.2.4: 120 fps (1.875x slow-mo) — ~25 min capture, ~36 GB peak
+#   - v0.2.6: 60 fps (real-time)       — ~12 min capture, ~18 GB peak
+#
+# Slow-motion as a premium feature is on the roadmap (let user choose
+# 120/240 from the web). For now real-time 60 fps is the safest default.
+DEFAULT_HOST_FRAMERATE = 60
 DEFAULT_KILLFEED_LIFETIME_SEC = 90
 STEAM64_BASE = 76561197960265728
 
@@ -73,12 +88,26 @@ class CaptureSegment:
             )
 
 
+def _quote_player_name(name: str) -> str:
+    """Escape a player name for safe use in a CS2 console command.
+
+    CS2 console parses double-quoted args as single tokens. Stripping `"`
+    avoids breaking the surrounding `spec_player "…"` quoting; control
+    chars are also stripped because the console cuts on \\n. Names in
+    CS2 may contain spaces, unicode, and most punctuation — those are
+    fine inside `"…"`.
+    """
+    cleaned = "".join(c for c in name if c.isprintable() and c != '"').strip()
+    return cleaned
+
+
 @dataclass(frozen=True)
 class CaptureScriptPlan:
     """Inputs for generating a capture .cfg."""
 
     segments: tuple[CaptureSegment, ...]
     user_account_id: int | None = None
+    user_player_name: str | None = None  # in-game name for `spec_player "<name>"`
     record_name: str = DEFAULT_RECORD_NAME
     stream_name: str = DEFAULT_STREAM_NAME
     host_framerate: int = DEFAULT_HOST_FRAMERATE
@@ -100,6 +129,12 @@ class CaptureScriptPlan:
             raise ValueError("stream_name is required")
         if self.user_account_id is not None and self.user_account_id <= 0:
             raise ValueError(f"user_account_id must be positive, got {self.user_account_id}")
+        if self.user_player_name is not None:
+            cleaned = _quote_player_name(self.user_player_name)
+            if not cleaned:
+                raise ValueError(
+                    f"user_player_name is empty after sanitization: {self.user_player_name!r}"
+                )
         prev_end = -1
         for seg in self.segments:
             if seg.start_tick < prev_end:
@@ -144,16 +179,31 @@ def _start_commands(plan: CaptureScriptPlan) -> list[str]:
 
     Camera lock is re-applied per segment because CS2's auto-director can
     drift the spectator target between segments (round end / death / etc.)
-    even if we set it once at the top. `spec_player_by_accountid` takes a
-    32-bit Steam Account ID; `spec_mode 4` is in-eye / first-person.
+    even if we set it once at the top.
+
+    Spec target precedence:
+      1. `spec_player "<name>"` — the canonical CS2 (Source 2) command.
+         Takes the player's in-game name. CS2 has NO `*_by_accountid`
+         variant; that died with Source 1.
+      2. `spec_mode 4` — in-eye / first-person. Issued AFTER spec_player
+         so the camera attaches to the right player before switching mode.
+
+    If the player name isn't known, we still set `spec_mode 4` so at least
+    the auto-director's pick is shown in first-person (better than free-cam
+    stuck at spawn, which is what v0.2.5 produced).
     """
     cmds: list[str] = []
-    if plan.user_account_id is not None:
+    if plan.user_player_name:
         # Lock spec target BEFORE starting the take so the very first frame
         # is already on the right player. Without this, CS2 defaults to
         # auto-director and the first 1-2s of capture follow whoever was
         # "interesting" at that tick — usually NOT the user.
-        cmds.append(f"spec_player_by_accountid {plan.user_account_id}")
+        safe_name = _quote_player_name(plan.user_player_name)
+        cmds.append(f'spec_player "{safe_name}"')
+        cmds.append("spec_mode 4")
+    elif plan.user_account_id is not None:
+        # Fallback: no player name available, just force first-person on
+        # whatever the auto-director picks. Better than free-cam.
         cmds.append("spec_mode 4")
     cmds += [
         f"host_framerate {plan.host_framerate}",
@@ -193,6 +243,7 @@ def build_cfg_content(plan: CaptureScriptPlan) -> str:
         f"// stream_name:   {plan.stream_name}",
         f"// host_framerate:{plan.host_framerate}",
         f"// user_xuid:     {plan.user_account_id if plan.user_account_id else '(not pinned)'}",
+        f"// user_name:     {plan.user_player_name if plan.user_player_name else '(camera not locked)'}",
         "",
         "// Cleanup (warns harmlessly on first run when stream does not exist yet).",
         f"mirv_streams remove {plan.stream_name}",
@@ -280,6 +331,7 @@ def generate_capture_cfg(
     *,
     user_account_id: int | None = None,
     user_steamid64: str | int | None = None,
+    user_player_name: str | None = None,
     record_name: str = DEFAULT_RECORD_NAME,
     stream_name: str = DEFAULT_STREAM_NAME,
     host_framerate: int = DEFAULT_HOST_FRAMERATE,
@@ -294,6 +346,11 @@ def generate_capture_cfg(
     Pass either `user_account_id` (already SteamID3) or `user_steamid64`
     (community ID, will be converted). Either one pins the killfeed to
     that player via `mirv_deathmsg localPlayer`.
+
+    `user_player_name` is the in-game CS2 name of the player to lock the
+    spectator camera to via `spec_player "<name>"`. Required for the camera
+    to actually follow the user — without it, only the killfeed gets pinned
+    and the camera follows whoever the auto-director picks.
 
     `pre_seek=True` (default) emits a `demo_gototick` at tick 1 that jumps
     near the first segment — so the user doesn't sit through minutes of
@@ -320,6 +377,7 @@ def generate_capture_cfg(
     plan = CaptureScriptPlan(
         segments=norm_segments,
         user_account_id=user_account_id,
+        user_player_name=user_player_name,
         record_name=record_name,
         stream_name=stream_name,
         host_framerate=host_framerate,

@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from hlae_runner import HlaeRunnerConfig, RenderPlan
-from render_coordinator import RenderCoordinator
+from render_coordinator import InsufficientDiskError, RenderCoordinator
 from scanner import scan_all, _load_cache as _load_scan_cache
 from uploader import UploadQueue
 from version import __version__ as CLIENT_VERSION
@@ -225,21 +225,34 @@ def create_app(
         if not demo.exists():
             return {"error": "demo_not_found", "path": str(demo)}, 404
 
+        # `reel_props` is the full ReelProps payload from the server's
+        # /matches/{id}/render-plan endpoint (match, selectedRanks, mood,
+        # playerName, orientation). Runner injects per-segment .mov paths
+        # into match.highlights[*].gameplayVideoSrc before calling Remotion.
+        reel_props = body.get("reel_props")
+
+        # Player name precedence for spec_player camera lock:
+        #   1. Explicit `user_player_name` in the request body
+        #   2. `reel_props.playerName` from the server's render-plan
+        # Without a name, v0.2.6 falls back to `spec_mode 4` only — camera
+        # follows the auto-director's pick instead of getting stuck at
+        # spawn (which is what v0.2.5 produced when spec_player_by_accountid
+        # was sent to CS2, which doesn't recognize that command).
+        user_player_name = body.get("user_player_name")
+        if not user_player_name and isinstance(reel_props, dict):
+            user_player_name = reel_props.get("playerName")
+
         plan = RenderPlan(
             demo_path=demo,
             segments=tuple(segments),
             user_steamid64=body.get("user_steamid64") or steamid,
+            user_player_name=user_player_name,
             record_name=body.get("record_name", "fragreel"),
             stream_name=body.get("stream_name", "default"),
         )
 
         render_id = body.get("render_id") or uuid.uuid4().hex[:12]
         force = bool(body.get("force", False))
-        # `reel_props` is the full ReelProps payload from the server's
-        # /matches/{id}/render-plan endpoint (match, selectedRanks, mood,
-        # playerName, orientation). Runner injects per-segment .mov paths
-        # into match.highlights[*].gameplayVideoSrc before calling Remotion.
-        reel_props = body.get("reel_props")
         try:
             session = render_coordinator.start(
                 plan,
@@ -253,6 +266,15 @@ def create_app(
                 "detail": "Close CS2 before rendering, or POST again with {\"force\": true} to terminate it.",
                 "cs2_pids": e.pids,
             }, 409
+        except InsufficientDiskError as e:
+            # 507 = "Insufficient Storage" (WebDAV but used widely for this).
+            # Surface the per-drive breakdown so the web can show "free up
+            # X GB on C:" instead of a generic error.
+            return {
+                "error": "insufficient_disk",
+                "detail": str(e),
+                "issues": e.issues,
+            }, 507
         return jsonify(session.to_dict()), 202
 
     @app.get("/render/status")
@@ -307,7 +329,34 @@ def _build_render_coordinator() -> Optional[RenderCoordinator]:
     if not hlae_dir.exists():
         log.warning("vendor/hlae missing at %s; render endpoints disabled", hlae_dir)
         return None
-    output_dir = Path.home() / "Desktop" / "FragReel"
+
+    # Output directory precedence (v0.2.6+):
+    #   1. FRAGREEL_OUTPUT_DIR env var (lets the user point at a different
+    #      drive — e.g. D:\FragReel — without rebuilding the .exe)
+    #   2. Default: ~/Desktop/FragReel
+    # Note: this only redirects the FINAL .mov / .mp4 output. The TGA
+    # capture itself goes under <CS2_install>/game/bin/win64/fragreel/
+    # because HLAE writes there directly (mirv_streams record name is
+    # joined to the engine bin dir). Redirecting TGA capture to another
+    # drive needs a Steam library transfer or a junction point at the
+    # CS2 capture path — see the project Status doc for that workaround.
+    import os
+    env_output = os.environ.get("FRAGREEL_OUTPUT_DIR", "").strip()
+    if env_output:
+        output_dir = Path(env_output).expanduser()
+        log.info("output_dir overridden via FRAGREEL_OUTPUT_DIR: %s", output_dir)
+    else:
+        output_dir = Path.home() / "Desktop" / "FragReel"
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning(
+            "could not create output_dir %s (%s); falling back to ~/Desktop/FragReel",
+            output_dir, e,
+        )
+        output_dir = Path.home() / "Desktop" / "FragReel"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
     editor_dir = Path(__file__).parent.parent / "main" / "editor"
     config = HlaeRunnerConfig(cs2_install=cs2_install, hlae_dir=hlae_dir)
     return RenderCoordinator(
