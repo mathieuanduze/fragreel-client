@@ -84,25 +84,44 @@ def create_app(
     app = Flask(__name__)
     CORS(app, origins=ALLOWED_ORIGINS)
 
-    @app.after_request
-    def _allow_private_network(response):
-        """Chrome 120+ enforces Private Network Access: HTTPS pages calling
-        HTTP 127.0.0.1 must receive `Access-Control-Allow-Private-Network:
-        true` on the preflight or the fetch is silently blocked, making the
-        desktop client appear offline to the website. flask-cors doesn't
-        emit this header yet (upstream PR pending), so we tack it on here.
+    # Chrome 120+ Private Network Access fix — v0.2.13 regression story:
+    #
+    # v0.2.12 used @app.after_request to inject `Access-Control-Allow-Private-
+    # Network: true`. But flask-cors ALSO emits this header on preflight OPTIONS
+    # (defaulting to "false" because it considers PNA an explicit opt-in), and
+    # after_request handlers run in REVERSE registration order — our hook fired
+    # first, flask-cors fired last, result was two headers on the same response:
+    #     Access-Control-Allow-Private-Network: true    ← us
+    #     Access-Control-Allow-Private-Network: false   ← flask-cors
+    # Chrome reads the `false`, blocks, and the client still looks offline.
+    #
+    # WSGI middleware is the only layer that's guaranteed to run AFTER
+    # everything Flask does, so we strip duplicates and inject a single
+    # canonical `true` for origins we already trust via CORS.
+    _inner_wsgi = app.wsgi_app
 
-        The web side must pair this with `targetAddressSpace: "private"`
-        in its fetch calls — see web/lib/local.ts privateFetch().
-        """
-        origin = request.headers.get("Origin", "")
-        # Only advertise the capability to origins we already trust via CORS.
-        if origin and any(
+    def _pna_wsgi(environ, start_response):
+        origin = environ.get("HTTP_ORIGIN", "")
+        allow = bool(origin) and any(
             (origin == o if isinstance(o, str) else o.match(origin))
             for o in ALLOWED_ORIGINS
-        ):
-            response.headers["Access-Control-Allow-Private-Network"] = "true"
-        return response
+        )
+
+        def _patched_start(status, headers, exc_info=None):
+            # Drop any pre-existing PNA headers (flask-cors "false" is the one
+            # we care about, but also any accidental duplicates from our
+            # previous after_request hook if code is reloaded).
+            headers = [
+                (k, v) for (k, v) in headers
+                if k.lower() != "access-control-allow-private-network"
+            ]
+            if allow:
+                headers.append(("Access-Control-Allow-Private-Network", "true"))
+            return start_response(status, headers, exc_info)
+
+        return _inner_wsgi(environ, _patched_start)
+
+    app.wsgi_app = _pna_wsgi
 
     # Estado do scan — atualizado pelo background thread, lido pelo /demos.
     # `scan_done` vira True depois do PRIMEIRO scan completo (sucesso ou erro).
