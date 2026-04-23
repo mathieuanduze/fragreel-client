@@ -60,6 +60,32 @@ DEFAULT_HOST_FRAMERATE = 60
 DEFAULT_KILLFEED_LIFETIME_SEC = 90
 STEAM64_BASE = 76561197960265728
 
+# Camera re-lock cadence (in demo ticks) INSIDE each segment.
+# CS2's auto-director can drift the spectator off the user's POV mid-segment
+# (e.g. on a local event like a flash, a teammate death, round-end ambience),
+# leaving the camera frozen or jumping to someone else. Emitting
+# `spec_player "<name>"` + `spec_mode 4` every ~0.5s of demo time (32 ticks
+# at 64 tps) re-asserts the lock without measurable overhead — `spec_player`
+# is a no-op if we're already on that player.
+#
+# v0.2.9 regression: single emit at segment start wasn't enough; users
+# reported camera sitting at player's spawn while the player walked off.
+CAMERA_RELOCK_INTERVAL_TICKS = 32
+
+# Stagger between spec_player and spec_mode 4 (in ticks). Source 2's camera
+# system appears to race: if spec_mode 4 runs in the same tick as the
+# preceding spec_player, the mode-switch can land BEFORE the target is
+# committed, leaving the camera in first-person on the auto-director's
+# previous pick (or worse, free-cam at 0,0,0). A 1-tick gap lets the spec
+# target settle first.
+CAMERA_MODE_DELAY_TICKS = 1
+
+# Gap between camera lock and engine freeze (`host_timescale 0`). If we
+# freeze the demo clock in the same tick as spec_player, the engine may
+# process the freeze before the camera lock takes effect. Giving it 2 ticks
+# of headroom is cheap insurance and effectively invisible (2 ticks ≈ 31ms).
+ENGINE_FREEZE_DELAY_TICKS = 2
+
 
 def steamid64_to_account_id(steamid64: str | int) -> int:
     """Convert a SteamID64 (community ID) to the 32-bit Account ID / SteamID3.
@@ -172,46 +198,44 @@ def _setup_commands(plan: CaptureScriptPlan) -> list[str]:
     return cmds
 
 
-def _start_commands(plan: CaptureScriptPlan) -> list[str]:
-    """Per-segment: lock camera to user (in-eye) + lock engine + start a new
-    take. Each `mirv_streams record start` creates a fresh
-    `<record_name>/takeNNNN/` so the runner can map one take per highlight.
+def _camera_lock_commands(plan: CaptureScriptPlan) -> list[str]:
+    """Commands that lock the spectator camera to the target player.
 
-    Camera lock is re-applied per segment because CS2's auto-director can
-    drift the spectator target between segments (round end / death / etc.)
-    even if we set it once at the top.
+    Returned as an ordered list — the caller staggers them across ticks
+    (see `CAMERA_MODE_DELAY_TICKS`). Returns an empty list if we have
+    nothing to lock to (no player name + no account id).
 
     Spec target precedence:
       1. `spec_player "<name>"` — the canonical CS2 (Source 2) command.
          Takes the player's in-game name. CS2 has NO `*_by_accountid`
          variant; that died with Source 1.
       2. `spec_mode 4` — in-eye / first-person. Issued AFTER spec_player
-         so the camera attaches to the right player before switching mode.
-
-    If the player name isn't known, we still set `spec_mode 4` so at least
-    the auto-director's pick is shown in first-person (better than free-cam
-    stuck at spawn, which is what v0.2.5 produced).
+         (one tick later in the emitted cfg) so the camera attaches to
+         the right player before switching mode.
     """
     cmds: list[str] = []
     if plan.user_player_name:
-        # Lock spec target BEFORE starting the take so the very first frame
-        # is already on the right player. Without this, CS2 defaults to
-        # auto-director and the first 1-2s of capture follow whoever was
-        # "interesting" at that tick — usually NOT the user.
         safe_name = _quote_player_name(plan.user_player_name)
         cmds.append(f'spec_player "{safe_name}"')
         cmds.append("spec_mode 4")
     elif plan.user_account_id is not None:
-        # Fallback: no player name available, just force first-person on
-        # whatever the auto-director picks. Better than free-cam.
+        # No player name — can't pin the target, but at least force in-eye
+        # on whatever the auto-director picks. Better than free-cam.
         cmds.append("spec_mode 4")
-    cmds += [
+    return cmds
+
+
+def _engine_freeze_commands(plan: CaptureScriptPlan) -> list[str]:
+    """Commands that freeze the demo clock and start recording.
+
+    Emitted `ENGINE_FREEZE_DELAY_TICKS` after the camera lock so the lock
+    has time to settle before host_timescale 0 pauses everything.
+    """
+    return [
         f"host_framerate {plan.host_framerate}",
         "host_timescale 0",
         "mirv_streams record start",
     ]
-    cmds.extend(plan.extra_start_commands)
-    return cmds
 
 
 def _end_commands(plan: CaptureScriptPlan) -> list[str]:
@@ -252,7 +276,9 @@ def build_cfg_content(plan: CaptureScriptPlan) -> str:
     ]
 
     setup_cmds = _setup_commands(plan)
-    start_cmds = _start_commands(plan)
+    camera_lock_cmds = _camera_lock_commands(plan)
+    engine_freeze_cmds = _engine_freeze_commands(plan)
+    extra_start_cmds = list(plan.extra_start_commands)
     end_cmds = _end_commands(plan)
 
     if plan.pre_seek_tick is not None:
@@ -275,8 +301,42 @@ def build_cfg_content(plan: CaptureScriptPlan) -> str:
 
     for i, seg in enumerate(plan.segments):
         lines.append(f"// segment {i}: ticks {seg.start_tick} .. {seg.end_tick}")
-        for c in start_cmds:
-            lines.append(_emit_addAtTick(seg.start_tick, c))
+
+        # Stagger camera-lock commands across ticks so spec_player settles
+        # before spec_mode 4 fires (Source 2 race condition — see
+        # CAMERA_MODE_DELAY_TICKS). When there's no player name, only one
+        # command is in the list (spec_mode 4), so the stagger is a no-op.
+        for offset, cmd in enumerate(camera_lock_cmds):
+            emit_tick = seg.start_tick + offset * CAMERA_MODE_DELAY_TICKS
+            lines.append(_emit_addAtTick(emit_tick, cmd))
+
+        # Engine freeze + record start: delayed by ENGINE_FREEZE_DELAY_TICKS
+        # so the camera lock has propagated before host_timescale 0 freezes
+        # the world. Without this gap the camera can freeze BEFORE attaching
+        # to the player, causing the static-at-spawn bug from v0.2.9 testing.
+        freeze_tick = seg.start_tick + len(camera_lock_cmds) * CAMERA_MODE_DELAY_TICKS
+        freeze_tick += ENGINE_FREEZE_DELAY_TICKS
+        # Keep freeze strictly inside the segment window.
+        freeze_tick = min(freeze_tick, seg.end_tick - 1)
+        for c in engine_freeze_cmds:
+            lines.append(_emit_addAtTick(freeze_tick, c))
+        for c in extra_start_cmds:
+            lines.append(_emit_addAtTick(freeze_tick, c))
+
+        # Periodic camera re-lock inside the segment. Guards against the
+        # auto-director drifting the spec target mid-take (happens on
+        # flashes, teammate deaths, round-end camera ambience). Every
+        # CAMERA_RELOCK_INTERVAL_TICKS we re-issue the whole lock block;
+        # spec_player is a no-op when we're already on that player, so
+        # this is effectively free.
+        if camera_lock_cmds:
+            relock_tick = seg.start_tick + CAMERA_RELOCK_INTERVAL_TICKS
+            while relock_tick < seg.end_tick:
+                for offset, cmd in enumerate(camera_lock_cmds):
+                    emit_tick = min(relock_tick + offset * CAMERA_MODE_DELAY_TICKS, seg.end_tick - 1)
+                    lines.append(_emit_addAtTick(emit_tick, cmd))
+                relock_tick += CAMERA_RELOCK_INTERVAL_TICKS
+
         for c in end_cmds:
             lines.append(_emit_addAtTick(seg.end_tick, c))
 
