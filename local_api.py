@@ -186,12 +186,35 @@ def create_app(
 
         body = request.get_json(silent=True) or {}
         try:
-            segments = [
+            raw_segments = [
                 (int(s["start_tick"]), int(s["end_tick"]))
                 for s in body.get("segments", [])
             ]
         except (KeyError, TypeError, ValueError) as e:
             return {"error": "bad_segments", "detail": str(e)}, 400
+        if not raw_segments:
+            return {"error": "no_segments"}, 400
+
+        # The web sends segments in highlight-score order (not tick order),
+        # and two highlights for kills close together can overlap by a few
+        # hundred ticks. capture_script.py validates strict ascending +
+        # non-overlapping and would error out as "segments overlap". Sort
+        # by start_tick and greedily merge any overlap so the user gets a
+        # single contiguous capture instead of an error.
+        raw_segments = [(s, e) for s, e in raw_segments if e > s]
+        raw_segments.sort(key=lambda se: se[0])
+        segments: list[tuple[int, int]] = []
+        for start, end in raw_segments:
+            if segments and start <= segments[-1][1]:
+                prev_start, prev_end = segments[-1]
+                segments[-1] = (prev_start, max(prev_end, end))
+            else:
+                segments.append((start, end))
+        if len(segments) != len(raw_segments):
+            log.info(
+                "/render — merged %d overlapping segment(s) → %d final segment(s)",
+                len(raw_segments) - len(segments), len(segments),
+            )
         if not segments:
             return {"error": "no_segments"}, 400
 
