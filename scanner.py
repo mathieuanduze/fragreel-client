@@ -28,7 +28,13 @@ log = logging.getLogger("fragreel.scanner")
 
 CACHE_DIR = Path.home() / ".fragreel"
 CACHE_FILE = CACHE_DIR / "scanned.json"
-CACHE_VERSION = 5           # bump: v5 guarda meta completa pra reaproveitar em demos já processadas
+# v6 (v0.2.8): invalida caches antigos onde uma falha transitória de parse
+# (ex: demoparser2 ainda não bundlado em early v0.1.x, ou falha de import)
+# marcou demos legítimas como "not_user_demo_or_parse_failed" pra sempre.
+# Symptom: usuários atualizando de < v0.2.8 viam "0 demos encontradas"
+# mesmo com .dem válidos no replays/. _load_cache() filtra entries com v != 6,
+# forçando reparse de tudo na primeira execução pós-upgrade.
+CACHE_VERSION = 6
 MIN_SIZE = 50 * 1024        # 50KB — abaixo disso é arquivo temp ou corrompido
 MAX_SCAN_PER_RUN = 50       # limite pra primeira execução não travar
 
@@ -137,6 +143,23 @@ def _parse_demo_summary(path: Path, steamid: str) -> Optional[ScannedMatch]:
             for r in rows
         )
         if not player_in_match:
+            # Diagnóstico: lista os steamids únicos que apareceram na demo.
+            # Útil pra detectar mismatch de formato (steamid64 vs steamid3
+            # vs profileid) — bug silencioso que faria toda demo ser pulada.
+            sample_ids: set[str] = set()
+            for r in rows[:200]:  # 200 events bastam pra cobrir todo time
+                aid = r.get("attacker_steamid")
+                uid = r.get("user_steamid")
+                if aid is not None:
+                    sample_ids.add(str(aid))
+                if uid is not None:
+                    sample_ids.add(str(uid))
+                if len(sample_ids) >= 12:
+                    break
+            log.info(
+                f"    [parse] {path.name}: usuário ({steamid}) não está na demo. "
+                f"steamids vistos (sample): {sorted(sample_ids)[:12]}"
+            )
             return None
 
         # Stats do jogador
