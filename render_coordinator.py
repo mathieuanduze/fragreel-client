@@ -56,10 +56,19 @@ PROGRESS_RENDERING = 0.10
 PROGRESS_DONE = 1.00
 
 # For capturing, we need a total-frame estimate to map frames → progress.
-# At host_framerate=300 and tickrate=64, each tick ≈ 300/64 = 4.6875 frames.
+# At host_framerate=120 and tickrate=64, each tick ≈ 120/64 = 1.875 frames.
+# IMPORTANT: must match DEFAULT_HOST_FRAMERATE in capture_script.py — wrong
+# value here only affects progress %, not the capture itself, but a 4x
+# mismatch makes the bar stay at 24% forever (the v0.2.3 → 0.2.4 lesson).
 CS2_TICKRATE = 64
-CAPTURE_FPS = 300
+CAPTURE_FPS = 120
 FRAMES_PER_TICK = CAPTURE_FPS / CS2_TICKRATE
+
+# Wall-clock cap for the capture stage. Even on a modest PC, capturing 4
+# segments at 120 fps + ProRes-bound TGA writes runs ~25 min for a typical
+# 4-highlight reel. 60 min gives 2x margin. v0.2.3 had 15 min, which cut
+# off mid-segment-0 on PCs that couldn't sustain >300 fps wall-clock.
+CAPTURE_TIMEOUT_SEC = 3600.0
 
 
 @dataclass
@@ -258,7 +267,7 @@ class RenderCoordinator:
             result = self._runner.wait_for_capture(
                 plan,
                 pre_take_index=pre_take,
-                timeout_sec=900.0,  # 15 min — plenty for a full match
+                timeout_sec=CAPTURE_TIMEOUT_SEC,
                 on_progress=on_progress,
             )
             self._update(
