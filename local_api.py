@@ -25,6 +25,11 @@ from typing import Optional
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+from client_config import (
+    clear_output_dir,
+    resolve_output_dir,
+    set_output_dir,
+)
 from hlae_runner import HlaeRunnerConfig, RenderPlan
 from render_coordinator import InsufficientDiskError, RenderCoordinator
 from scanner import scan_all, _load_cache as _load_scan_cache
@@ -294,6 +299,129 @@ def create_app(
         current = render_coordinator.current()
         return jsonify(current.to_dict() if current else {"state": "idle"})
 
+    # ── Config endpoints (v0.2.7+ — Settings UI in web) ─────────────────
+
+    def _serialize_resolved(resolved) -> dict:
+        return {
+            "output_dir": str(resolved.path),
+            "source": resolved.source,
+            "default": str(resolved.default),
+            "env_override": str(resolved.env_override) if resolved.env_override else None,
+        }
+
+    @app.get("/config")
+    def get_config():
+        """Returns current effective output_dir + provenance.
+        Settings UI shows `source: "env"` as a read-only banner ("override
+        ativo via FRAGREEL_OUTPUT_DIR — remova a env var para usar a UI")."""
+        resolved = resolve_output_dir()
+        return jsonify(_serialize_resolved(resolved))
+
+    @app.post("/config")
+    def post_config():
+        """Update output_dir. Body: {"output_dir": "D:\\\\FragReel"}.
+        Validates: non-empty string, can be created/exists, is writable.
+        On success, hot-reloads RenderCoordinator's output_dir so the
+        next render uses it without restarting the .exe."""
+        body = request.get_json(silent=True) or {}
+        new_dir_raw = body.get("output_dir")
+        if not isinstance(new_dir_raw, str) or not new_dir_raw.strip():
+            return {"error": "missing_output_dir",
+                    "detail": "body must be {output_dir: <non-empty string>}"}, 400
+
+        new_path = Path(new_dir_raw.strip()).expanduser()
+        # Validate: try to create + write a probe file. We don't trust
+        # path.is_dir() alone — Windows can show writable-looking paths
+        # under restricted system folders that fail at runtime.
+        try:
+            new_path.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return {"error": "cannot_create",
+                    "detail": f"could not create {new_path}: {e}"}, 400
+        probe = new_path / ".fragreel-write-probe"
+        try:
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+        except OSError as e:
+            return {"error": "not_writable",
+                    "detail": f"cannot write to {new_path}: {e}"}, 400
+
+        resolved = set_output_dir(new_path)
+        # Hot-reload coordinator so next render picks up the new path.
+        # When env var is overriding, resolved.path != new_path — log a
+        # warning so the user sees why their save "didn't take".
+        if render_coordinator is not None:
+            render_coordinator.update_output_dir(resolved.path)
+            if resolved.source == "env":
+                log.warning(
+                    "saved output_dir=%s but FRAGREEL_OUTPUT_DIR=%s overrides it; "
+                    "next render will still use the env value",
+                    new_path, resolved.env_override,
+                )
+        return jsonify(_serialize_resolved(resolved))
+
+    @app.post("/config/reset")
+    def reset_config():
+        """Clear output_dir override → falls back to env or default."""
+        resolved = clear_output_dir()
+        if render_coordinator is not None:
+            render_coordinator.update_output_dir(resolved.path)
+        return jsonify(_serialize_resolved(resolved))
+
+    @app.post("/config/pick-folder")
+    def pick_folder():
+        """Open the OS-native folder picker dialog and return the chosen
+        path. Does NOT save it — the web shows the result in the input,
+        user clicks Save, then POST /config persists.
+
+        Why a separate endpoint: HTML5 has no folder picker. <input
+        webkitdirectory> only gives File objects, not the absolute path.
+        Asking the user to type "D:\\Users\\...\\FragReel" by hand is
+        terrible UX. The local client has tkinter for free, so we open
+        the native dialog from here.
+
+        Implementation note: tkinter wants to be on the main thread.
+        Flask runs us on a worker thread. On Windows this still works
+        for transient (Tk + filedialog + destroy) usage because no real
+        event loop runs. If it ever breaks, the web falls back to the
+        text input the user can type into manually.
+        """
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except ImportError:
+            return {"error": "tkinter_unavailable",
+                    "detail": "native picker not bundled; type the path manually"}, 501
+
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            # On Windows, dialogs from background threads can render
+            # behind other windows. -topmost forces it to the front.
+            root.attributes("-topmost", True)
+            initial = str(resolve_output_dir().path)
+            try:
+                Path(initial).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                initial = str(Path.home())
+            chosen = filedialog.askdirectory(
+                parent=root,
+                title="Escolha a pasta onde os FragReels serão salvos",
+                initialdir=initial,
+                mustexist=False,
+            )
+            root.destroy()
+        except Exception as e:
+            log.exception("native folder picker failed")
+            return {"error": "picker_failed",
+                    "detail": f"{type(e).__name__}: {e}"}, 500
+
+        if not chosen:
+            # User cancelled — distinguish from error so the web can just
+            # close the picker silently instead of showing a toast.
+            return jsonify({"cancelled": True})
+        return jsonify({"cancelled": False, "path": chosen})
+
     return app
 
 
@@ -330,31 +458,27 @@ def _build_render_coordinator() -> Optional[RenderCoordinator]:
         log.warning("vendor/hlae missing at %s; render endpoints disabled", hlae_dir)
         return None
 
-    # Output directory precedence (v0.2.6+):
-    #   1. FRAGREEL_OUTPUT_DIR env var (lets the user point at a different
-    #      drive — e.g. D:\FragReel — without rebuilding the .exe)
-    #   2. Default: ~/Desktop/FragReel
+    # Output directory precedence (v0.2.7+, see client_config.py):
+    #   1. FRAGREEL_OUTPUT_DIR env var (CI/power-user escape hatch)
+    #   2. config.json `output_dir` (Settings UI in the web)
+    #   3. Default: ~/Desktop/FragReel
     # Note: this only redirects the FINAL .mov / .mp4 output. The TGA
     # capture itself goes under <CS2_install>/game/bin/win64/fragreel/
     # because HLAE writes there directly (mirv_streams record name is
     # joined to the engine bin dir). Redirecting TGA capture to another
     # drive needs a Steam library transfer or a junction point at the
     # CS2 capture path — see the project Status doc for that workaround.
-    import os
-    env_output = os.environ.get("FRAGREEL_OUTPUT_DIR", "").strip()
-    if env_output:
-        output_dir = Path(env_output).expanduser()
-        log.info("output_dir overridden via FRAGREEL_OUTPUT_DIR: %s", output_dir)
-    else:
-        output_dir = Path.home() / "Desktop" / "FragReel"
+    resolved = resolve_output_dir()
+    output_dir = resolved.path
+    log.info("output_dir resolved: %s (source=%s)", output_dir, resolved.source)
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         log.warning(
-            "could not create output_dir %s (%s); falling back to ~/Desktop/FragReel",
-            output_dir, e,
+            "could not create output_dir %s (%s); falling back to %s",
+            output_dir, e, resolved.default,
         )
-        output_dir = Path.home() / "Desktop" / "FragReel"
+        output_dir = resolved.default
         output_dir.mkdir(parents=True, exist_ok=True)
 
     editor_dir = Path(__file__).parent.parent / "main" / "editor"
