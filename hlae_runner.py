@@ -26,6 +26,7 @@ import json
 import logging
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -41,6 +42,14 @@ from scripts.capture_script import (
 
 
 log = logging.getLogger(__name__)
+
+
+# Windows-only: supress the cmd/PowerShell console window that normally pops
+# up when we call a .exe like ffmpeg.exe via subprocess. Users reported (v0.2.9
+# testing, Apr 23) that a PowerShell window blinked open showing the MEIPASS
+# ffmpeg path — scary from a non-technical user's POV. CREATE_NO_WINDOW is
+# 0x08000000. On non-Windows this ends up as 0, a harmless flag.
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
 # ---------------------------------------------------------------------------
@@ -279,10 +288,20 @@ class HlaeRunner:
         # -insecure: no VAC — required for injected hook + demo playback.
         # +mat_queue_mode 2: multi-thread renderer.
         # +fps_max 0: uncap render rate; host_framerate drives pacing.
+        # -noborder + -x/-y: CS2 uses SDL for windowing and respects these
+        # flags. Positioning the window at (-32000, -32000) from frame 0
+        # means the user never sees it on their desktop — previously we
+        # relied on a polling watcher to move it *after* it appeared, which
+        # left a 100–500ms visible flash (regression reported on v0.2.9).
+        # -noborder strips the titlebar so even during that flash there's
+        # no "CS2" window chrome, just black pixels.
         return [
             "-insecure",
             "-novid",
             "-windowed",
+            "-noborder",
+            "-x", "-32000",
+            "-y", "-32000",
             "-w", str(w),
             "-h", str(h),
             "+mat_fullscreen", "0",
@@ -530,6 +549,52 @@ class HlaeRunner:
     def _count_tgas(stream_dir: Path) -> int:
         return sum(1 for p in stream_dir.iterdir() if p.suffix.lower() == ".tga")
 
+    @staticmethod
+    def cleanup_orphan_take_dirs(record_root: Path, *, keep_below_index: int = 0) -> tuple[int, int]:
+        """Delete `takeNNNN/` subdirs left behind under `record_root`.
+
+        Called when a render is cancelled mid-capture — HLAE does not
+        clean up after itself, and a single aborted 60-fps capture can
+        leave 10+ GB of orphan TGAs on disk. Returns
+        `(dirs_deleted, bytes_freed)`.
+
+        `keep_below_index`: leave takes with N < this alone. Typically
+        set to the `pre_take` snapshot so we never touch takes that were
+        already on disk before our session started (user's older renders
+        from previous sessions, in theory — in practice FragReel always
+        cleans up its own, but belt-and-braces).
+
+        Non-`takeNNNN` children of `record_root` are also left alone.
+        """
+        if not record_root.exists() or not record_root.is_dir():
+            return 0, 0
+        dirs_deleted = 0
+        bytes_freed = 0
+        for child in record_root.iterdir():
+            if not child.is_dir() or not child.name.startswith("take"):
+                continue
+            try:
+                n = int(child.name[4:])
+            except ValueError:
+                continue
+            if n < keep_below_index:
+                continue
+            try:
+                # Sum before delete for the telemetry log; best-effort —
+                # errors walking a dir mean we just skip the size total.
+                try:
+                    bytes_freed += sum(
+                        p.stat().st_size for p in child.rglob("*") if p.is_file()
+                    )
+                except OSError:
+                    pass
+                import shutil as _shutil
+                _shutil.rmtree(child, ignore_errors=True)
+                dirs_deleted += 1
+            except OSError as e:
+                log.warning("could not remove orphan take %s: %s", child, e)
+        return dirs_deleted, bytes_freed
+
     # -- stage 4 ------------------------------------------------------------
 
     def render_remotion(
@@ -619,7 +684,13 @@ class HlaeRunner:
             sum(1 for t in result.takes if t.mov_path is not None),
         )
         output_mp4.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(cmd, cwd=editor_dir, check=True, shell=False)
+        subprocess.run(
+            cmd,
+            cwd=editor_dir,
+            check=True,
+            shell=False,
+            creationflags=_NO_WINDOW,
+        )
         return output_mp4
 
     def convert_takes_to_prores(
@@ -737,6 +808,7 @@ class HlaeRunner:
             capture_output=True,
             text=True,
             errors="replace",
+            creationflags=_NO_WINDOW,
         )
         if proc.returncode != 0:
             tail = "\n".join(proc.stderr.splitlines()[-30:]) if proc.stderr else "(no stderr)"
@@ -860,6 +932,7 @@ class HlaeRunner:
             capture_output=True,
             text=True,
             errors="replace",
+            creationflags=_NO_WINDOW,
         )
         # Always remove the list file — it's just a manifest, not user data.
         try:

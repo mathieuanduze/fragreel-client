@@ -155,6 +155,12 @@ class RenderCoordinator:
         self._lock = threading.Lock()
         self._cancel_requested = threading.Event()
         self._runner: HlaeRunner | None = None
+        # Scratch paths for the currently-running session — kept so a
+        # mid-capture cancel can clean up the TGAs / empty mov subdir
+        # instead of leaving multi-GB garbage behind (v0.2.9 feedback).
+        self._active_record_root: Path | None = None
+        self._active_mov_dir: Path | None = None
+        self._active_pre_take: int = 0
 
     # -- public API ---------------------------------------------------------
 
@@ -356,6 +362,11 @@ class RenderCoordinator:
             # Snapshot existing takes so wait_for_capture ignores them
             record_root = self.config.recording_parent / plan.record_name
             pre_take = HlaeRunner._snapshot_take_index(record_root)
+            # Remember these for the cancel path — we want to blow away
+            # partial takeNNNN/ dirs that weren't finalized by the time
+            # the user hit cancel (HLAE doesn't clean up after itself).
+            self._active_record_root = record_root
+            self._active_pre_take = pre_take
 
             # Stage 2: launch CS2 injected + minimized
             self._update(
@@ -378,6 +389,7 @@ class RenderCoordinator:
 
             mov_dir = self.output_dir / plan.demo_basename
             mov_dir.mkdir(parents=True, exist_ok=True)
+            self._active_mov_dir = mov_dir
             converted_movs: dict[int, Path] = {}
 
             def on_progress(now: int, prev: int) -> None:
@@ -537,6 +549,20 @@ class RenderCoordinator:
                     if self._session:
                         self._session.output_movs = ()
 
+            # With the .movs gone (either concat path cleanup_movs=True
+            # or the remotion-then-prune block above), the per-match
+            # subdir is typically empty. rmdir() it so Desktop doesn't
+            # fill up with `fragreel/<match_id>/` shells (v0.2.9 bug).
+            # If something else wrote inside (e.g. a user drag-copied),
+            # rmdir raises and we leave it alone.
+            try:
+                if mov_dir.exists() and not any(mov_dir.iterdir()):
+                    mov_dir.rmdir()
+            except OSError:
+                pass
+
+            self._active_record_root = None
+            self._active_mov_dir = None
             self._mark_done()
         except Exception as e:
             tb = traceback.format_exc()
@@ -605,3 +631,40 @@ class RenderCoordinator:
             kill_running_cs2()
         except Exception:
             pass
+        # Best-effort scratch cleanup. v0.2.9 left orphan TGAs (multi-GB)
+        # and an empty <match_id>/ subdir under Desktop whenever a
+        # render was aborted — both reported as bug by testing user.
+        record_root = self._active_record_root
+        pre_take = self._active_pre_take
+        if record_root is not None:
+            try:
+                deleted, freed = HlaeRunner.cleanup_orphan_take_dirs(
+                    record_root, keep_below_index=pre_take,
+                )
+                if deleted:
+                    log.info(
+                        "cancel cleanup: removed %d orphan take dir(s), freed %.2f GB",
+                        deleted, freed / (1024 ** 3),
+                    )
+            except Exception as e:
+                log.warning("cancel cleanup (take dirs) failed: %s", e)
+        mov_dir = self._active_mov_dir
+        if mov_dir is not None and mov_dir.exists():
+            try:
+                # mov_dir may have partial .movs from segments finalized
+                # before cancel. Delete them + the now-empty parent so
+                # Desktop doesn't accumulate `fragreel/<match_id>/` shells.
+                for p in mov_dir.iterdir():
+                    try:
+                        if p.is_file():
+                            p.unlink()
+                    except OSError:
+                        pass
+                try:
+                    mov_dir.rmdir()
+                except OSError:
+                    pass  # non-empty (subdir we don't understand) — leave it
+            except Exception as e:
+                log.warning("cancel cleanup (mov dir %s) failed: %s", mov_dir, e)
+        self._active_record_root = None
+        self._active_mov_dir = None

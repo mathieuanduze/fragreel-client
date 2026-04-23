@@ -22,6 +22,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import subprocess
+import sys
 import time
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -35,6 +36,12 @@ log = logging.getLogger(__name__)
 # --- Win32 constants -------------------------------------------------------
 
 CREATE_SUSPENDED = 0x00000004
+# Suppress the flash of a cmd/PowerShell window when we shell out to things
+# like `tasklist` / `taskkill`. Windows-only; on other platforms this ends up
+# as 0 (harmless). Same constant is defined in hlae_runner.py for the ffmpeg
+# invocations — keeping two local copies (vs a shared utils module) to keep
+# cs2_launcher.py importable without pulling half the client into scope.
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 PROCESS_ALL_ACCESS = 0x001F0FFF
 MEM_COMMIT = 0x1000
 MEM_RESERVE = 0x2000
@@ -339,7 +346,7 @@ def move_process_windows_offscreen(
     pid: int,
     *,
     timeout_sec: float = 20.0,
-    poll_sec: float = 0.1,
+    poll_sec: float = 0.03,
     watch_for_sec: float = 4.0,
 ) -> bool:
     """Hide + disable every top-level window of `pid`.
@@ -349,6 +356,11 @@ def move_process_windows_offscreen(
     let them press keys that disrupted demo playback). Keeps watching for
     `watch_for_sec` after the first sighting because Source 2 may swap
     splash → D3D main window, and we want to catch both.
+
+    Note: as of v0.2.10 CS2 is launched with `-x -32000 -y -32000` so the
+    initial window already appears offscreen. This watcher is redundant
+    belt-and-braces — polling at 30ms to catch any subsequent window Source 2
+    might create (splash → main swap, etc) before the user sees it.
     """
     deadline = time.monotonic() + timeout_sec
     handled: set[int] = set()
@@ -393,6 +405,7 @@ def find_running_cs2_pids() -> list[int]:
         out = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq cs2.exe", "/FO", "CSV", "/NH"],
             capture_output=True, text=True, check=True, timeout=10,
+            creationflags=_NO_WINDOW,
         ).stdout
     except Exception as e:
         log.warning("tasklist failed: %s", e)
@@ -420,6 +433,7 @@ def kill_running_cs2(*, wait_sec: float = 5.0) -> int:
     subprocess.run(
         ["taskkill", "/F", "/IM", "cs2.exe"],
         capture_output=True, timeout=10,
+        creationflags=_NO_WINDOW,
     )
     # Give Windows a moment to actually release the process + its ports/files.
     deadline = time.monotonic() + wait_sec
