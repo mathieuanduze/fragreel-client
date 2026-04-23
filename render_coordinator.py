@@ -162,6 +162,25 @@ class RenderCoordinator:
         with self._lock:
             return self._session
 
+    def update_output_dir(self, new_path: Path) -> None:
+        """Hot-swap the output directory (called by /config POST handler).
+
+        We don't pause an active render — the path is read at the start
+        of `_run` and kept in plan-local variables, so changing it
+        mid-render is safe but only affects the NEXT render. mkdir
+        failures are logged and the previous value is kept.
+        """
+        new_path = Path(new_path)
+        try:
+            new_path.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            log.warning("update_output_dir(%s) failed (%s); keeping %s",
+                        new_path, e, self.output_dir)
+            return
+        with self._lock:
+            log.info("output_dir hot-reloaded: %s → %s", self.output_dir, new_path)
+            self.output_dir = new_path
+
     class CS2BusyError(RuntimeError):
         """Raised when the user has a live CS2 session we shouldn't kill."""
 
