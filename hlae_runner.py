@@ -774,6 +774,122 @@ class HlaeRunner:
                 # leftover files they can clean manually.
                 log.warning("could not clean take dir %s: %s", take.take_dir, e)
 
+    # -- stage 5 fallback ----------------------------------------------------
+
+    def concat_movs_to_mp4(
+        self,
+        mov_paths: list[Path],
+        output_mp4: Path,
+        *,
+        ffmpeg: Path | None = None,
+        cleanup_movs: bool = True,
+    ) -> Path:
+        """Concatenate ProRes .mov segments into a single h264 MP4.
+
+        Used when Remotion isn't available (e.g. inside the PyInstaller
+        .exe, where the editor/ folder isn't bundled). Without this
+        fallback the user is left with ProRes 4444 .mov files whose
+        codec_tag "ap4h" Windows Media Player refuses to decode (the
+        "formato não suportado" symptom from v0.2.8 testing).
+
+        We re-encode to h264 + yuv420p + aac so the result plays in
+        every default OS player, social platforms, and Discord.
+
+        Args:
+            mov_paths: ordered list of .mov files (one per highlight).
+                Empty list raises.
+            output_mp4: destination path. Parent dir is created.
+            cleanup_movs: delete the input .mov files after success.
+                The user only needs the final MP4; the intermediate
+                ProRes files are 5–10 GB each and serve no purpose
+                once the MP4 is on disk. Survival of the source files
+                on failure is guaranteed (cleanup runs only after
+                ffmpeg returns 0).
+
+        Returns the MP4 path on success. Raises RuntimeError otherwise.
+        """
+        if not mov_paths:
+            raise ValueError("no .mov inputs to concat")
+
+        ff = ffmpeg or self.config.resolved_ffmpeg()
+        if ff is None:
+            raise RuntimeError(
+                "ffmpeg not found (checked --ffmpeg-exe, bundled, and $PATH)"
+            )
+
+        output_mp4.parent.mkdir(parents=True, exist_ok=True)
+
+        # ffmpeg's concat *demuxer* needs a list file. We write it next
+        # to the MP4 output so any debugging artifact is co-located.
+        # Path quoting follows ffmpeg's concat protocol — single quotes
+        # around the path, with embedded single-quotes escaped as
+        # `'\''`. Windows backslashes need to become forward slashes
+        # so ffmpeg doesn't choke on the escape sequences.
+        list_file = output_mp4.with_suffix(".concat.txt")
+        with list_file.open("w", encoding="utf-8") as fh:
+            for mov in mov_paths:
+                escaped = str(mov).replace("\\", "/").replace("'", "'\\''")
+                fh.write(f"file '{escaped}'\n")
+
+        cmd: list[str] = [
+            str(ff),
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(list_file),
+            # h264 high profile + yuv420p = playable in WMP, QuickTime,
+            # Discord, browsers. CRF 18 is "visually lossless" for the
+            # 1080p ProRes source we just produced; preset fast keeps
+            # encode time under ~30s for a typical 4-segment reel.
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            str(output_mp4),
+        ]
+
+        log.info(
+            "ffmpeg concat: %d .mov(s) → %s",
+            len(mov_paths), output_mp4.name,
+        )
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+        # Always remove the list file — it's just a manifest, not user data.
+        try:
+            list_file.unlink()
+        except OSError:
+            pass
+
+        if proc.returncode != 0:
+            tail = "\n".join(proc.stderr.splitlines()[-30:]) if proc.stderr else "(no stderr)"
+            raise RuntimeError(
+                f"ffmpeg concat failed (exit {proc.returncode}).\n"
+                f"command: {' '.join(cmd)}\n"
+                f"stderr (last 30 lines):\n{tail}"
+            )
+
+        if cleanup_movs:
+            freed_bytes = 0
+            for mov in mov_paths:
+                try:
+                    freed_bytes += mov.stat().st_size
+                    mov.unlink()
+                except OSError as e:
+                    log.warning("could not delete %s: %s", mov, e)
+            log.info(
+                "freed %.1f GB of intermediate ProRes .mov(s)",
+                freed_bytes / (1024 ** 3),
+            )
+
+        return output_mp4
+
 
 # ---------------------------------------------------------------------------
 # CLI (for manual testing / runner invocation)

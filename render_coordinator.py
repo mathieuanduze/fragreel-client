@@ -461,10 +461,25 @@ class RenderCoordinator:
             if self._cancel_requested.is_set():
                 return self._mark_cancelled()
 
-            # Stage 5: Remotion composition (final .mp4)
+            # Stage 5: produce the final playable MP4. Two paths:
+            #   (a) Remotion — composes branded reel with overlays. Only
+            #       available when editor/ is present (dev tree, not the
+            #       PyInstaller .exe). Output is h264 MP4 already.
+            #   (b) ffmpeg concat fallback — re-encodes the per-segment
+            #       ProRes .movs into a single h264 MP4. Played by every
+            #       OS default player; no fancy overlays but watchable.
+            #
+            # v0.2.8 had only path (a) and silently logged "no editor_dir"
+            # otherwise, leaving the user with ProRes 4444 .mov files
+            # whose codec_tag "ap4h" Windows Media Player rejects. v0.2.9
+            # always produces an MP4 — Remotion when possible, concat
+            # otherwise.
+            mp4_path = self.output_dir / f"{plan.demo_basename}.mp4"
+            mov_paths: list[Path] = list(converted_movs[k] for k in sorted(converted_movs))
+            remotion_succeeded = False
+
             if self.editor_dir is not None and self.editor_dir.is_dir():
-                mp4_path = self.output_dir / f"{plan.demo_basename}.mp4"
-                self._update(state="rendering", stage="composing final MP4")
+                self._update(state="rendering", stage="composing final MP4 (Remotion)")
                 try:
                     self._runner.render_remotion(
                         result=result,
@@ -475,16 +490,52 @@ class RenderCoordinator:
                     with self._lock:
                         if self._session:
                             self._session.output_mp4 = mp4_path
+                    remotion_succeeded = True
                 except Exception as e:
-                    # Remotion failures shouldn't lose the .mov files the
-                    # user already has — log and degrade.
-                    log.warning("remotion stage skipped: %s", e)
-                    self._update(stage=f"MOVs ready (remotion skipped: {e})")
-            else:
-                self._update(
-                    stage=f"{len(result.takes)} MOV(s) ready at {mov_dir.name}/ "
-                    f"(no editor_dir for Remotion)"
-                )
+                    # Remotion failures shouldn't lose the .mov files —
+                    # we'll concat them in the fallback below.
+                    log.warning("remotion stage failed, falling back to concat: %s", e)
+                    self._update(stage=f"remotion failed, concatenating instead: {e}")
+
+            if not remotion_succeeded:
+                self._update(state="rendering", stage="encoding final MP4 (ffmpeg concat)")
+                try:
+                    self._runner.concat_movs_to_mp4(
+                        mov_paths=mov_paths,
+                        output_mp4=mp4_path,
+                        cleanup_movs=True,
+                    )
+                    with self._lock:
+                        if self._session:
+                            self._session.output_mp4 = mp4_path
+                            # The .movs are gone — clear the list so the
+                            # web doesn't offer "open .mov" buttons that
+                            # would 404 on the OS-open call.
+                            self._session.output_movs = ()
+                except Exception as e:
+                    log.error("ffmpeg concat fallback failed: %s", e)
+                    self._update(stage=f"MOVs ready (concat failed: {e})")
+
+            # If Remotion succeeded, prune the ProRes intermediates too —
+            # the MP4 carries everything the user needs and the .movs are
+            # multi-GB scratch files. Best-effort; failures are non-fatal.
+            if remotion_succeeded and mov_paths:
+                freed_bytes = 0
+                for mov in mov_paths:
+                    try:
+                        if mov.exists():
+                            freed_bytes += mov.stat().st_size
+                            mov.unlink()
+                    except OSError as e:
+                        log.warning("could not delete %s after Remotion: %s", mov, e)
+                if freed_bytes:
+                    log.info(
+                        "freed %.1f GB of intermediate ProRes .mov(s) post-Remotion",
+                        freed_bytes / (1024 ** 3),
+                    )
+                with self._lock:
+                    if self._session:
+                        self._session.output_movs = ()
 
             self._mark_done()
         except Exception as e:
