@@ -31,7 +31,12 @@ from typing import Iterable
 
 DEFAULT_RECORD_NAME = "fragreel"
 DEFAULT_STREAM_NAME = "default"
-DEFAULT_HOST_FRAMERATE = 300
+# 120 fps capture: 1.875x slow-motion vs CS2's 64 tps. Cinético o suficiente
+# pra clipes de kill ficarem dramáticos sem tornar o render impraticável.
+# Antes (v0.2.3): 300 fps (4.69x slow-mo) — pegava ~60 min de wall-clock pra
+# capturar 4 segments num PC modesto e batia o timeout do coordinator. Era
+# qualidade premium mas matava UX.
+DEFAULT_HOST_FRAMERATE = 120
 DEFAULT_KILLFEED_LIFETIME_SEC = 90
 STEAM64_BASE = 76561197960265728
 
