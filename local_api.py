@@ -84,6 +84,26 @@ def create_app(
     app = Flask(__name__)
     CORS(app, origins=ALLOWED_ORIGINS)
 
+    @app.after_request
+    def _allow_private_network(response):
+        """Chrome 120+ enforces Private Network Access: HTTPS pages calling
+        HTTP 127.0.0.1 must receive `Access-Control-Allow-Private-Network:
+        true` on the preflight or the fetch is silently blocked, making the
+        desktop client appear offline to the website. flask-cors doesn't
+        emit this header yet (upstream PR pending), so we tack it on here.
+
+        The web side must pair this with `targetAddressSpace: "private"`
+        in its fetch calls — see web/lib/local.ts privateFetch().
+        """
+        origin = request.headers.get("Origin", "")
+        # Only advertise the capability to origins we already trust via CORS.
+        if origin and any(
+            (origin == o if isinstance(o, str) else o.match(origin))
+            for o in ALLOWED_ORIGINS
+        ):
+            response.headers["Access-Control-Allow-Private-Network"] = "true"
+        return response
+
     # Estado do scan — atualizado pelo background thread, lido pelo /demos.
     # `scan_done` vira True depois do PRIMEIRO scan completo (sucesso ou erro).
     state: dict = {
