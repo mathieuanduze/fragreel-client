@@ -82,6 +82,10 @@ a = Analysis(
         'render_coordinator',
         'setup_vendor',
         'scripts.capture_script',
+        # v0.2.7: client_config holds output_dir persistence. Imported by
+        # local_api at top level, so a missing bundle would crash the entire
+        # API thread on startup (not just /config endpoints).
+        'client_config',
     ],
     hookspath=[],
     hooksconfig={},
