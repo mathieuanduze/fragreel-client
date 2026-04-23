@@ -13,9 +13,14 @@ right after `playdemo`. Paths are relative to `<CS2>/game/csgo/cfg/`.
 
 Capture pipeline per segment:
 
-- At `start_tick`: install stream, pin killfeed to the user, lock engine
-  (`host_framerate` + `host_timescale 0`), start recording.
+- At `start_tick`: lock spectator camera to the user (`spec_player_by_accountid`
+  + `spec_mode 4`), lock engine (`host_framerate` + `host_timescale 0`),
+  start recording. The killfeed and stream are installed once before the
+  first segment.
 - At `end_tick`: stop recording, release engine.
+- At `end_tick + 1` (when there's another segment): emit `demo_gototick`
+  to skip the silent gap to the next segment instead of letting CS2 play
+  it back at normal speed (1 round ≈ 115s of wasted wall-clock).
 
 The user's Steam Account ID (SteamID3) is what CS2 expects in
 `mirv_deathmessage localPlayer <id>`. Convert from SteamID64 with
@@ -133,10 +138,24 @@ def _setup_commands(plan: CaptureScriptPlan) -> list[str]:
 
 
 def _start_commands(plan: CaptureScriptPlan) -> list[str]:
-    """Per-segment: lock engine + start a new take. Each `mirv_streams record
-    start` creates a fresh `<record_name>/takeNNNN/` so the runner can map
-    one take per highlight."""
-    cmds = [
+    """Per-segment: lock camera to user (in-eye) + lock engine + start a new
+    take. Each `mirv_streams record start` creates a fresh
+    `<record_name>/takeNNNN/` so the runner can map one take per highlight.
+
+    Camera lock is re-applied per segment because CS2's auto-director can
+    drift the spectator target between segments (round end / death / etc.)
+    even if we set it once at the top. `spec_player_by_accountid` takes a
+    32-bit Steam Account ID; `spec_mode 4` is in-eye / first-person.
+    """
+    cmds: list[str] = []
+    if plan.user_account_id is not None:
+        # Lock spec target BEFORE starting the take so the very first frame
+        # is already on the right player. Without this, CS2 defaults to
+        # auto-director and the first 1-2s of capture follow whoever was
+        # "interesting" at that tick — usually NOT the user.
+        cmds.append(f"spec_player_by_accountid {plan.user_account_id}")
+        cmds.append("spec_mode 4")
+    cmds += [
         f"host_framerate {plan.host_framerate}",
         "host_timescale 0",
         "mirv_streams record start",
@@ -209,6 +228,25 @@ def build_cfg_content(plan: CaptureScriptPlan) -> str:
             lines.append(_emit_addAtTick(seg.start_tick, c))
         for c in end_cmds:
             lines.append(_emit_addAtTick(seg.end_tick, c))
+
+        # Inter-segment fast-forward: without this, the demo plays at normal
+        # speed through the gap between `record end` here and `record start`
+        # of the next segment — no frames captured but full wall-clock time
+        # elapses (1 round ≈ 115s of real-time demo playback). With a seek
+        # we skip straight to just before the next segment.
+        if i + 1 < len(plan.segments):
+            next_start = plan.segments[i + 1].start_tick
+            gap_ticks = next_start - seg.end_tick
+            # Only worth seeking if gap > ~1.5s of demo time. Tiny gaps stay
+            # linear (seek has its own ~200-500ms overhead in CS2).
+            if gap_ticks > INTER_SEGMENT_SEEK_MIN_GAP:
+                seek_target = next_start - INTER_SEGMENT_SEEK_LEAD_TICKS
+                lines.append(
+                    f"// skip {gap_ticks} ticks of silent playback to next segment"
+                )
+                lines.append(
+                    _emit_addAtTick(seg.end_tick + 1, f"demo_gototick {seek_target}")
+                )
         lines.append("")
 
     # Graceful shutdown: fire `quit` a few ticks after the final segment's
@@ -226,6 +264,14 @@ def build_cfg_content(plan: CaptureScriptPlan) -> str:
 
 
 PRE_SEEK_LEAD_TICKS = 100  # how many ticks before first segment we seek to
+# Inter-segment seek: how many ticks before the next segment's start_tick to
+# land after seeking. Gives spec_player_by_accountid + spec_mode 4 (queued at
+# next_start) a small window to settle before record start fires.
+INTER_SEGMENT_SEEK_LEAD_TICKS = 50
+# Minimum gap (in ticks) between segments worth seeking through. Below this,
+# we let the demo play linearly — the seek's own overhead (~200-500ms) eats
+# the savings. 100 ticks ≈ 1.5s of demo time at 64 tps.
+INTER_SEGMENT_SEEK_MIN_GAP = 100
 
 
 def generate_capture_cfg(
