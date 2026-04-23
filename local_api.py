@@ -21,7 +21,10 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import threading
+import time
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -264,10 +267,11 @@ def create_app(
         # Player name precedence for spec_player camera lock:
         #   1. Explicit `user_player_name` in the request body
         #   2. `reel_props.playerName` from the server's render-plan
-        # Without a name, v0.2.6 falls back to `spec_mode 4` only — camera
-        # follows the auto-director's pick instead of getting stuck at
-        # spawn (which is what v0.2.5 produced when spec_player_by_accountid
-        # was sent to CS2, which doesn't recognize that command).
+        # Without a name, the .cfg falls back to `spec_mode 1` only — camera
+        # follows the auto-director's pick in first-person POV. Better than
+        # the v0.2.5..v0.2.10 bug, where the wrong spec_mode (4 = roaming/
+        # static) made the camera sit at the spawn point even when the
+        # spec_player target was correct.
         user_player_name = body.get("user_player_name")
         if not user_player_name and isinstance(reel_props, dict):
             user_player_name = reel_props.get("playerName")
@@ -395,6 +399,174 @@ def create_app(
         except Exception as e:
             return {"opened": False, "path": str(parent_dir), "kind": None,
                     "reason": f"could not open folder: {e}"}, 500
+
+    # ── Auto-update (v0.2.11+) ─────────────────────────────────────────
+    #
+    # User pediu no v0.2.10 testing: "Não daria pra fazer isto
+    # automaticamente ao baixar a nova versão do client?". Implementação:
+    #   1. /update baixa o novo .exe pra %TEMP%
+    #   2. Cria um helper .bat que: espera o PID atual morrer → move o
+    #      .exe novo pro lugar do antigo → relança
+    #   3. Spawn o .bat detachado, agenda os.exit() em 2s
+    #   4. Frontend faz polling em /version e detecta a versão nova
+    #      voltando online (~5-15s no total)
+    #
+    # Limitações:
+    #   - Só roda no .exe (PyInstaller frozen). Em dev (python main.py)
+    #     retorna 501 — atualizar Python source é responsabilidade do dev.
+    #   - Só Windows. macOS/Linux dev volta 501.
+    #   - Não verifica assinatura / checksum. Se um atacante MITM o
+    #     tráfego HTTPS do GitHub, dá pra injetar binário arbitrário.
+    #     Mitigação aceitável hoje porque o atacante já precisaria do
+    #     mesmo MITM pra trojanar o download manual via /download. Quando
+    #     SignPath signing entrar de verdade, dá pra adicionar verificação
+    #     de Authenticode aqui antes do swap.
+
+    UPDATE_URL = (
+        "https://github.com/mathieuanduze/fragreel-client/releases/latest/download/FragReel.exe"
+    )
+
+    @app.post("/update")
+    def trigger_update():
+        """Download the latest .exe and spawn a helper that swaps + relaunches.
+
+        Returns 202 with `{started: true, ...}` on success. The Python
+        process exits ~2s later — the frontend should poll `/version`
+        until the new version answers (typically 5-15s end-to-end).
+        """
+        # Hard guards: only frozen Windows builds can self-update.
+        if not getattr(sys, "frozen", False):
+            return {
+                "error": "not_frozen",
+                "detail": "auto-update only works in the packaged .exe",
+            }, 501
+        if not sys.platform.startswith("win"):
+            return {
+                "error": "unsupported_platform",
+                "detail": f"auto-update is Windows-only (got {sys.platform})",
+            }, 501
+
+        current_exe = Path(sys.executable)
+        current_pid = os.getpid()
+
+        # Download into %TEMP%. We use a deterministic name (with PID) so a
+        # half-finished file from a previous attempt gets overwritten cleanly.
+        new_exe_path = Path(tempfile.gettempdir()) / f"FragReel-update-{current_pid}.exe"
+
+        log.info("auto-update: downloading %s -> %s", UPDATE_URL, new_exe_path)
+        try:
+            # urllib.request handles redirects (GitHub redirects to a CDN
+            # URL with the actual binary). 5-min timeout — slow connections
+            # need it; the .exe is ~30-50 MB.
+            req = urllib.request.Request(
+                UPDATE_URL,
+                headers={"User-Agent": f"FragReel-client/{CLIENT_VERSION}"},
+            )
+            with urllib.request.urlopen(req, timeout=300) as resp, \
+                 open(new_exe_path, "wb") as out:
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+        except Exception as e:
+            log.exception("auto-update: download failed")
+            try:
+                if new_exe_path.exists():
+                    new_exe_path.unlink()
+            except OSError:
+                pass
+            return {"error": "download_failed", "detail": str(e)}, 502
+
+        # Sanity check — anything < 5 MB is almost certainly an error page
+        # or partial download. Real .exe is ~30-50 MB.
+        size = new_exe_path.stat().st_size
+        if size < 5 * 1024 * 1024:
+            log.error("auto-update: downloaded file too small (%d bytes)", size)
+            try:
+                new_exe_path.unlink()
+            except OSError:
+                pass
+            return {
+                "error": "download_too_small",
+                "detail": f"downloaded only {size} bytes — likely an error page, not the .exe",
+            }, 502
+
+        # Build the swap+relaunch helper. Has to be a .bat (or PowerShell)
+        # because we need to outlive the Python process — once Python exits,
+        # the .exe lock releases and the bat can move the new file in.
+        bat_path = Path(tempfile.gettempdir()) / f"FragReel-update-{current_pid}.bat"
+        # Note the doubled %% for batch escaping. The bat:
+        #   1. Polls tasklist until our PID is gone
+        #   2. Sleeps 2s extra to be sure the file lock cleared (Windows
+        #      sometimes holds it briefly after process exit)
+        #   3. Moves the new .exe over the old one
+        #   4. Launches it with `start ""` (detached, won't block the bat)
+        #   5. Self-deletes
+        bat_content = (
+            f"@echo off\r\n"
+            f"REM FragReel auto-update helper (PID {current_pid})\r\n"
+            f":wait_loop\r\n"
+            f'tasklist /FI "PID eq {current_pid}" 2>NUL | find /I "{current_pid}" >NUL\r\n'
+            f"if not errorlevel 1 (\r\n"
+            f"  timeout /t 1 /nobreak >NUL\r\n"
+            f"  goto wait_loop\r\n"
+            f")\r\n"
+            f"timeout /t 2 /nobreak >NUL\r\n"
+            f'move /Y "{new_exe_path}" "{current_exe}"\r\n'
+            f"if errorlevel 1 (\r\n"
+            f"  REM Swap failed (file locked? perms?). Launch the staging copy\r\n"
+            f"  REM so the user at least gets the new build, leaving the old in place.\r\n"
+            f'  start "" "{new_exe_path}"\r\n'
+            f"  exit /b 1\r\n"
+            f")\r\n"
+            f'start "" "{current_exe}"\r\n'
+            f'del "%~f0"\r\n'
+        )
+        bat_path.write_text(bat_content, encoding="utf-8")
+
+        # Spawn detached so the bat survives our exit. CREATE_NO_WINDOW
+        # keeps the cmd console invisible to the user.
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        CREATE_NO_WINDOW = 0x08000000
+        try:
+            subprocess.Popen(
+                ["cmd.exe", "/c", str(bat_path)],
+                creationflags=(
+                    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+                ),
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            log.exception("auto-update: failed to spawn helper")
+            return {"error": "helper_spawn_failed", "detail": str(e)}, 500
+
+        # Schedule our own exit on a daemon thread so the response can flush
+        # before we die. 2s is enough for Flask to send back the JSON +
+        # close the socket cleanly. os._exit (not sys.exit) because we want
+        # to skip atexit handlers — they can hang if something has open
+        # file handles in vendored DLLs.
+        def _exit_after():
+            time.sleep(2.0)
+            log.info("auto-update: exiting now to let helper swap the binary")
+            os._exit(0)
+
+        threading.Thread(
+            target=_exit_after, daemon=True, name="fragreel-update-exit"
+        ).start()
+
+        return jsonify({
+            "started": True,
+            "new_exe": str(new_exe_path),
+            "current_exe": str(current_exe),
+            "pid": current_pid,
+            "size_mb": round(size / 1024 / 1024, 1),
+            "message": "downloaded — swap helper spawned, client exits in ~2s",
+        }), 202
 
     # ── Config endpoints (v0.2.7+ — Settings UI in web) ─────────────────
 

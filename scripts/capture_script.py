@@ -14,7 +14,7 @@ right after `playdemo`. Paths are relative to `<CS2>/game/csgo/cfg/`.
 Capture pipeline per segment:
 
 - At `start_tick`: lock spectator camera to the user (`spec_player "<name>"`
-  + `spec_mode 4`), lock engine (`host_framerate` + `host_timescale 0`),
+  + `spec_mode 1`), lock engine (`host_framerate` + `host_timescale 0`),
   start recording. The killfeed and stream are installed once before the
   first segment.
 - At `end_tick`: stop recording, release engine.
@@ -22,12 +22,21 @@ Capture pipeline per segment:
   to skip the silent gap to the next segment instead of letting CS2 play
   it back at normal speed (1 round ≈ 115s of wasted wall-clock).
 
-Spec target: CS2 (Source 2) does NOT ship `spec_player_by_accountid` —
-that was a CS:GO / Source 1 command. v0.2.5 used it and the camera ended
-up free-cammed at the spawn point because `spec_mode 4` activated without
-a target. v0.2.6 switched to `spec_player "<name>"` which is the actual
-CS2 console command. The killfeed pin (`mirv_deathmsg localPlayer <id>`)
-still uses the SteamID3 / Account ID — that's HLAE-side and correct.
+Spec target + mode (history of pain):
+- v0.2.5: used `spec_player_by_accountid` — that command doesn't exist in
+  CS2 (Source 2 dropped the `_by_accountid` variants). Camera ended up
+  free-cammed at the spawn point because the spec call no-op'd.
+- v0.2.6 .. v0.2.10: switched the target to `spec_player "<name>"` (correct
+  for CS2) BUT kept `spec_mode 4` from the old code. `spec_mode 4` in
+  Source/Source 2 is **roaming / static camera**, not in-eye — that's
+  exactly why every release in this range still showed "câmera parada no
+  spawn" even though the `spec_player` part was right.
+- v0.2.11: corrected to `spec_mode 1` (POV / olhos do jogador). Reference:
+    spec_mode 1 → POV (first-person, in-eye)
+    spec_mode 3 → POV (third-person)
+    spec_mode 4 → roaming / static
+  The killfeed pin (`mirv_deathmsg localPlayer <id>`) still uses the
+  SteamID3 / Account ID — that's HLAE-side and correct.
 
 The user's Steam Account ID (SteamID3) is what HLAE expects in
 `mirv_deathmessage localPlayer <id>`. Convert from SteamID64 with
@@ -64,7 +73,7 @@ STEAM64_BASE = 76561197960265728
 # CS2's auto-director can drift the spectator off the user's POV mid-segment
 # (e.g. on a local event like a flash, a teammate death, round-end ambience),
 # leaving the camera frozen or jumping to someone else. Emitting
-# `spec_player "<name>"` + `spec_mode 4` every ~0.5s of demo time (32 ticks
+# `spec_player "<name>"` + `spec_mode 1` every ~0.5s of demo time (32 ticks
 # at 64 tps) re-asserts the lock without measurable overhead — `spec_player`
 # is a no-op if we're already on that player.
 #
@@ -72,19 +81,33 @@ STEAM64_BASE = 76561197960265728
 # reported camera sitting at player's spawn while the player walked off.
 CAMERA_RELOCK_INTERVAL_TICKS = 32
 
-# Stagger between spec_player and spec_mode 4 (in ticks). Source 2's camera
-# system appears to race: if spec_mode 4 runs in the same tick as the
+# Stagger between spec_player and spec_mode 1 (in ticks). Source 2's camera
+# system appears to race: if spec_mode runs in the same tick as the
 # preceding spec_player, the mode-switch can land BEFORE the target is
-# committed, leaving the camera in first-person on the auto-director's
-# previous pick (or worse, free-cam at 0,0,0). A 1-tick gap lets the spec
-# target settle first.
+# committed, leaving the camera attached to the auto-director's previous
+# pick (or worse, an undefined entity). A 1-tick gap lets the spec target
+# settle first.
 CAMERA_MODE_DELAY_TICKS = 1
 
 # Gap between camera lock and engine freeze (`host_timescale 0`). If we
 # freeze the demo clock in the same tick as spec_player, the engine may
-# process the freeze before the camera lock takes effect. Giving it 2 ticks
-# of headroom is cheap insurance and effectively invisible (2 ticks ≈ 31ms).
-ENGINE_FREEZE_DELAY_TICKS = 2
+# process the freeze before the camera lock takes effect. Giving it ticks
+# of headroom is cheap insurance and effectively invisible (4 ticks ≈ 62ms
+# at 64 tps).
+#
+# v0.2.10 used 2 ticks; v0.2.11 bumps to 4 because we still saw "câmera
+# parada no spawn" reports — Source 2's spec subsystem appears to need
+# more frames to acquire the entity than CS:GO did. Going from 2→4 is
+# imperceptible to the user but doubles the budget for spec to settle.
+ENGINE_FREEZE_DELAY_TICKS = 4
+
+# Gap AFTER `mirv_streams record start` where we re-emit the spec lock
+# block one more time. v0.2.11 insurance: if spec_player/spec_mode missed
+# the first attach (e.g. demo was still buffering the round entity table),
+# this guarantees we hit it once more while the camera is in the recorded
+# frame range. Source 2 commits the spec change next tick, so we still
+# get a clean attach within ~30ms of record start.
+POST_RECORD_REASSERT_DELAY_TICKS = 2
 
 
 def steamid64_to_account_id(steamid64: str | int) -> int:
@@ -185,8 +208,19 @@ def _emit_addAtTick(tick: int, command: str) -> str:
 def _setup_commands(plan: CaptureScriptPlan) -> list[str]:
     """Run ONCE at the first segment's start tick (or earlier) — installs the
     stream + names the record dir + pins the killfeed. Re-running these per
-    segment would noop-warn at best and confuse HLAE state at worst."""
+    segment would noop-warn at best and confuse HLAE state at worst.
+
+    v0.2.11: enable `developer 1` so spec_player/spec_mode error messages
+    surface in the CS2 console.log file (default: %CSGO%/console.log when
+    -condebug is set, which our launcher always sets). Without this we have
+    no signal when spec_player silently fails to attach (typical cause: the
+    in-game name has a unicode glyph CS2 console doesn't recognize).
+    """
     cmds = [
+        # `developer 1` is verbose but the only way to see WHY spec_player
+        # didn't attach. We turn it back to 0 at shutdown.
+        "developer 1",
+        f'echo "[FragReel] setup tick — stream={plan.stream_name} record={plan.record_name}"',
         f"mirv_streams add normal {plan.stream_name}",
         f"mirv_streams record name {plan.record_name}",
     ]
@@ -209,19 +243,26 @@ def _camera_lock_commands(plan: CaptureScriptPlan) -> list[str]:
       1. `spec_player "<name>"` — the canonical CS2 (Source 2) command.
          Takes the player's in-game name. CS2 has NO `*_by_accountid`
          variant; that died with Source 1.
-      2. `spec_mode 4` — in-eye / first-person. Issued AFTER spec_player
-         (one tick later in the emitted cfg) so the camera attaches to
-         the right player before switching mode.
+      2. `spec_mode 1` — POV / olhos do jogador (in-eye / first-person).
+         Issued AFTER spec_player (one tick later in the emitted cfg) so
+         the camera attaches to the right player before switching mode.
+
+    spec_mode reference (DON'T touch without re-checking):
+        1 → POV first-person ("olhos do jogador")  ← what we want
+        3 → POV third-person (chase cam)
+        4 → roaming / static camera                ← the v0.2.5..v0.2.10
+                                                     bug — produced "câmera
+                                                     parada no spawn".
     """
     cmds: list[str] = []
     if plan.user_player_name:
         safe_name = _quote_player_name(plan.user_player_name)
         cmds.append(f'spec_player "{safe_name}"')
-        cmds.append("spec_mode 4")
+        cmds.append("spec_mode 1")
     elif plan.user_account_id is not None:
-        # No player name — can't pin the target, but at least force in-eye
-        # on whatever the auto-director picks. Better than free-cam.
-        cmds.append("spec_mode 4")
+        # No player name — can't pin the target, but at least force first-person
+        # POV on whatever the auto-director picks. Better than roaming cam.
+        cmds.append("spec_mode 1")
     return cmds
 
 
@@ -230,8 +271,13 @@ def _engine_freeze_commands(plan: CaptureScriptPlan) -> list[str]:
 
     Emitted `ENGINE_FREEZE_DELAY_TICKS` after the camera lock so the lock
     has time to settle before host_timescale 0 pauses everything.
+
+    v0.2.11: emit an `echo` first so the user can grep the console.log to
+    confirm we entered the freeze block. If we DON'T see this line in the
+    log but the capture ran, the .cfg load itself failed mid-way.
     """
     return [
+        f'echo "[FragReel] engine freeze + record start (host_framerate={plan.host_framerate})"',
         f"host_framerate {plan.host_framerate}",
         "host_timescale 0",
         "mirv_streams record start",
@@ -253,8 +299,16 @@ def _shutdown_commands() -> list[str]:
     fully flushed to disk. A clean `quit` lets CS2 restore the display
     mode the user had before launch; killing it with TerminateProcess
     instead can leave the desktop stuck at a low resolution.
+
+    v0.2.11: dial `developer` back to 0 before quit. If CS2 ever crashes
+    after our `quit` (it shouldn't but Source 2 is Source 2), at least
+    the next user-launched session won't have spammy dev output.
     """
-    return ["quit"]
+    return [
+        'echo "[FragReel] capture done — shutting down CS2"',
+        "developer 0",
+        "quit",
+    ]
 
 
 def build_cfg_content(plan: CaptureScriptPlan) -> str:
@@ -302,10 +356,23 @@ def build_cfg_content(plan: CaptureScriptPlan) -> str:
     for i, seg in enumerate(plan.segments):
         lines.append(f"// segment {i}: ticks {seg.start_tick} .. {seg.end_tick}")
 
+        # Diagnostic marker — first thing emitted in the segment. Lets the
+        # user (or us, with their console.log) verify we entered the segment
+        # logic and which player we're trying to lock to.
+        target_label = (
+            f'spec_player="{plan.user_player_name}"'
+            if plan.user_player_name
+            else (f"acct={plan.user_account_id}" if plan.user_account_id else "no-target")
+        )
+        lines.append(_emit_addAtTick(
+            seg.start_tick,
+            f'echo "[FragReel] seg {i} start tick={seg.start_tick} target={target_label}"',
+        ))
+
         # Stagger camera-lock commands across ticks so spec_player settles
-        # before spec_mode 4 fires (Source 2 race condition — see
+        # before spec_mode 1 fires (Source 2 race condition — see
         # CAMERA_MODE_DELAY_TICKS). When there's no player name, only one
-        # command is in the list (spec_mode 4), so the stagger is a no-op.
+        # command is in the list (spec_mode 1), so the stagger is a no-op.
         for offset, cmd in enumerate(camera_lock_cmds):
             emit_tick = seg.start_tick + offset * CAMERA_MODE_DELAY_TICKS
             lines.append(_emit_addAtTick(emit_tick, cmd))
@@ -322,6 +389,27 @@ def build_cfg_content(plan: CaptureScriptPlan) -> str:
             lines.append(_emit_addAtTick(freeze_tick, c))
         for c in extra_start_cmds:
             lines.append(_emit_addAtTick(freeze_tick, c))
+
+        # v0.2.11 insurance: re-assert the spec lock right after record
+        # start. The original lock was emitted before host_timescale 0;
+        # if the entity wasn't yet known to the spec subsystem, the lock
+        # silently fell back to free-cam. Re-emitting once more after the
+        # demo has progressed a few engine frames catches that race.
+        # (CS2 keeps running its own internal tick even with timescale=0;
+        # mirv_cmd's addAtTick is keyed off the demo tick, not wall-clock,
+        # so this still fires reliably.)
+        if camera_lock_cmds:
+            reassert_base = freeze_tick + POST_RECORD_REASSERT_DELAY_TICKS
+            for offset, cmd in enumerate(camera_lock_cmds):
+                emit_tick = min(
+                    reassert_base + offset * CAMERA_MODE_DELAY_TICKS,
+                    seg.end_tick - 1,
+                )
+                lines.append(_emit_addAtTick(emit_tick, cmd))
+            lines.append(_emit_addAtTick(
+                min(reassert_base, seg.end_tick - 1),
+                f'echo "[FragReel] seg {i} re-asserted spec lock post-record"',
+            ))
 
         # Periodic camera re-lock inside the segment. Guards against the
         # auto-director drifting the spec target mid-take (happens on
@@ -376,7 +464,7 @@ def build_cfg_content(plan: CaptureScriptPlan) -> str:
 
 PRE_SEEK_LEAD_TICKS = 100  # how many ticks before first segment we seek to
 # Inter-segment seek: how many ticks before the next segment's start_tick to
-# land after seeking. Gives spec_player_by_accountid + spec_mode 4 (queued at
+# land after seeking. Gives spec_player + spec_mode 1 (queued at
 # next_start) a small window to settle before record start fires.
 INTER_SEGMENT_SEEK_LEAD_TICKS = 50
 # Minimum gap (in ticks) between segments worth seeking through. Below this,

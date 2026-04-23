@@ -288,15 +288,29 @@ class InjectedProcess:
 # --- Window / process management helpers -----------------------------------
 
 
-def find_windows_for_pid(pid: int) -> list[int]:
-    """Return HWNDs of top-level windows owned by the given process."""
+def find_windows_for_pid(pid: int, *, only_visible: bool = False) -> list[int]:
+    """Return HWNDs of top-level windows owned by the given process.
+
+    `only_visible=False` (default): return EVERY top-level window owned by
+    `pid`, even if `IsWindowVisible` returns false. This matters because
+    CS2's splash/D3D window can be enumerable for a few ms *before* it
+    gets WS_VISIBLE set — if we only find visible windows we end up moving
+    it too late, after the user already saw it flash on their primary
+    monitor (regression reported on v0.2.10 testing: "logo gigante da Valve").
+
+    `only_visible=True`: legacy behaviour, kept for callers that explicitly
+    want to wait until the window is on-screen (e.g. diagnostics).
+    """
     found: list[int] = []
 
     def callback(hwnd: int, lparam: int) -> bool:
         wnd_pid = wintypes.DWORD(0)
         _GetWindowThreadProcessId(hwnd, ctypes.byref(wnd_pid))
-        if wnd_pid.value == pid and _IsWindowVisible(hwnd):
-            found.append(hwnd)
+        if wnd_pid.value != pid:
+            return True
+        if only_visible and not _IsWindowVisible(hwnd):
+            return True
+        found.append(hwnd)
         return True
 
     _EnumWindows(_EnumWindowsProc(callback), 0)
@@ -325,29 +339,40 @@ def minimize_process_windows(pid: int, *, timeout_sec: float = 10.0, poll_sec: f
 def _hide_and_disable(hwnd: int) -> None:
     """Move hwnd offscreen, disable input, remove from Alt+Tab.
 
+    Order matters: we flip the ex-style FIRST (removing the window from the
+    taskbar / Alt+Tab catalogue) before moving it, because
+    WS_EX_TOOLWINDOW + WS_EX_NOACTIVATE have to be set *before* the window
+    paints itself into those shell surfaces. Then we move it offscreen,
+    then disable input. If we moved first, the shell would have already
+    indexed a "Counter-Strike 2" entry for this HWND and the taskbar chip
+    lingered briefly (user report: "só fica no topo da esquerda da tela
+    escrito 'Counter-Strike 2'").
+
+    - WS_EX_TOOLWINDOW → removes the window from Alt+Tab & taskbar.
+    - WS_EX_NOACTIVATE → keeps it from taking focus.
     - SetWindowPos → off the visible desktop (D3D still sees it as visible
       so Source 2 keeps rendering).
     - EnableWindow(False) → keyboard/mouse bounce off this window even if
       somehow focused. Stops the user from hitting the demo-playback arrows
       and disrupting the capture.
-    - WS_EX_TOOLWINDOW → removes the window from Alt+Tab so the user can't
-      accidentally surface it. WS_EX_NOACTIVATE keeps it from taking focus.
     """
-    flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER
-    _SetWindowPos(hwnd, 0, OFFSCREEN_X, OFFSCREEN_Y, 0, 0, flags)
-    _EnableWindow(hwnd, False)
     current = _GetWindowLongPtr(hwnd, GWL_EXSTYLE) or 0
     new_style = current | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
     if new_style != current:
         _SetWindowLongPtr(hwnd, GWL_EXSTYLE, ctypes.c_void_p(new_style))
+    flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER
+    _SetWindowPos(hwnd, 0, OFFSCREEN_X, OFFSCREEN_Y, 0, 0, flags)
+    _EnableWindow(hwnd, False)
 
 
 def move_process_windows_offscreen(
     pid: int,
     *,
     timeout_sec: float = 20.0,
-    poll_sec: float = 0.03,
-    watch_for_sec: float = 4.0,
+    hot_poll_sec: float = 0.005,
+    hot_poll_duration_sec: float = 3.0,
+    cold_poll_sec: float = 0.05,
+    watch_for_sec: float = 8.0,
 ) -> bool:
     """Hide + disable every top-level window of `pid`.
 
@@ -357,17 +382,34 @@ def move_process_windows_offscreen(
     `watch_for_sec` after the first sighting because Source 2 may swap
     splash → D3D main window, and we want to catch both.
 
-    Note: as of v0.2.10 CS2 is launched with `-x -32000 -y -32000` so the
-    initial window already appears offscreen. This watcher is redundant
-    belt-and-braces — polling at 30ms to catch any subsequent window Source 2
-    might create (splash → main swap, etc) before the user sees it.
+    Two poll regimes to balance CPU vs responsiveness:
+      • HOT (5ms, first 3s): catch the CS2 splash/D3D window in the <100ms
+        window between CreateWindow and first Present. Without this the
+        user sees the Valve logo flash on their primary monitor.
+      • COLD (50ms, after): keep watching for late-created windows (rare
+        but happens on display-mode change or driver overlays like
+        NVIDIA Shadow Play).
+
+    `find_windows_for_pid(only_visible=False)` returns windows **before**
+    WS_VISIBLE is set, letting us reposition them while they're still
+    invisible — so even a paint-before-first-present flash never shows up
+    on the user's desktop.
+
+    Note: v0.2.10 tried `-x -32000 -y -32000` launch args but CS2 ignored
+    them in many configs. v0.2.11 relies entirely on this watcher and
+    drops the SDL positioning flags (kept in the cmdline for belt-and-
+    braces but they're no-ops on most CS2 builds).
     """
     deadline = time.monotonic() + timeout_sec
+    hot_end = time.monotonic() + hot_poll_duration_sec
     handled: set[int] = set()
     seen_first: float | None = None
     total_hidden = 0
     while time.monotonic() < deadline:
-        windows = find_windows_for_pid(pid)
+        # Include invisible windows — we want to pre-hide them before
+        # they ever paint. This is what fixes the "Valve logo dominou o
+        # desktop" regression from v0.2.10.
+        windows = find_windows_for_pid(pid, only_visible=False)
         new_hwnds = [w for w in windows if w not in handled]
         if new_hwnds:
             for hwnd in new_hwnds:
@@ -379,7 +421,10 @@ def move_process_windows_offscreen(
                 seen_first = time.monotonic()
         if seen_first is not None and time.monotonic() - seen_first >= watch_for_sec:
             return total_hidden > 0
-        time.sleep(poll_sec)
+        # Tight loop right after launch (splash can appear in <100ms),
+        # relaxed after the hot-poll budget expires.
+        now = time.monotonic()
+        time.sleep(hot_poll_sec if now < hot_end else cold_poll_sec)
     if total_hidden == 0:
         log.warning("no visible window appeared for pid %d within %.1fs", pid, timeout_sec)
     return total_hidden > 0
@@ -578,19 +623,20 @@ def launch_cs2_injected(
             )
         log.info("injected %s → hModule=0x%x", hook_dll.name, module)
 
-        # 3) Resume — CS2 now runs with the hook active from frame 0.
-        _ResumeThread(pi.hThread)
-
         proc = InjectedProcess(
             pid=pi.dwProcessId,
             process_handle=pi.hProcess,
             main_thread_handle=pi.hThread,
         )
 
+        # Spawn the offscreen watcher BEFORE resume — this is the critical
+        # fix for v0.2.10's "CS2 dominou o desktop" regression. If we
+        # started the watcher AFTER resume, Source 2 had already created
+        # + painted its splash window by the time our first poll ran
+        # (~10-30ms race window that consistently lost on fast PCs).
+        # Starting it first means the watcher is already polling at 5ms
+        # when CS2 starts creating windows.
         if hide_offscreen:
-            # Fire-and-forget on a helper thread — CS2 may take several
-            # seconds to create its D3D window and we don't want to block
-            # capture setup.
             import threading as _th
             _th.Thread(
                 target=move_process_windows_offscreen,
@@ -599,6 +645,10 @@ def launch_cs2_injected(
                 daemon=True,
                 name="cs2-offscreen",
             ).start()
+
+        # 3) Resume — CS2 now runs with the hook active from frame 0.
+        #    The offscreen watcher is already polling above.
+        _ResumeThread(pi.hThread)
 
         return proc
     except Exception:
