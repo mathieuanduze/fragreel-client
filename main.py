@@ -13,11 +13,17 @@ Usage:
   python main.py --no-tray                          # sem ícone na bandeja
 """
 import argparse
+import atexit
 import logging
 import os
+import signal
+import socket
 import sys
 import threading
+import time
 import traceback
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
@@ -72,6 +78,124 @@ log = logging.getLogger("fragreel")
 log.info(f"=== FragReel iniciando · log em {LOG_FILE} ===")
 
 _stop_event = threading.Event()
+_BOOT_TIME = time.time()
+
+
+# ── Bug 5 instrumentation (v0.2.12) ───────────────────────────────────────
+# User reported on PC testing (2026-04-23): "client morre silenciosamente
+# depois de ~10min idle". Logs terminam num GET /demos 200 e simplesmente
+# param — sem traceback, sem ERROR, nada. Possíveis causas em investigação:
+# antivírus, Windows kill policy, atexit hang, leak de os._exit() em algum
+# helper. Adicionamos abaixo um conjunto mínimo de instrumentação pra que
+# a próxima ocorrência deixe pegada no log:
+#   • atexit handler que loga o exit "normal" (Python encerrando via main loop)
+#   • signal handlers SIGTERM / SIGINT / SIGBREAK que logam ANTES de morrer
+#   • heartbeat thread que loga a cada 60s "alive (uptime Xs)" — quando a
+#     gente vê o último heartbeat e nada depois, sabemos minute-precision
+#     quando o processo foi morto
+
+def _log_exit() -> None:
+    uptime = time.time() - _BOOT_TIME
+    log.info(f"=== FragReel saindo (atexit) · uptime {uptime:.0f}s ===")
+
+
+def _signal_handler(sig: int, _frame) -> None:
+    name = {
+        signal.SIGINT: "SIGINT (Ctrl+C ou kill -2)",
+        signal.SIGTERM: "SIGTERM (TerminateProcess / kill -15)",
+    }.get(sig, f"signal {sig}")
+    # SIGBREAK só existe no Windows.
+    if hasattr(signal, "SIGBREAK") and sig == signal.SIGBREAK:
+        name = "SIGBREAK (Ctrl+Break ou closing console)"
+    uptime = time.time() - _BOOT_TIME
+    log.warning(f"=== FragReel recebeu {name} · uptime {uptime:.0f}s · saindo ===")
+    # Não chamamos sys.exit aqui — apenas sinalizamos pro main loop sair
+    # limpo (queue.stop, etc). O atexit handler vai logar o resto.
+    _stop_event.set()
+
+
+def _install_signal_handlers() -> None:
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _signal_handler)
+        except (ValueError, OSError):
+            # Threads sem suporte a signal (improvável aqui — main thread)
+            # ou plataformas que não expõem o sinal.
+            pass
+    # Windows-only: console close / Ctrl+Break
+    if hasattr(signal, "SIGBREAK"):
+        try:
+            signal.signal(signal.SIGBREAK, _signal_handler)
+        except (ValueError, OSError):
+            pass
+
+
+def _start_heartbeat() -> None:
+    """Loga a cada 60s pra confirmar que o processo ainda está vivo.
+    Quando investigarmos uma silent death, basta ver no log qual foi o
+    último heartbeat — diferença com o timestamp atual ≈ minutos parado."""
+    def _beat():
+        while not _stop_event.wait(60.0):
+            uptime = time.time() - _BOOT_TIME
+            log.info(f"♥ heartbeat · uptime {uptime:.0f}s")
+    threading.Thread(target=_beat, daemon=True, name="fragreel-heartbeat").start()
+
+
+# ── Bug 1 (v0.2.12): evict an older client still bound to port 5775 ──────
+LOCAL_PORT = 5775
+
+def _evict_stale_instance(timeout_total: float = 6.0) -> None:
+    """If port 5775 is already bound by a previous FragReel client, ask it
+    to shut down via POST /shutdown (added in v0.2.12 local_api). Wait for
+    the port to become free before we try to bind ourselves.
+
+    No-op if:
+      • Port is already free (nothing to evict)
+      • Port is bound but /shutdown endpoint missing (pre-v0.2.12 client →
+        falls through; user needs to kill it manually). We still wait the
+        full timeout so the new bind doesn't 100% fail — gives the user a
+        chance to close it via tray, and surfaces a clearer error if not.
+    """
+    # Quick port probe — if we can connect, something is listening.
+    try:
+        with socket.create_connection(("127.0.0.1", LOCAL_PORT), timeout=0.5):
+            pass
+    except OSError:
+        # Nothing on port; clean boot.
+        return
+
+    log.warning(
+        "port %d already bound — outra instância do FragReel rodando? "
+        "tentando evict via POST /shutdown", LOCAL_PORT,
+    )
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{LOCAL_PORT}/shutdown",
+            method="POST",
+            data=b"",  # /shutdown ignora body, mas precisa do POST
+            headers={"User-Agent": "FragReel-self-evict"},
+        )
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            log.info("evict: /shutdown respondeu %d — old client deve sair em ~1.5s", resp.status)
+    except urllib.error.HTTPError as e:
+        log.warning("evict: /shutdown HTTP %d — client antigo (<v0.2.12) sem o endpoint?", e.code)
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        log.warning("evict: falha em chamar /shutdown (%s) — vou só esperar a porta liberar", e)
+
+    # Polling: porta liberou?
+    deadline = time.time() + timeout_total
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", LOCAL_PORT), timeout=0.3):
+                pass
+            time.sleep(0.4)
+        except OSError:
+            log.info("port %d liberada — booting normalmente", LOCAL_PORT)
+            return
+    log.error(
+        "port %d ainda ocupada após %.1fs — bind vai provavelmente falhar. "
+        "Feche o FragReel.exe antigo na bandeja do sistema.", LOCAL_PORT, timeout_total,
+    )
 
 
 def _on_upload_event(event: str, payload: dict) -> None:
@@ -100,6 +224,14 @@ def main() -> None:
     parser.add_argument("--steamid",  help="SteamID64 (auto-detect se omitido)")
     parser.add_argument("--no-tray",  action="store_true", help="Desabilita ícone do tray")
     args = parser.parse_args()
+
+    # Bug 1 + Bug 5 instrumentation (v0.2.12). Evict-stale roda ANTES de
+    # qualquer bind pra garantir que se o user instalou um .exe novo sem
+    # passar pelo auto-update, o tray velho não fica segurando a porta.
+    _install_signal_handlers()
+    atexit.register(_log_exit)
+    _evict_stale_instance()
+    _start_heartbeat()
 
     # ── Steam ID ────────────────────────────────────────────────────
     steamid = args.steamid

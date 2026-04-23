@@ -588,6 +588,46 @@ def create_app(
             "message": "downloaded — swap helper spawned, client exits in ~2s",
         }), 202
 
+    @app.post("/shutdown")
+    def shutdown():
+        """Graceful exit — used by a NEWER client at startup to evict an
+        OLDER instance that's still bound to port 5775.
+
+        v0.2.11 PC testing reveal: when a user installed v0.2.11 manually
+        without auto-update, the old v0.2.10 tray process kept running and
+        held the port. The web kept seeing the stale version and "Mapear
+        Plays" did nothing. Killing it via Task Manager worked but no end
+        user is going to do that.
+
+        Flow:
+          1. New `.exe` boots, calls POST http://127.0.0.1:5775/shutdown
+          2. We log + ack 202 and schedule os._exit(0) on a daemon thread
+             (1.5s — enough to flush the response and let TCP TIME_WAIT
+             reset, but short enough that the new client doesn't timeout)
+          3. New `.exe` waits ~3s, then binds the port itself
+
+        Security: this is only exposed on 127.0.0.1 + CORS-restricted to
+        fragreel.vercel.app, so the only callers in practice are (a) the
+        new self-evicting client or (b) the web (which has no UI to call
+        it — it's not in lib/local.ts). Still, we don't take a body or
+        do anything irreversible beyond exiting our own process.
+        """
+        log.info("/shutdown received — newer client probably evicting us; exiting in 1.5s")
+
+        def _exit_after():
+            time.sleep(1.5)
+            log.info("/shutdown: exiting now (os._exit(0))")
+            os._exit(0)
+
+        threading.Thread(
+            target=_exit_after, daemon=True, name="fragreel-shutdown-exit"
+        ).start()
+        return jsonify({
+            "ok": True,
+            "version": CLIENT_VERSION,
+            "message": "exiting in 1.5s",
+        }), 202
+
     # ── Config endpoints (v0.2.7+ — Settings UI in web) ─────────────────
 
     def _serialize_resolved(resolved) -> dict:
