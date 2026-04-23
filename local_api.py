@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from hlae_runner import HlaeRunnerConfig, RenderPlan
-from render_coordinator import RenderCoordinator
+from render_coordinator import InsufficientDiskError, RenderCoordinator
 from scanner import scan_all, _load_cache as _load_scan_cache
 from uploader import UploadQueue
 from version import __version__ as CLIENT_VERSION
@@ -225,21 +225,34 @@ def create_app(
         if not demo.exists():
             return {"error": "demo_not_found", "path": str(demo)}, 404
 
+        # `reel_props` is the full ReelProps payload from the server's
+        # /matches/{id}/render-plan endpoint (match, selectedRanks, mood,
+        # playerName, orientation). Runner injects per-segment .mov paths
+        # into match.highlights[*].gameplayVideoSrc before calling Remotion.
+        reel_props = body.get("reel_props")
+
+        # Player name precedence for spec_player camera lock:
+        #   1. Explicit `user_player_name` in the request body
+        #   2. `reel_props.playerName` from the server's render-plan
+        # Without a name, v0.2.6 falls back to `spec_mode 4` only — camera
+        # follows the auto-director's pick instead of getting stuck at
+        # spawn (which is what v0.2.5 produced when spec_player_by_accountid
+        # was sent to CS2, which doesn't recognize that command).
+        user_player_name = body.get("user_player_name")
+        if not user_player_name and isinstance(reel_props, dict):
+            user_player_name = reel_props.get("playerName")
+
         plan = RenderPlan(
             demo_path=demo,
             segments=tuple(segments),
             user_steamid64=body.get("user_steamid64") or steamid,
+            user_player_name=user_player_name,
             record_name=body.get("record_name", "fragreel"),
             stream_name=body.get("stream_name", "default"),
         )
 
         render_id = body.get("render_id") or uuid.uuid4().hex[:12]
         force = bool(body.get("force", False))
-        # `reel_props` is the full ReelProps payload from the server's
-        # /matches/{id}/render-plan endpoint (match, selectedRanks, mood,
-        # playerName, orientation). Runner injects per-segment .mov paths
-        # into match.highlights[*].gameplayVideoSrc before calling Remotion.
-        reel_props = body.get("reel_props")
         try:
             session = render_coordinator.start(
                 plan,
@@ -253,6 +266,15 @@ def create_app(
                 "detail": "Close CS2 before rendering, or POST again with {\"force\": true} to terminate it.",
                 "cs2_pids": e.pids,
             }, 409
+        except InsufficientDiskError as e:
+            # 507 = "Insufficient Storage" (WebDAV but used widely for this).
+            # Surface the per-drive breakdown so the web can show "free up
+            # X GB on C:" instead of a generic error.
+            return {
+                "error": "insufficient_disk",
+                "detail": str(e),
+                "issues": e.issues,
+            }, 507
         return jsonify(session.to_dict()), 202
 
     @app.get("/render/status")

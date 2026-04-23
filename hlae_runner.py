@@ -70,11 +70,16 @@ class RenderPlan:
       single .cfg handles all segments; HLAE schedules them all upfront.
     - `user_steamid64`: SteamID64 of the player whose kills should be pinned
       in the killfeed. Converted to SteamID3 for `mirv_deathmsg localPlayer`.
+    - `user_player_name`: in-game CS2 name (string shown in scoreboard) of
+      the same player. Required for `spec_player "<name>"` to lock the
+      spectator camera. CS2 has no `*_by_accountid` variant — the killfeed
+      pin uses the SteamID3, but the camera lock needs the name.
     """
 
     demo_path: Path
     segments: tuple[tuple[int, int], ...]
     user_steamid64: str | None = None
+    user_player_name: str | None = None
     record_name: str = "fragreel"
     stream_name: str = "default"
 
@@ -84,6 +89,7 @@ class RenderPlan:
             demo_path=Path(payload["demo_path"]),
             segments=tuple((int(s["start_tick"]), int(s["end_tick"])) for s in payload["segments"]),
             user_steamid64=payload.get("user_steamid64"),
+            user_player_name=payload.get("user_player_name"),
             record_name=payload.get("record_name", "fragreel"),
             stream_name=payload.get("stream_name", "default"),
         )
@@ -215,6 +221,7 @@ class HlaeRunner:
             self.config.cfg_target,
             plan.segments,
             user_steamid64=plan.user_steamid64,
+            user_player_name=plan.user_player_name,
             record_name=plan.record_name,
             stream_name=plan.stream_name,
         )
@@ -336,6 +343,7 @@ class HlaeRunner:
         timeout_sec: float = 600.0,
         poll_sec: float = 2.0,
         on_progress: Callable[[int, int], None] | None = None,
+        on_take_finalized: Callable[["TakeOutput"], None] | None = None,
     ) -> CaptureResult:
         """Poll the recording dir until ALL N takes (one per segment) are stable.
 
@@ -353,6 +361,15 @@ class HlaeRunner:
         `pre_take_index` = highest take number seen BEFORE launching CS2,
         so leftovers from previous renders aren't picked up. If None,
         `_snapshot_take_index` is called now.
+
+        `on_take_finalized` (v0.2.6+): fires ONCE per take the moment we know
+        it's done — either because a higher-numbered take has appeared
+        (HLAE moved on) or because the final stability check passed for the
+        last take. Lets the caller stream-convert (TGA→ProRes) and free
+        disk while CS2 is still capturing the next segment, capping peak
+        disk usage at ~1 segment instead of N. The callback runs SYNCHRONOUSLY
+        on the polling thread — long callbacks pause progress polling. If
+        the callback raises, the render is aborted with that exception.
         """
         record_root = self.config.recording_parent / plan.record_name
         if pre_take_index is None:
@@ -365,81 +382,115 @@ class HlaeRunner:
         deadline = time.monotonic() + timeout_sec
         # Per-take state: take_number -> (last_frames, stable_since)
         take_state: dict[int, tuple[int, float | None]] = {}
+        # Finalized takes (callback already fired). Their TGA dirs may be
+        # gone (cleanup_tgas), so their frames are remembered separately
+        # to keep the progress total monotonic.
+        finalized: dict[int, "TakeOutput"] = {}
+        finalized_frames_total = 0
         last_total = -1
 
-        while time.monotonic() < deadline:
-            takes = self._list_new_takes(record_root, skip_up_to=pre_take_index)
+        def _finalize(n: int, take_dir: Path, frame_count: int) -> None:
+            """Build a TakeOutput for take n and fire the callback once."""
+            nonlocal finalized_frames_total
+            if n in finalized:
+                return
+            stream_dir = take_dir / plan.stream_name
+            audio = take_dir / "audio.wav"
+            # segment_index assigned in finalization order (= take_n order
+            # because we sort takes ascending and finalize the lowest first).
+            take_output = TakeOutput(
+                segment_index=len(finalized),
+                take_dir=take_dir,
+                stream_dir=stream_dir,
+                frame_count=frame_count,
+                audio_path=audio if audio.exists() else None,
+            )
+            finalized[n] = take_output
+            finalized_frames_total += frame_count
+            if on_take_finalized is not None:
+                # Caller may convert + delete TGAs here. If they raise we
+                # abort the whole capture — there's no graceful partial
+                # success when one segment is missing from the reel.
+                on_take_finalized(take_output)
 
-            # Track each take's frame count + stability window. Only the
-            # *highest* take seen so far can still be growing — once a
-            # higher-numbered take exists, lower ones are guaranteed stable
-            # (HLAE has called record end on them).
-            highest_n = max((n for n, _ in takes), default=-1)
-            current_total = 0
-            for n, take_dir in takes:
+        while time.monotonic() < deadline:
+            takes_disk = self._list_new_takes(record_root, skip_up_to=pre_take_index)
+            # Discard takes already finalized — their dirs may be deleted by
+            # the streaming converter. They contribute via finalized_frames_total.
+            live_takes = [(n, p) for n, p in takes_disk if n not in finalized]
+            # Highest take ever seen (live OR finalized) — gates "is this
+            # take definitively done" check.
+            seen_n = set(finalized.keys()) | {n for n, _ in takes_disk}
+            highest_seen = max(seen_n) if seen_n else -1
+
+            live_total = 0
+            for n, take_dir in live_takes:
                 stream_dir = take_dir / plan.stream_name
                 frames = self._count_tgas(stream_dir) if stream_dir.is_dir() else 0
-                current_total += frames
+                live_total += frames
                 prev_frames, prev_stable = take_state.get(n, (-1, None))
-                # A take below the current highest is definitively stable.
-                if n < highest_n:
-                    take_state[n] = (frames, time.monotonic())
+                # A take below the current highest is definitively stable
+                # — finalize immediately so the streaming converter starts.
+                if n < highest_seen:
+                    _finalize(n, take_dir, frames)
                     continue
                 if frames > 0 and frames == prev_frames:
                     take_state[n] = (frames, prev_stable or time.monotonic())
                 else:
                     take_state[n] = (frames, None)
 
+            current_total = finalized_frames_total + live_total
             if on_progress is not None and current_total != last_total:
                 on_progress(current_total, last_total)
                 last_total = current_total
 
-            if len(takes) >= expected:
-                # Got every expected take dir. Now verify the last one has
-                # had a stable frame count for at least 2 polls.
-                last_n, _ = takes[-1]
+            total_takes_seen = len(finalized) + len(live_takes)
+            if total_takes_seen >= expected:
+                # Got every expected take. Either they're all finalized
+                # (return immediately) or the last live one needs to pass
+                # the stability gate before we finalize it too.
+                if not live_takes:
+                    return self._build_capture_result_streaming(plan, finalized, pre_take_index)
+                last_n, last_dir = live_takes[-1]
                 _, stable_since = take_state.get(last_n, (0, None))
                 if stable_since is not None and (
                     time.monotonic() - stable_since >= poll_sec * 2
                 ):
-                    return self._build_capture_result(plan, takes, pre_take_index)
+                    stream_dir = last_dir / plan.stream_name
+                    frames = self._count_tgas(stream_dir) if stream_dir.is_dir() else 0
+                    _finalize(last_n, last_dir, frames)
+                    return self._build_capture_result_streaming(plan, finalized, pre_take_index)
 
             time.sleep(poll_sec)
 
         raise TimeoutError(
             f"capture did not produce {expected} stable takes within "
-            f"{timeout_sec}s under {record_root} (got {len(take_state)} takes)"
+            f"{timeout_sec}s under {record_root} (got {len(take_state) + len(finalized)} takes)"
         )
 
-    def _build_capture_result(
-        self,
+    @staticmethod
+    def _build_capture_result_streaming(
         plan: RenderPlan,
-        takes: list[tuple[int, Path]],
+        finalized: dict[int, "TakeOutput"],
         pre_take_index: int,
     ) -> CaptureResult:
-        """Sorted (take_n, take_dir) → CaptureResult with segment_index mapping."""
-        takes_sorted = sorted(takes, key=lambda x: x[0])
-        outputs: list[TakeOutput] = []
-        for segment_index, (n, take_dir) in enumerate(takes_sorted):
-            stream_dir = take_dir / plan.stream_name
-            audio = take_dir / "audio.wav"
-            outputs.append(
-                TakeOutput(
-                    segment_index=segment_index,
-                    take_dir=take_dir,
-                    stream_dir=stream_dir,
-                    frame_count=self._count_tgas(stream_dir) if stream_dir.is_dir() else 0,
-                    audio_path=audio if audio.exists() else None,
-                )
+        """Assemble the final CaptureResult from streaming-finalized takes.
+
+        Iteration order matters for segment_index assignment, but _finalize
+        already set segment_index in finalization order (= take_n order),
+        so we just sort by take_n and return.
+        """
+        sorted_n = sorted(finalized.keys())
+        outputs = tuple(finalized[n] for n in sorted_n)
+        if outputs:
+            log.info(
+                "capture complete: %d takes (pre_index=%d, range take%04d..take%04d)",
+                len(outputs),
+                pre_take_index,
+                sorted_n[0],
+                sorted_n[-1],
             )
-        log.info(
-            "capture complete: %d takes (pre_index=%d, range take%04d..take%04d)",
-            len(outputs),
-            pre_take_index,
-            takes_sorted[0][0],
-            takes_sorted[-1][0],
-        )
-        return CaptureResult(takes=tuple(outputs))
+        return CaptureResult(takes=outputs)
 
     @staticmethod
     def _snapshot_take_index(record_root: Path) -> int:
@@ -619,6 +670,32 @@ class HlaeRunner:
 
         return result.with_movs(movs)
 
+    def convert_one_take(
+        self,
+        *,
+        take: TakeOutput,
+        output_path: Path,
+        source_framerate: int = 120,
+        cleanup_tgas: bool = True,
+        ffmpeg: Path | None = None,
+    ) -> None:
+        """Public wrapper around `_convert_one_take` — used by the streaming
+        converter callback in the coordinator.
+        """
+        ff = ffmpeg or self.config.resolved_ffmpeg()
+        if ff is None:
+            raise RuntimeError(
+                "ffmpeg not found (checked --ffmpeg-exe, bundled, and $PATH)"
+            )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._convert_one_take(
+            take=take,
+            output_path=output_path,
+            ffmpeg=ff,
+            source_framerate=source_framerate,
+            cleanup_tgas=cleanup_tgas,
+        )
+
     def _convert_one_take(
         self,
         *,
@@ -651,7 +728,36 @@ class HlaeRunner:
             "ffmpeg TGA→ProRes seg=%d frames=%d → %s",
             take.segment_index, take.frame_count, output_path.name,
         )
-        subprocess.run(cmd, check=True)
+        # Capture stderr so we can surface ffmpeg's actual error message
+        # (disk full, codec mismatch, missing input frame, etc) instead of
+        # losing it. ffmpeg writes its progress AND its errors to stderr;
+        # the last 30 lines is enough to diagnose without bloating logs.
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+        if proc.returncode != 0:
+            tail = "\n".join(proc.stderr.splitlines()[-30:]) if proc.stderr else "(no stderr)"
+            # Decode common Windows POSIX-style negative exit codes for the
+            # error message — ffmpeg returns the underlying errno cast to
+            # uint32, so e.g. -28 (ENOSPC) shows up as 4294967268.
+            rc = proc.returncode
+            decoded = ""
+            if rc > 2**31:
+                signed = rc - 2**32
+                if signed == -28:
+                    decoded = " (ENOSPC: no space left on device — check free disk)"
+                elif signed == -12:
+                    decoded = " (ENOMEM: out of memory)"
+                else:
+                    decoded = f" (signed: {signed})"
+            raise RuntimeError(
+                f"ffmpeg failed for seg={take.segment_index} (exit {rc}{decoded}).\n"
+                f"command: {' '.join(cmd)}\n"
+                f"stderr (last 30 lines):\n{tail}"
+            )
 
         if cleanup_tgas and take.take_dir.exists():
             try:
