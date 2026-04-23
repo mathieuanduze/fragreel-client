@@ -414,6 +414,36 @@ class RenderCoordinator:
             def on_take_finalized(take: TakeOutput) -> None:
                 """Stream-convert this take immediately so its TGAs free
                 up while CS2 keeps capturing the next segment."""
+                already_done = len(converted_movs)  # integer count so far
+
+                def _on_ffmpeg_frame(frame: int) -> None:
+                    """Live ffmpeg progress → fractional segments_done so
+                    the UI's render bar moves during the ~4 min it takes to
+                    encode a 3964-frame 1080p ProRes 4444 segment.
+                    """
+                    frac = min(1.0, frame / max(1, take.frame_count))
+                    pct = int(frac * 100)
+                    with self._lock:
+                        if self._session is None:
+                            return
+                        self._session.segments_done = already_done + frac
+                        self._session.stage = (
+                            f"encoding seg{take.segment_index:02d} "
+                            f"({frame}/{take.frame_count} = {pct}%)"
+                        )
+                        # Bump the global progress too so the main bar
+                        # doesn't look frozen at 0.611 for 4 minutes.
+                        # Ffmpeg takes up the "converting" slice between
+                        # capture-done (PROGRESS_STAGING + PROGRESS_LAUNCHING
+                        # + PROGRESS_CAPTURING) and the "rendering" slice.
+                        seg_slice = PROGRESS_CONVERTING / max(1, self._session.segments_total)
+                        self._session.progress = (
+                            PROGRESS_STAGING
+                            + PROGRESS_LAUNCHING
+                            + PROGRESS_CAPTURING
+                            + seg_slice * (already_done + frac)
+                        )
+
                 if self._cancel_requested.is_set():
                     return
                 mov_path = mov_dir / f"{plan.demo_basename}_seg{take.segment_index:02d}.mov"
@@ -428,6 +458,7 @@ class RenderCoordinator:
                 self._runner.convert_one_take(
                     take=take,
                     output_path=mov_path,
+                    on_frame_progress=_on_ffmpeg_frame,
                     cleanup_tgas=True,
                 )
                 converted_movs[take.segment_index] = mov_path

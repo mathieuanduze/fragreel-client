@@ -24,6 +24,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Callable
+
+
+# ffmpeg emits progress lines on stderr like:
+#   frame=  123 fps= 45 q=-0.0 size=    1234kB time=00:00:02.05 bitrate=...
+# We grep the `frame=` number and forward it to a caller-supplied callback
+# so the UI's render-pipeline bar can show live per-segment progress
+# (v0.2.14: previous versions only updated when ffmpeg exited, which felt
+# frozen for ~4 min per 3964-frame 1080p ProRes 4444 segment).
+_FFMPEG_FRAME_RE = re.compile(r"frame=\s*(\d+)")
 
 from cs2_launcher import InjectedProcess, get_desktop_resolution, launch_cs2_injected
 from scripts.capture_script import (
@@ -749,9 +759,15 @@ class HlaeRunner:
         source_framerate: int = 60,
         cleanup_tgas: bool = True,
         ffmpeg: Path | None = None,
+        on_frame_progress: Callable[[int], None] | None = None,
     ) -> None:
         """Public wrapper around `_convert_one_take` — used by the streaming
         converter callback in the coordinator.
+
+        `on_frame_progress(n)` fires as ffmpeg completes each batch of frames
+        (throttled, not every frame). Lets the coordinator update
+        `segments_done` as a float during a long encode instead of jumping
+        from 0 → 1 only at the end.
         """
         ff = ffmpeg or self.config.resolved_ffmpeg()
         if ff is None:
@@ -765,6 +781,7 @@ class HlaeRunner:
             ffmpeg=ff,
             source_framerate=source_framerate,
             cleanup_tgas=cleanup_tgas,
+            on_frame_progress=on_frame_progress,
         )
 
     def _convert_one_take(
@@ -775,6 +792,7 @@ class HlaeRunner:
         ffmpeg: Path,
         source_framerate: int,
         cleanup_tgas: bool,
+        on_frame_progress: Callable[[int], None] | None = None,
     ) -> None:
         """Single TGA-sequence → ProRes pass for one TakeOutput."""
         # Numbered TGA pattern (HLAE writes 00000.tga, 00001.tga, ...)
@@ -799,19 +817,63 @@ class HlaeRunner:
             "ffmpeg TGA→ProRes seg=%d frames=%d → %s",
             take.segment_index, take.frame_count, output_path.name,
         )
-        # Capture stderr so we can surface ffmpeg's actual error message
-        # (disk full, codec mismatch, missing input frame, etc) instead of
-        # losing it. ffmpeg writes its progress AND its errors to stderr;
-        # the last 30 lines is enough to diagnose without bloating logs.
-        proc = subprocess.run(
+        # Live progress: stream stderr line-by-line and parse `frame=N` so
+        # the UI can show a moving bar instead of a frozen "0/3 segments".
+        # ffmpeg writes BOTH progress AND errors to stderr — we keep the
+        # last 200 lines for error reporting if the process fails.
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             errors="replace",
             creationflags=_NO_WINDOW,
+            bufsize=1,  # line-buffered so we see progress as it happens
         )
+
+        stderr_tail: list[str] = []
+        STDERR_TAIL_MAX = 200
+        last_reported = 0
+        # Throttle: call the progress callback at most every N frames, or
+        # on completion. Avoids flooding the lock in render_coordinator.
+        REPORT_EVERY = 30
+
+        assert proc.stderr is not None  # bufsize=1 + stderr=PIPE guarantees it
+        try:
+            for line in proc.stderr:
+                stderr_tail.append(line)
+                if len(stderr_tail) > STDERR_TAIL_MAX:
+                    stderr_tail.pop(0)
+                m = _FFMPEG_FRAME_RE.search(line)
+                if m and on_frame_progress is not None:
+                    n = int(m.group(1))
+                    if n - last_reported >= REPORT_EVERY:
+                        last_reported = n
+                        try:
+                            on_frame_progress(n)
+                        except Exception:
+                            # Progress callback errors never kill the encode.
+                            log.debug("on_frame_progress callback raised", exc_info=True)
+            proc.wait()
+            # Final flush — report the last frame count so the bar hits
+            # 100% cleanly instead of stopping at the last REPORT_EVERY step.
+            if on_frame_progress is not None and take.frame_count > last_reported:
+                try:
+                    on_frame_progress(take.frame_count)
+                except Exception:
+                    log.debug("on_frame_progress final flush raised", exc_info=True)
+        except BaseException:
+            # Interrupted (Ctrl+C, SIGTERM, cancel) — kill the child so we
+            # don't orphan ffmpeg holding onto GB of TGA file handles.
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            raise
+
         if proc.returncode != 0:
-            tail = "\n".join(proc.stderr.splitlines()[-30:]) if proc.stderr else "(no stderr)"
+            tail = "".join(stderr_tail[-30:]) if stderr_tail else "(no stderr)"
             # Decode common Windows POSIX-style negative exit codes for the
             # error message — ffmpeg returns the underlying errno cast to
             # uint32, so e.g. -28 (ENOSPC) shows up as 4294967268.
