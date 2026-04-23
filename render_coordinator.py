@@ -57,12 +57,12 @@ PROGRESS_RENDERING = 0.10
 PROGRESS_DONE = 1.00
 
 # For capturing, we need a total-frame estimate to map frames → progress.
-# At host_framerate=120 and tickrate=64, each tick ≈ 120/64 = 1.875 frames.
+# At host_framerate=60 and tickrate=64, each tick ≈ 60/64 ≈ 0.94 frames.
 # IMPORTANT: must match DEFAULT_HOST_FRAMERATE in capture_script.py — wrong
 # value here only affects progress %, not the capture itself, but a 4x
 # mismatch makes the bar stay at 24% forever (the v0.2.3 → 0.2.4 lesson).
 CS2_TICKRATE = 64
-CAPTURE_FPS = 120
+CAPTURE_FPS = 60
 FRAMES_PER_TICK = CAPTURE_FPS / CS2_TICKRATE
 
 # Wall-clock cap for the capture stage. Even on a modest PC, capturing 4

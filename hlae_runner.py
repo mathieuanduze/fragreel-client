@@ -628,7 +628,7 @@ class HlaeRunner:
         output_dir: Path,
         *,
         basename: str = "highlight",
-        source_framerate: int = 120,
+        source_framerate: int = 60,
         cleanup_tgas: bool = True,
     ) -> CaptureResult:
         """ffmpeg every take in `result` → one ProRes 4444 .mov per segment.
@@ -639,8 +639,8 @@ class HlaeRunner:
         Per Edicao_FragReel_Best_Practices: ProRes 4444 preserves alpha
         and decodes fast in the Chromium build Remotion uses. Source
         framerate MUST match `host_framerate` that captured the TGAs —
-        we ship 120 fps as default in v0.2.4+ (was 300 fps in earlier
-        builds, which made the render pass time out on modest hardware).
+        we ship 60 fps as default in v0.2.6+ (was 120 fps in v0.2.4-5,
+        300 fps in v0.2.3; each step traded slow-mo for disk + speed).
 
         `cleanup_tgas=True` (default): once ffmpeg succeeds for a take,
         wipes that take's directory. Without this, each render leaves
@@ -675,7 +675,7 @@ class HlaeRunner:
         *,
         take: TakeOutput,
         output_path: Path,
-        source_framerate: int = 120,
+        source_framerate: int = 60,
         cleanup_tgas: bool = True,
         ffmpeg: Path | None = None,
     ) -> None:

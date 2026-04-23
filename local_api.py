@@ -329,7 +329,34 @@ def _build_render_coordinator() -> Optional[RenderCoordinator]:
     if not hlae_dir.exists():
         log.warning("vendor/hlae missing at %s; render endpoints disabled", hlae_dir)
         return None
-    output_dir = Path.home() / "Desktop" / "FragReel"
+
+    # Output directory precedence (v0.2.6+):
+    #   1. FRAGREEL_OUTPUT_DIR env var (lets the user point at a different
+    #      drive — e.g. D:\FragReel — without rebuilding the .exe)
+    #   2. Default: ~/Desktop/FragReel
+    # Note: this only redirects the FINAL .mov / .mp4 output. The TGA
+    # capture itself goes under <CS2_install>/game/bin/win64/fragreel/
+    # because HLAE writes there directly (mirv_streams record name is
+    # joined to the engine bin dir). Redirecting TGA capture to another
+    # drive needs a Steam library transfer or a junction point at the
+    # CS2 capture path — see the project Status doc for that workaround.
+    import os
+    env_output = os.environ.get("FRAGREEL_OUTPUT_DIR", "").strip()
+    if env_output:
+        output_dir = Path(env_output).expanduser()
+        log.info("output_dir overridden via FRAGREEL_OUTPUT_DIR: %s", output_dir)
+    else:
+        output_dir = Path.home() / "Desktop" / "FragReel"
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning(
+            "could not create output_dir %s (%s); falling back to ~/Desktop/FragReel",
+            output_dir, e,
+        )
+        output_dir = Path.home() / "Desktop" / "FragReel"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
     editor_dir = Path(__file__).parent.parent / "main" / "editor"
     config = HlaeRunnerConfig(cs2_install=cs2_install, hlae_dir=hlae_dir)
     return RenderCoordinator(

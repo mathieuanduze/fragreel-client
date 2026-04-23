@@ -43,12 +43,20 @@ from typing import Iterable
 
 DEFAULT_RECORD_NAME = "fragreel"
 DEFAULT_STREAM_NAME = "default"
-# 120 fps capture: 1.875x slow-motion vs CS2's 64 tps. Cinético o suficiente
-# pra clipes de kill ficarem dramáticos sem tornar o render impraticável.
-# Antes (v0.2.3): 300 fps (4.69x slow-mo) — pegava ~60 min de wall-clock pra
-# capturar 4 segments num PC modesto e batia o timeout do coordinator. Era
-# qualidade premium mas matava UX.
-DEFAULT_HOST_FRAMERATE = 120
+# 60 fps capture: 0.94x speed vs CS2's 64 tps — basically real-time, no
+# slow-motion. Chosen as default in v0.2.6 because 1080p TGA + 60 fps
+# = ~3000 frames per 50s segment ≈ 18 GB peak with v0.2.6 streaming
+# convert. 120 fps doubled that and pushed users with < 30 GB free out
+# of the product entirely.
+#
+# History:
+#   - v0.2.3: 300 fps (4.69x slow-mo) — ~60 min capture, hit timeout
+#   - v0.2.4: 120 fps (1.875x slow-mo) — ~25 min capture, ~36 GB peak
+#   - v0.2.6: 60 fps (real-time)       — ~12 min capture, ~18 GB peak
+#
+# Slow-motion as a premium feature is on the roadmap (let user choose
+# 120/240 from the web). For now real-time 60 fps is the safest default.
+DEFAULT_HOST_FRAMERATE = 60
 DEFAULT_KILLFEED_LIFETIME_SEC = 90
 STEAM64_BASE = 76561197960265728
 
