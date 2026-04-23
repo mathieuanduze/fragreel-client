@@ -11,12 +11,16 @@ Endpoints:
                                        body: {demo_path, segments:[{start_tick,end_tick}...]}
   GET  /render/status               → current render progress (polled by AdModal)
   POST /render/cancel               → abort the active render, kill CS2
+  POST /render/open                 → open the rendered video in the OS default player
 
 CORS: liberado só pra fragreel.vercel.app + http://localhost:3000 (dev).
 """
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
+import sys
 import threading
 import uuid
 from pathlib import Path
@@ -35,6 +39,27 @@ from render_coordinator import InsufficientDiskError, RenderCoordinator
 from scanner import scan_all, _load_cache as _load_scan_cache
 from uploader import UploadQueue
 from version import __version__ as CLIENT_VERSION
+
+
+def _open_in_os(path: Path) -> None:
+    """Open a file or folder in the OS default app, cross-platform.
+
+    Windows is the only target we ship today (FragReel.exe), but the macOS
+    branch makes development on Mac actually exercise the same code path.
+    Linux uses xdg-open which is best-effort.
+
+    Raises whatever the underlying call raises so the caller can degrade
+    to "open the parent folder" / surface the error to the user.
+    """
+    if sys.platform.startswith("win"):
+        # os.startfile is the right primitive on Windows — it picks the
+        # default app for files (Reprodutor de Mídia, VLC, etc) and opens
+        # folders in Explorer. Doesn't block.
+        os.startfile(str(path))  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
 
 log = logging.getLogger("fragreel.local_api")
 
@@ -298,6 +323,78 @@ def create_app(
         render_coordinator.cancel()
         current = render_coordinator.current()
         return jsonify(current.to_dict() if current else {"state": "idle"})
+
+    @app.post("/render/open")
+    def render_open():
+        """Open the most recently rendered output in the OS default player.
+
+        The web "Abrir FragReel" CTA hits this so the user doesn't have to
+        copy a path and paste it in Explorer. Browsers can't invoke
+        `os.startfile` on local paths (file:// to a binary triggers download
+        UX, not "open in app"), so we proxy through the local client.
+
+        Output preference (most polished → fallback):
+          1. session.output_mp4    — Remotion's final h264 MP4
+          2. session.output_movs[0] — first ProRes segment (won't play in
+                                      Windows Media Player but might in VLC)
+          3. session.output_mov    — legacy single-take field
+          4. <fallback> open the parent folder so the user can pick by hand
+
+        Returns {opened, path, kind, reason?} so the web can show the
+        path-copy chip when we couldn't open the file directly (e.g. on
+        non-Windows hosts or when the file vanished between status and open).
+        """
+        if render_coordinator is None:
+            return {"opened": False, "path": None, "kind": None,
+                    "reason": "render_not_configured"}, 503
+        current = render_coordinator.current()
+        if current is None:
+            return {"opened": False, "path": None, "kind": None,
+                    "reason": "no render has run yet"}, 404
+
+        # Pick the best available output. Falling back through the list keeps
+        # this endpoint useful even when Remotion is skipped (which is the
+        # case today inside the .exe — see editor_dir bug in render_coordinator).
+        candidates: list[Path] = []
+        if getattr(current, "output_mp4", None):
+            candidates.append(Path(current.output_mp4))
+        for mov in getattr(current, "output_movs", None) or []:
+            candidates.append(Path(mov))
+        if getattr(current, "output_mov", None):
+            candidates.append(Path(current.output_mov))
+
+        target_file = next((p for p in candidates if p.exists()), None)
+        if target_file is not None:
+            try:
+                _open_in_os(target_file)
+                return jsonify({
+                    "opened": True,
+                    "path": str(target_file),
+                    "kind": "file",
+                })
+            except Exception as e:
+                log.warning("could not open %s: %s — falling back to folder", target_file, e)
+
+        # Fallback: open the parent dir so the user can at least find the file.
+        parent_dir: Optional[Path] = None
+        for p in candidates:
+            if p.parent.exists():
+                parent_dir = p.parent
+                break
+        if parent_dir is None:
+            return {"opened": False, "path": None, "kind": None,
+                    "reason": "no output file or folder exists yet"}, 404
+        try:
+            _open_in_os(parent_dir)
+            return jsonify({
+                "opened": True,
+                "path": str(parent_dir),
+                "kind": "folder",
+                "reason": "opened parent folder (no playable file)",
+            })
+        except Exception as e:
+            return {"opened": False, "path": str(parent_dir), "kind": None,
+                    "reason": f"could not open folder: {e}"}, 500
 
     # ── Config endpoints (v0.2.7+ — Settings UI in web) ─────────────────
 
