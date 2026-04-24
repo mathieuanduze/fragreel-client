@@ -123,6 +123,135 @@ def steamid64_to_account_id(steamid64: str | int) -> int:
     return acc
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# v0.3.0-beta — Cluster round kills into capture windows (client-side)
+#
+# v0.3.0-alpha (server) switched scoring from cluster-based to round-based:
+# 1 highlight = 1 round. Cada HighlightOut carrega `kill_ticks` +
+# `kill_timestamps` do user naquele round. A decisão de CAPTURA (qual trecho
+# do round gravar) vive aqui no client, não no server — o server não sabe
+# do tickrate exato do demo, do budget de tempo de captura do user, nem das
+# constraints do HLAE.
+#
+# Algoritmo:
+#   1. Agrupa kills consecutivas com gap ≤ GAP_THRESHOLD_S num cluster único
+#   2. Pra cada cluster, define janela: [first_kill - PAD_PRE, last_kill + PAD_POST]
+#   3. Clampa no intervalo do round pra não vazar pro round anterior/próximo
+#
+# Garantia de não-echo (mesmo trecho capturado 2x):
+#   GAP_THRESHOLD_S (10s) >= PAD_PRE_S (5s) + PAD_POST_S (3.5s) = 8.5s
+#   Folga de 1.5s absorve imprecisão de tick→segundo e reconhece kills
+#   9-10s apartadas como mesmo fluxo de combate narrativo.
+#
+# Inter-round: garantido pelo freezetime do CS2 (15s+ entre rounds),
+# estruturalmente maior que pad sum.
+#
+# Spec completa em `Obsidian.../FragReel/v0.3 Plano Produto.md` §2.
+# ─────────────────────────────────────────────────────────────────────────
+
+CLUSTER_PAD_PRE_S = 5.0
+"""Segundos antes da primeira kill do cluster (build-up cinematográfico)."""
+
+CLUSTER_PAD_POST_S = 3.5
+"""Segundos depois da última kill do cluster (reação + body drop + reload início)."""
+
+CLUSTER_GAP_THRESHOLD_S = 10.0
+"""Kills consecutivas com gap <= este valor agrupam no mesmo cluster.
+
+Escolhido 1.5s acima do piso matemático (PAD_PRE+PAD_POST=8.5s) pra margem
+de tick→segundo e reconhecer kills 9-10s apartadas como mesmo fluxo.
+"""
+
+DEFAULT_TICKRATE = 64
+"""CS2 matchmaking padrão. Esports / tournament demos usam 128 tps —
+quando for suportado, o tickrate virá no payload do server."""
+
+
+def cluster_round_kills(
+    kill_ticks: list[int] | tuple[int, ...],
+    kill_timestamps: list[float] | tuple[float, ...],
+    round_start_tick: int,
+    round_end_tick: int,
+    tickrate: int = DEFAULT_TICKRATE,
+    pad_pre_s: float = CLUSTER_PAD_PRE_S,
+    pad_post_s: float = CLUSTER_PAD_POST_S,
+    gap_threshold_s: float = CLUSTER_GAP_THRESHOLD_S,
+) -> list[tuple[int, int]]:
+    """Expande 1 round window em N janelas de captura menores, 1 por cluster.
+
+    Args:
+        kill_ticks: ticks exatos de cada kill do user no round (sorted asc).
+        kill_timestamps: mesmos kills em segundos do jogo (tick/tickrate).
+        round_start_tick: limite inferior pra clamp (impede vazar pro round anterior).
+        round_end_tick: limite superior pra clamp.
+        tickrate: ticks por segundo do demo (64 matchmaking, 128 tournament).
+        pad_pre_s / pad_post_s: padding em segundos antes/depois do cluster.
+        gap_threshold_s: kills com gap <= este agrupam no mesmo cluster.
+
+    Returns:
+        Lista `[(start_tick, end_tick), ...]` ordenada. Clampada no round.
+        Se `kill_ticks` vazio OU desalinhado com timestamps → retorna
+        `[(round_start_tick, round_end_tick)]` (fallback pro comportamento
+        pre-v0.3: captura o round inteiro).
+
+    Exemplos:
+        Round com triple kill rápido (≤10s entre cada) → 1 janela de ~10-15s
+        Round com 3 kills espaçadas (>10s entre cada) → 3 janelas de ~8.5s cada
+        Round com 1 kill solo                          → 1 janela de ~8.5s
+    """
+    if not kill_ticks or len(kill_ticks) != len(kill_timestamps):
+        # Dados ausentes ou inconsistentes → fallback pro round inteiro.
+        # Isso é o comportamento pre-v0.3.0-beta e garante que demos
+        # parseadas por scorers pre-v0.3.0-alpha (sem `kill_ticks`) continuem
+        # funcionando sem regressão.
+        return [(round_start_tick, round_end_tick)]
+
+    if round_end_tick <= round_start_tick:
+        raise ValueError(
+            f"invalid round window: start={round_start_tick} end={round_end_tick}"
+        )
+
+    # 1. Agrupa kills em sub-clusters por gap temporal
+    cluster_indices: list[list[int]] = [[0]]
+    for i in range(1, len(kill_timestamps)):
+        last_in_cluster = cluster_indices[-1][-1]
+        gap = kill_timestamps[i] - kill_timestamps[last_in_cluster]
+        if gap <= gap_threshold_s:
+            cluster_indices[-1].append(i)
+        else:
+            cluster_indices.append([i])
+
+    # 2. Converte cada cluster numa janela (start_tick, end_tick) com padding
+    pad_pre_ticks = int(pad_pre_s * tickrate)
+    pad_post_ticks = int(pad_post_s * tickrate)
+    windows: list[tuple[int, int]] = []
+    for indices in cluster_indices:
+        first = kill_ticks[indices[0]]
+        last = kill_ticks[indices[-1]]
+        # 3. Clampa no range do round pra não vazar pra rounds adjacentes
+        start = max(round_start_tick, first - pad_pre_ticks)
+        end = min(round_end_tick, last + pad_post_ticks)
+        # Defensivo: se clamping colapsou a janela (kill exatamente em
+        # round_start ou round_end), mantém 1 tick mínimo pra CaptureSegment
+        # não rejeitar no __post_init__.
+        if end <= start:
+            end = min(round_end_tick, start + 1)
+        windows.append((start, end))
+
+    # Segurança: se algum pad deu merge entre clusters adjacentes (não
+    # deveria pelas invariantes, mas paranoia), mescla greedy. Mesma lógica
+    # do `/render` handler em local_api.
+    windows.sort(key=lambda w: w[0])
+    merged: list[tuple[int, int]] = []
+    for start, end in windows:
+        if merged and start <= merged[-1][1]:
+            prev_s, prev_e = merged[-1]
+            merged[-1] = (prev_s, max(prev_e, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 @dataclass(frozen=True)
 class CaptureSegment:
     """A single [start_tick, end_tick) range to record."""

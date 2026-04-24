@@ -296,35 +296,81 @@ def create_app(
                     "detail": "CS2 install or HLAE dir not detected on this PC"}, 503
 
         body = request.get_json(silent=True) or {}
+
+        # Each raw segment is (round_start_tick, round_end_tick, kill_ticks,
+        # kill_timestamps). The last two are opcionais — presentes a partir
+        # do v0.3.0-alpha (server expõe em HighlightOut) + web v0.3 (repassa
+        # no payload via RenderSegment.kill_ticks/kill_timestamps). Clients
+        # mais antigos ou demos parseadas com scorer pre-v0.3.0-alpha não
+        # têm esses campos e caem no comportamento round-inteiro (fallback
+        # gracioso sem quebrar).
         try:
-            raw_segments = [
-                (int(s["start_tick"]), int(s["end_tick"]))
-                for s in body.get("segments", [])
-            ]
+            raw_segments: list[tuple[int, int, list[int], list[float]]] = []
+            for s in body.get("segments", []):
+                start = int(s["start_tick"])
+                end = int(s["end_tick"])
+                kt = [int(t) for t in (s.get("kill_ticks") or [])]
+                ks = [float(t) for t in (s.get("kill_timestamps") or [])]
+                raw_segments.append((start, end, kt, ks))
         except (KeyError, TypeError, ValueError) as e:
             return {"error": "bad_segments", "detail": str(e)}, 400
         if not raw_segments:
             return {"error": "no_segments"}, 400
+
+        # v0.3.0-beta — expand each round window into N capture windows via
+        # `cluster_round_kills()` when kill data is present. Round com triple
+        # kill rápido (<=10s entre cada) → 1 janela de ~10-15s. Round com 3
+        # kills espaçadas (>10s entre cada) → 3 janelas de ~8.5s cada. Captura
+        # fica ~3-5× mais rápida que o round inteiro (round dura ~120s, janelas
+        # somadas ~25-40s). Sem kill data → 1 janela cobrindo o round inteiro
+        # (fallback pre-v0.3). Spec em `v0.3 Plano Produto.md` §2.
+        from scripts.capture_script import cluster_round_kills  # lazy import (dev reload)
+
+        expanded: list[tuple[int, int]] = []
+        clusters_count = 0
+        for start, end, kt, ks in raw_segments:
+            if end <= start:
+                continue
+            windows = cluster_round_kills(
+                kill_ticks=kt,
+                kill_timestamps=ks,
+                round_start_tick=start,
+                round_end_tick=end,
+            )
+            # Se houve cluster real (mais de 1 janela OU 1 janela menor que
+            # o round inteiro), loga pra debug. Sem kill data, windows==
+            # [(start, end)] e o ratio==1.0.
+            if kt:
+                clusters_count += len(windows)
+            expanded.extend(windows)
 
         # The web sends segments in highlight-score order (not tick order),
         # and two highlights for kills close together can overlap by a few
         # hundred ticks. capture_script.py validates strict ascending +
         # non-overlapping and would error out as "segments overlap". Sort
         # by start_tick and greedily merge any overlap so the user gets a
-        # single contiguous capture instead of an error.
-        raw_segments = [(s, e) for s, e in raw_segments if e > s]
-        raw_segments.sort(key=lambda se: se[0])
+        # single contiguous capture instead of an error. This ALSO catches
+        # any residual overlap entre clusters de rounds adjacentes (o
+        # invariante do freezetime do CS2 >= pad sum cobre o caso normal;
+        # este merge é belt-and-braces).
+        expanded = [(s, e) for s, e in expanded if e > s]
+        expanded.sort(key=lambda se: se[0])
         segments: list[tuple[int, int]] = []
-        for start, end in raw_segments:
+        for start, end in expanded:
             if segments and start <= segments[-1][1]:
                 prev_start, prev_end = segments[-1]
                 segments[-1] = (prev_start, max(prev_end, end))
             else:
                 segments.append((start, end))
-        if len(segments) != len(raw_segments):
+        if len(segments) != len(expanded):
             log.info(
                 "/render — merged %d overlapping segment(s) → %d final segment(s)",
-                len(raw_segments) - len(segments), len(segments),
+                len(expanded) - len(segments), len(segments),
+            )
+        if clusters_count:
+            log.info(
+                "/render — v0.3.0-beta clustering: %d rounds → %d cluster windows → %d final (after merge)",
+                len(raw_segments), clusters_count, len(segments),
             )
         if not segments:
             return {"error": "no_segments"}, 400
