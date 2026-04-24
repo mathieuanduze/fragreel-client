@@ -25,7 +25,12 @@ from typing import Callable, Optional
 import requests
 
 from config import API_URL, MIN_DEMO_BYTES
-from scanner import _sha1_quick, mark_processed, is_already_processed
+from scanner import (
+    _sha1_quick,
+    get_cached_processing,
+    is_already_processed,
+    mark_processed,
+)
 
 log = logging.getLogger("fragreel.uploader")
 
@@ -121,9 +126,47 @@ class UploadQueue:
             if size < MIN_DEMO_BYTES:
                 return False
             sha = _sha1_quick(demo_path)
-            if is_already_processed(demo_path):
-                log.info(f"Pulando (já processada antes): {demo_path.name}")
-                self.on_event("skipped", {"path": str(demo_path), "sha": sha, "reason": "already_processed"})
+            cached = get_cached_processing(demo_path)
+            if cached:
+                # v0.2.15 Bug #6v2: cache HIT branch.
+                #
+                # The scanner cache knows this demo was uploaded before and
+                # has a server-side match_id. Before this fix, we emitted
+                # `skipped` and bailed — which was correct for the watcher /
+                # scan_retroativo paths (nothing was waiting), but broke the
+                # web path: when the user clicks "Mapear plays" from the
+                # browser, the AnalyzeModal polls /jobs/{sha} for `done` and
+                # would hang forever on "Iniciando análise…" because the
+                # terminal event was `skipped`, not `done`.
+                #
+                # Fix: when the caller is the web (user-initiated
+                # re-analyze), emit `done` immediately with the cached
+                # match_id so the modal can unlock + redirect to /match/{id}
+                # as soon as the ad timer finishes. For the watcher /
+                # scan_retroativo paths, keep the old `skipped` semantic
+                # since nothing is polling.
+                if source == "web":
+                    match_id = cached.get("match_id")
+                    highlights = int(cached.get("highlights") or 0)
+                    log.info(
+                        "cache HIT [web]: %s → match_id=%s (highlights=%d, skipping re-upload)",
+                        demo_path.name, match_id, highlights,
+                    )
+                    self.on_event("done", {
+                        "path": str(demo_path),
+                        "sha": sha,
+                        "match_id": match_id,
+                        "highlights": highlights,
+                        "duration_s": 0.0,
+                        "cache_hit": True,
+                    })
+                else:
+                    log.info(f"Pulando (já processada antes): {demo_path.name}")
+                    self.on_event("skipped", {
+                        "path": str(demo_path),
+                        "sha": sha,
+                        "reason": "already_processed",
+                    })
                 return False
             self._enqueued_paths.add(key)
 
@@ -187,7 +230,10 @@ class UploadQueue:
                 match_id = data.get("match_id") or path.stem
                 highlights = data.get("highlights", 0)
 
-                mark_processed(sha, match_id)
+                # v0.2.15 Bug #6v2: cache highlights count so the cache-HIT
+                # fast path in enqueue() can emit a `done` with the real
+                # number instead of 0.
+                mark_processed(sha, match_id, highlights=highlights)
 
                 duration = round(time.time() - t0, 1)
                 log.info(f"✓ {path.name} → match_id={match_id} ({highlights} highlights, {duration}s)")

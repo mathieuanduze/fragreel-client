@@ -337,14 +337,24 @@ def scan_all(
     return results
 
 
-def mark_processed(sha1: str, match_id: str) -> None:
+def mark_processed(
+    sha1: str,
+    match_id: str,
+    highlights: Optional[int] = None,
+) -> None:
     """Depois do upload bem-sucedido, marca essa demo como processada no cache.
     Preserva a meta cacheada pra que `scan_all` continue retornando a demo
-    (com match_id) e o usuário possa abrir o FragReel pronto."""
+    (com match_id) e o usuário possa abrir o FragReel pronto.
+
+    v0.2.15 (Bug #6v2): agora também cacheia `highlights` (count) pra que o
+    atalho "cache HIT" no uploader consiga emitir um `done` com o número
+    correto de highlights sem precisar re-bater no servidor."""
     cache = _load_cache()
     entry = cache.get(sha1) or {}
     entry["match_id"] = match_id
     entry["processed_at"] = time.time()
+    if highlights is not None:
+        entry["highlights"] = int(highlights)
     cache[sha1] = entry
     _save_cache(cache)
 
@@ -355,3 +365,20 @@ def is_already_processed(path: Path) -> bool:
     sha = _sha1_quick(path)
     entry = cache.get(sha)
     return bool(entry and entry.get("match_id"))
+
+
+def get_cached_processing(path: Path) -> Optional[dict]:
+    """Retorna o dict cacheado ({match_id, processed_at, highlights?}) se a
+    demo já foi processada, ou None caso contrário.
+
+    Introduzido em v0.2.15 pra resolver Bug #6v2: quando o user clica
+    "Mapear plays" via web numa demo que já foi enviada ao servidor antes,
+    o uploader pode curto-circuitar a fila e emitir `done` direto com o
+    match_id cacheado, evitando o modal de análise travar em
+    "Iniciando análise…" pra sempre."""
+    cache = _load_cache()
+    sha = _sha1_quick(path)
+    entry = cache.get(sha)
+    if entry and entry.get("match_id"):
+        return dict(entry)
+    return None
