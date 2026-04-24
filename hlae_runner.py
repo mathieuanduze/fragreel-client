@@ -43,6 +43,21 @@ from typing import Callable
 # frozen for ~4 min per 3964-frame 1080p ProRes 4444 segment).
 _FFMPEG_FRAME_RE = re.compile(r"frame=\s*(\d+)")
 
+
+class RenderCancelled(Exception):
+    """Clean abort signal raised by the conversion pipeline when a
+    caller-supplied `is_cancelled()` callable returns True mid-encode.
+
+    Distinct from `RuntimeError` so the coordinator can treat cancel as
+    `state='cancelled'` instead of `state='error'`. Introduced in v0.2.15
+    after PC test confirmed v0.2.14's cancel-from-web-thread flow left
+    ffmpeg orphaned (Bug #4): the `except BaseException` in
+    `_convert_one_take` only fires on signals delivered to the encoding
+    thread, but web-triggered cancel just flips a `threading.Event` on
+    another thread — the stderr loop kept reading until ffmpeg finished.
+    """
+    pass
+
 from cs2_launcher import InjectedProcess, get_desktop_resolution, launch_cs2_injected
 from scripts.capture_script import (
     CaptureSegment,
@@ -711,6 +726,7 @@ class HlaeRunner:
         basename: str = "highlight",
         source_framerate: int = 60,
         cleanup_tgas: bool = True,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> CaptureResult:
         """ffmpeg every take in `result` → one ProRes 4444 .mov per segment.
 
@@ -726,6 +742,11 @@ class HlaeRunner:
         `cleanup_tgas=True` (default): once ffmpeg succeeds for a take,
         wipes that take's directory. Without this, each render leaves
         5–10 GB of single-use TGAs per segment on disk.
+
+        `is_cancelled` (v0.2.15+): optional callable polled during the
+        ffmpeg stderr loop. Returning True kills ffmpeg and raises
+        `RenderCancelled` — used by the coordinator to abort cleanly
+        when a user hits cancel mid-encode.
         """
         if not result.takes:
             raise ValueError("CaptureResult has no takes to convert")
@@ -739,6 +760,12 @@ class HlaeRunner:
 
         movs: dict[int, Path] = {}
         for take in result.takes:
+            # Between-take cancel check: spares us launching ffmpeg for a
+            # segment we're going to abort anyway.
+            if is_cancelled is not None and is_cancelled():
+                raise RenderCancelled(
+                    f"cancelled before seg={take.segment_index} (batch convert)"
+                )
             mov_path = output_dir / f"{basename}_seg{take.segment_index:02d}.mov"
             self._convert_one_take(
                 take=take,
@@ -746,6 +773,7 @@ class HlaeRunner:
                 ffmpeg=ffmpeg,
                 source_framerate=source_framerate,
                 cleanup_tgas=cleanup_tgas,
+                is_cancelled=is_cancelled,
             )
             movs[take.segment_index] = mov_path
 
@@ -760,6 +788,7 @@ class HlaeRunner:
         cleanup_tgas: bool = True,
         ffmpeg: Path | None = None,
         on_frame_progress: Callable[[int], None] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> None:
         """Public wrapper around `_convert_one_take` — used by the streaming
         converter callback in the coordinator.
@@ -768,6 +797,13 @@ class HlaeRunner:
         (throttled, not every frame). Lets the coordinator update
         `segments_done` as a float during a long encode instead of jumping
         from 0 → 1 only at the end.
+
+        `is_cancelled` (v0.2.15+): optional callable polled inside the ffmpeg
+        stderr loop. Returning True kills ffmpeg and raises `RenderCancelled`.
+        Used by the coordinator to detect `threading.Event` cancels set from
+        the web request thread — the previous `except BaseException` fallback
+        only caught signals delivered to the encoding thread itself (Bug #4
+        from v0.2.14 PC test: cancel from web left ffmpeg orphaned).
         """
         ff = ffmpeg or self.config.resolved_ffmpeg()
         if ff is None:
@@ -782,6 +818,7 @@ class HlaeRunner:
             source_framerate=source_framerate,
             cleanup_tgas=cleanup_tgas,
             on_frame_progress=on_frame_progress,
+            is_cancelled=is_cancelled,
         )
 
     def _convert_one_take(
@@ -793,6 +830,7 @@ class HlaeRunner:
         source_framerate: int,
         cleanup_tgas: bool,
         on_frame_progress: Callable[[int], None] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> None:
         """Single TGA-sequence → ProRes pass for one TakeOutput."""
         # Numbered TGA pattern (HLAE writes 00000.tga, 00001.tga, ...)
@@ -841,6 +879,36 @@ class HlaeRunner:
         assert proc.stderr is not None  # bufsize=1 + stderr=PIPE guarantees it
         try:
             for line in proc.stderr:
+                # Cancel check (v0.2.15+): poll the caller flag on every
+                # stderr line. ffmpeg emits progress lines ~10–30 Hz, which
+                # caps our cancel-detection latency at ~30–100 ms. That's
+                # fast enough the user doesn't notice a delay, and we kill
+                # ffmpeg BEFORE it consumes more TGAs. See Bug #4 analysis:
+                # previous `except BaseException` only caught signals
+                # delivered to THIS thread — web-thread cancel via
+                # `threading.Event` would never trigger it.
+                if is_cancelled is not None and is_cancelled():
+                    log.info(
+                        "cancel detected mid-encode for seg=%d (frame=%d/%d) "
+                        "— killing ffmpeg pid=%d",
+                        take.segment_index, last_reported,
+                        take.frame_count, proc.pid,
+                    )
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        log.warning(
+                            "ffmpeg pid=%d did not exit within 5s of kill",
+                            proc.pid,
+                        )
+                    except Exception as e:
+                        log.warning("ffmpeg kill raised: %s", e)
+                    raise RenderCancelled(
+                        f"cancelled mid-encode seg={take.segment_index} "
+                        f"at frame={last_reported}/{take.frame_count}"
+                    )
+
                 stderr_tail.append(line)
                 if len(stderr_tail) > STDERR_TAIL_MAX:
                     stderr_tail.pop(0)
@@ -862,9 +930,16 @@ class HlaeRunner:
                     on_frame_progress(take.frame_count)
                 except Exception:
                     log.debug("on_frame_progress final flush raised", exc_info=True)
+        except RenderCancelled:
+            # Already killed ffmpeg above; just propagate the clean-abort
+            # signal up to the coordinator for state='cancelled' handling.
+            raise
         except BaseException:
-            # Interrupted (Ctrl+C, SIGTERM, cancel) — kill the child so we
-            # don't orphan ffmpeg holding onto GB of TGA file handles.
+            # Interrupted (Ctrl+C, SIGTERM, direct thread signal) — kill
+            # the child so we don't orphan ffmpeg holding onto GB of TGA
+            # file handles. Web-thread cancels flow through RenderCancelled
+            # above (v0.2.15+); this remains a safety net for the rare
+            # direct-signal case (e.g. user hits Ctrl+C in a dev console).
             try:
                 proc.kill()
                 proc.wait(timeout=5)

@@ -42,7 +42,14 @@ from pathlib import Path
 from typing import Callable
 
 from cs2_launcher import InjectedProcess, find_running_cs2_pids, kill_running_cs2
-from hlae_runner import HlaeRunner, HlaeRunnerConfig, LaunchStrategy, RenderPlan, TakeOutput
+from hlae_runner import (
+    HlaeRunner,
+    HlaeRunnerConfig,
+    LaunchStrategy,
+    RenderCancelled,
+    RenderPlan,
+    TakeOutput,
+)
 
 
 log = logging.getLogger(__name__)
@@ -460,6 +467,11 @@ class RenderCoordinator:
                     output_path=mov_path,
                     on_frame_progress=_on_ffmpeg_frame,
                     cleanup_tgas=True,
+                    # v0.2.15+: propagate the Event flag so ffmpeg dies
+                    # promptly when the web thread hits /render/cancel,
+                    # instead of orphaning the child for the rest of the
+                    # encode (Bug #4 from PC test).
+                    is_cancelled=self._cancel_requested.is_set,
                 )
                 converted_movs[take.segment_index] = mov_path
                 with self._lock:
@@ -595,6 +607,15 @@ class RenderCoordinator:
             self._active_record_root = None
             self._active_mov_dir = None
             self._mark_done()
+        except RenderCancelled as e:
+            # User cancelled mid-encode (via /render/cancel flipping the
+            # Event flag). Not an error — route to the clean `cancelled`
+            # terminal state, same as flag-based aborts between stages.
+            # Without this branch the exception would fall through to
+            # `except Exception` below and get reported as state='error'
+            # with a spurious traceback (Bug #7 from PC test).
+            log.info("render cancelled mid-encode: %s", e)
+            self._mark_cancelled()
         except Exception as e:
             tb = traceback.format_exc()
             log.error("render crashed: %s\n%s", e, tb)
