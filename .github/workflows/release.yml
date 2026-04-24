@@ -45,6 +45,31 @@ jobs:
       - name: Verify vendor/ is complete
         run: python setup_vendor.py --check
 
+      # Sobrescreve version.py com a tag que disparou o workflow (ou um
+      # sentinel pra workflow_dispatch manual). O .exe final sempre carrega
+      # a versão que o CI registrou — nunca o fallback de dev. Isso elimina
+      # o passo manual de bumpar version.py antes de tagear.
+      - name: Inject version from tag
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            cat > version.py <<EOF
+          # Auto-gerado por .github/workflows/release.yml a partir da tag ${tag}.
+          # NÃO editar — qualquer mudança aqui é sobrescrita no próximo build.
+          __version__ = "${tag}"
+          EOF
+          else
+            sha_short="$(git rev-parse --short HEAD)"
+            cat > version.py <<EOF
+          # Auto-gerado: build manual via workflow_dispatch (sem tag).
+          __version__ = "v0.0.0-manual-${sha_short}"
+          EOF
+          fi
+          echo "--- version.py ---"
+          cat version.py
+          echo "------------------"
+
       - name: Build .exe with PyInstaller
         run: pyinstaller --noconfirm --clean FragReel.spec
 
