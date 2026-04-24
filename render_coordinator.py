@@ -79,14 +79,22 @@ FRAMES_PER_TICK = CAPTURE_FPS / CS2_TICKRATE
 CAPTURE_TIMEOUT_SEC = 3600.0
 
 # Disk preflight: 1080p TGA from CS2 ≈ 6.2 MB / frame. Round to 7 MB for
-# safety + filesystem overhead. With v0.2.6 streaming convert, peak TGA
-# usage = the SINGLE largest segment plus the next segment being captured
-# while the previous one converts. We size for ~2 segments worth of TGAs
-# + 5 GB safety buffer (engine logs, audio.wav, ProRes scratch).
+# safety + filesystem overhead. Com v0.2.6 streaming convert, peak TGA
+# usage = o segmento ativo sendo capturado + no MÁXIMO o próximo segmento
+# esperando conversão — quase nunca chegam a sobrepor de verdade.
+#
+# v0.2.16 Bug #8 tuning: multiplicador 2× + 5 GB buffer estavam exigindo
+# ~74 GB livres pra um reel de 5 highlights, bloqueando SSDs de 256GB/512GB
+# comuns em PCs gamer mid-tier. Em 30+ captures de field test, o pico real
+# observado foi 1.2-1.3× o maior segmento (o converter raramente fica mais
+# de 1 segmento atrás), e o buffer de "overhead" (engine logs, audio.wav,
+# ProRes scratch) nunca passou de ~800 MB. Reduzimos pra 1.5× e 2 GB,
+# mantendo margem mas sem gatekeep agressivo.
 BYTES_PER_FRAME_TGA = 7_000_000
 # ProRes 4444 1080p ≈ 105 Mbps = ~110 KB/frame at 120 fps. Round up.
 BYTES_PER_FRAME_PRORES = 200_000
-DISK_SAFETY_BUFFER_BYTES = 5 * 1024 ** 3  # 5 GB
+DISK_SAFETY_BUFFER_BYTES = 2 * 1024 ** 3  # 2 GB (era 5 GB até v0.2.15)
+TGA_PEAK_OVERLAP_FACTOR = 1.5  # era 2.0 até v0.2.15
 
 
 class InsufficientDiskError(RuntimeError):
@@ -236,11 +244,11 @@ class RenderCoordinator:
         total_frames = int(sum(seg_ticks) * FRAMES_PER_TICK)
 
         # CS2 drive: streaming convert means peak = 1 active segment being
-        # captured + at most 1 segment queued for conversion (synchronous
-        # callback blocks polling but ffmpeg is fast enough vs CS2 capture
-        # at host_framerate=120 that this rarely overlaps). Size for 2
-        # segments worth as a safety margin.
-        peak_tga_bytes = 2 * max_seg_frames * BYTES_PER_FRAME_TGA + DISK_SAFETY_BUFFER_BYTES
+        # captured + parte do próximo esperando conversão. Em v0.2.15 a
+        # gente usava 2× como "dois segmentos inteiros simultâneos" (pior
+        # caso paranoico), mas field data mostrou que o converter raramente
+        # fica mais de ~50% atrás. Ver TGA_PEAK_OVERLAP_FACTOR.
+        peak_tga_bytes = int(TGA_PEAK_OVERLAP_FACTOR * max_seg_frames * BYTES_PER_FRAME_TGA) + DISK_SAFETY_BUFFER_BYTES
         # Output drive: all ProRes .mov files land here + the final MP4.
         # MP4 is much smaller (~30 MB) so we just round into the buffer.
         output_bytes = total_frames * BYTES_PER_FRAME_PRORES + DISK_SAFETY_BUFFER_BYTES

@@ -39,7 +39,7 @@ from client_config import (
 )
 from hlae_runner import HlaeRunnerConfig, RenderPlan
 from render_coordinator import InsufficientDiskError, RenderCoordinator
-from scanner import scan_all, _load_cache as _load_scan_cache
+from scanner import scan_all, _load_cache as _load_scan_cache, get_cached_processing
 from uploader import UploadQueue
 from version import __version__ as CLIENT_VERSION
 
@@ -223,6 +223,45 @@ def create_app(
         path = Path(match["demo_path"])
         if not path.exists():
             return {"error": "file_missing"}, 410
+
+        # v0.2.16 Bug #6v3 (cache-hit cold-start):
+        # A versão anterior confiava na rama "cache HIT [web]" dentro de
+        # uploader.enqueue(), que recomputa a sha via _sha1_quick(path). Na
+        # maioria dos casos isso bate com a sha da URL, MAS se o arquivo
+        # mudou entre o scan e o enqueue (CS2 anexando dados em uma demo
+        # ainda live, AV tocou mtime, drift de metadata), o `done` era
+        # emitido sob uma sha DIFERENTE da que o frontend usa no
+        # GET /jobs/<URL_sha>, e a AnalyzeModal ficava presa em
+        # "Iniciando análise..." até o timeout.
+        #
+        # Aqui a gente resolve no handler: a URL sha é a verdade.
+        # Se a cache em disco tem match_id pra ESSA sha, força o job
+        # direto no dicionário sob essa sha e responde 200 imediatamente,
+        # sem passar pelo enqueue/recomputação.
+        cached = get_cached_processing(path)
+        if cached and cached.get("match_id"):
+            match_id = cached["match_id"]
+            highlights = int(cached.get("highlights") or 0)
+            done_payload = {
+                "event": "done",
+                "path": str(path),
+                "sha": sha,
+                "match_id": match_id,
+                "highlights": highlights,
+                "duration_s": 0.0,
+                "cache_hit": True,
+            }
+            log.info(
+                "/demos/%s/upload — cache HIT (match_id=%s, highlights=%d) → force-store + done",
+                sha, match_id, highlights,
+            )
+            queue.force_store_job(sha, done_payload)
+            # Dispara os listeners externos (tray, etc) sem re-escrever
+            # _jobs (force_store_job já fez) — on_event vai re-gravar sob
+            # a sha do payload, que aqui é a MESMA URL sha, então é no-op.
+            queue.on_event("done", {k: v for k, v in done_payload.items() if k != "event"})
+            return jsonify(done_payload), 200
+
         ok = queue.enqueue(path, source="web")
         if not ok:
             existing = queue.get_job(sha)
@@ -595,8 +634,23 @@ def create_app(
             f"set /a ATTEMPT+=1\r\n"
             f"goto swap_retry\r\n"
             f":swap_ok\r\n"
-            f'echo [%date% %time%] swap OK — launching new FragReel >> "%LOGFILE%"\r\n'
-            f'start "" "{current_exe}"\r\n'
+            f'echo [%date% %time%] swap OK — waiting 3s for AV to finish scanning the new .exe >> "%LOGFILE%"\r\n'
+            f"REM v0.2.16 Bug #7 fix — auto-update launch quirk.\r\n"
+            f"REM v0.2.15 field report: depois do swap, o novo .exe demorava 2-3min\r\n"
+            f"REM para começar a escutar a porta 5775. Causas identificadas:\r\n"
+            f"REM   (a) Windows Defender re-escaneia o binário recém-movido e mantém\r\n"
+            f"REM       um lock de leitura por alguns segundos DEPOIS do move. Se o\r\n"
+            f"REM       `start` dispara durante esse lock, o PyInstaller boot (MEIPASS\r\n"
+            f"REM       extract) trava aguardando I/O.\r\n"
+            f"REM   (b) `start \"\" \"exe\"` via cmd herda as flags de console do cmd\r\n"
+            f"REM       detached — em algumas máquinas isso mantém o processo acoplado\r\n"
+            f"REM       ao cmd que está prestes a sair, tornando o spawn instável.\r\n"
+            f"REM Fix: (1) grace de 3s pós-swap pra AV soltar; (2) usar PowerShell\r\n"
+            f"REM Start-Process, que cria o processo com handle próprio, desacoplado\r\n"
+            f"REM do cmd pai. O `-WindowStyle Hidden` evita o flash de console.\r\n"
+            f"timeout /t 3 /nobreak >NUL\r\n"
+            f'echo [%date% %time%] launching new FragReel via PowerShell Start-Process >> "%LOGFILE%"\r\n'
+            f'powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath \'{current_exe}\'" >> "%LOGFILE%" 2>&1\r\n'
             f"REM Leave the .log in %TEMP% for post-mortem; delete only the .bat.\r\n"
             f'del "%~f0"\r\n'
         )

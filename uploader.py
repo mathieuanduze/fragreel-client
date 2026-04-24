@@ -94,6 +94,29 @@ class UploadQueue:
         with self._lock:
             return dict(self._jobs[sha]) if sha in self._jobs else None
 
+    def force_store_job(self, sha: str, payload: dict) -> None:
+        """Store a job entry keyed by the CALLER's sha, bypassing the sha
+        computation that `on_event()` does from `payload["sha"]`.
+
+        Exists because of the v0.2.16 cache-HIT robustness fix (Bug #6v3).
+        The web calls POST /demos/<sha>/upload using the sha produced by
+        scanner (the one it saw in the /demos list). In most cases that
+        matches what `_sha1_quick(path)` returns inside enqueue(), but if
+        the file changed between scan and enqueue (e.g. CS2 appended to a
+        live demo, AV scan touched mtime, filesystem metadata drift), the
+        internal recomputation would emit `done` keyed under a DIFFERENT
+        sha than the one the frontend polls via GET /jobs/<URL_sha>. End
+        result: frontend polls forever on "Iniciando análise…".
+
+        Solution: the /demos/<sha>/upload handler force-stores the done
+        payload under the URL sha directly, so the subsequent poll always
+        hits a live entry. The `sha` inside the payload itself is kept as
+        whatever the caller passed (for downstream consumers that read it)
+        — but the DICT KEY is the URL sha.
+        """
+        with self._lock:
+            self._jobs[sha] = dict(payload)
+
     # ── API pública ──────────────────────────────────────────────────────
 
     def start(self) -> None:
