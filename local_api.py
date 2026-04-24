@@ -535,34 +535,73 @@ def create_app(
         # because we need to outlive the Python process — once Python exits,
         # the .exe lock releases and the bat can move the new file in.
         bat_path = Path(tempfile.gettempdir()) / f"FragReel-update-{current_pid}.bat"
-        # Note the doubled %% for batch escaping. The bat:
-        #   1. Polls tasklist until our PID is gone
-        #   2. Sleeps 2s extra to be sure the file lock cleared (Windows
-        #      sometimes holds it briefly after process exit)
-        #   3. Moves the new .exe over the old one
-        #   4. Launches it with `start ""` (detached, won't block the bat)
-        #   5. Self-deletes
+        bat_log = Path(tempfile.gettempdir()) / f"FragReel-update-{current_pid}.log"
+
+        # v0.2.15 Bug #5 fix — belt & suspenders swap.
+        #
+        # v0.2.14 field test: the swap `move /Y` occasionally failed silently
+        # and the user ended up on the OLD version, thinking the update worked.
+        # Root causes identified:
+        #   (a) A stray FragReel.exe process (orphan from a previous crash,
+        #       duplicate tray instance, or child spawned by hlae/ffmpeg that
+        #       re-exec'd fragreel somehow) was still holding a lock on the
+        #       .exe even after OUR PID exited.
+        #   (b) Windows Defender's real-time scan opens a read lock on the
+        #       freshly-written .exe for a few seconds after it lands in
+        #       %TEMP%. The old 2-second timeout wasn't enough on slower
+        #       machines.
+        #   (c) Single `move` attempt with no retry meant any transient lock
+        #       skipped straight to the fallback-launch-staging branch.
+        #   (d) No log of what happened inside the bat, so debugging was blind.
+        #
+        # This version:
+        #   1. Waits for our PID (unchanged).
+        #   2. Runs `taskkill /F /IM FragReel.exe /T` (recursive tree kill) to
+        #      sweep any remaining FragReel processes regardless of origin.
+        #   3. Sleeps 5s (was 2s) to let Windows Defender release its read lock.
+        #   4. Attempts `move` up to 3 times with 2s between attempts.
+        #   5. Logs every step to %TEMP%\FragReel-update-<PID>.log — left in
+        #      place on exit so post-mortems are possible.
         bat_content = (
             f"@echo off\r\n"
             f"REM FragReel auto-update helper (PID {current_pid})\r\n"
+            f"REM v0.2.15 Bug #5 fix — taskkill /T + 5s grace + 3x retry + log\r\n"
+            f'set "LOGFILE={bat_log}"\r\n'
+            f'echo [%date% %time%] update helper started for PID {current_pid} > "%LOGFILE%"\r\n'
+            f'echo [%date% %time%] new_exe={new_exe_path} >> "%LOGFILE%"\r\n'
+            f'echo [%date% %time%] current_exe={current_exe} >> "%LOGFILE%"\r\n'
             f":wait_loop\r\n"
             f'tasklist /FI "PID eq {current_pid}" 2>NUL | find /I "{current_pid}" >NUL\r\n'
             f"if not errorlevel 1 (\r\n"
             f"  timeout /t 1 /nobreak >NUL\r\n"
             f"  goto wait_loop\r\n"
             f")\r\n"
-            f"timeout /t 2 /nobreak >NUL\r\n"
-            f'move /Y "{new_exe_path}" "{current_exe}"\r\n'
-            f"if errorlevel 1 (\r\n"
-            f"  REM Swap failed (file locked? perms?). Launch the staging copy\r\n"
-            f"  REM so the user at least gets the new build, leaving the old in place.\r\n"
+            f'echo [%date% %time%] PID {current_pid} gone — running taskkill /F /T on any remaining FragReel.exe >> "%LOGFILE%"\r\n'
+            f'taskkill /F /IM FragReel.exe /T >> "%LOGFILE%" 2>&1\r\n'
+            f'echo [%date% %time%] sleeping 5s for AV scan / file lock release >> "%LOGFILE%"\r\n'
+            f"timeout /t 5 /nobreak >NUL\r\n"
+            f'set "ATTEMPT=1"\r\n'
+            f":swap_retry\r\n"
+            f'echo [%date% %time%] swap attempt %ATTEMPT%/3 >> "%LOGFILE%"\r\n'
+            f'move /Y "{new_exe_path}" "{current_exe}" >> "%LOGFILE%" 2>&1\r\n'
+            f"if not errorlevel 1 goto swap_ok\r\n"
+            f'if "%ATTEMPT%"=="3" (\r\n'
+            f'  echo [%date% %time%] swap FAILED after 3 attempts — launching staging copy as fallback >> "%LOGFILE%"\r\n'
             f'  start "" "{new_exe_path}"\r\n'
             f"  exit /b 1\r\n"
             f")\r\n"
+            f'echo [%date% %time%] attempt %ATTEMPT% failed — retrying in 2s >> "%LOGFILE%"\r\n'
+            f"timeout /t 2 /nobreak >NUL\r\n"
+            f"set /a ATTEMPT+=1\r\n"
+            f"goto swap_retry\r\n"
+            f":swap_ok\r\n"
+            f'echo [%date% %time%] swap OK — launching new FragReel >> "%LOGFILE%"\r\n'
             f'start "" "{current_exe}"\r\n'
+            f"REM Leave the .log in %TEMP% for post-mortem; delete only the .bat.\r\n"
             f'del "%~f0"\r\n'
         )
         bat_path.write_text(bat_content, encoding="utf-8")
+        log.info("auto-update: wrote helper bat=%s log=%s", bat_path, bat_log)
 
         # Spawn detached so the bat survives our exit. CREATE_NO_WINDOW
         # keeps the cmd console invisible to the user.
@@ -602,6 +641,7 @@ def create_app(
             "started": True,
             "new_exe": str(new_exe_path),
             "current_exe": str(current_exe),
+            "bat_log": str(bat_log),  # v0.2.15: surface log path for post-mortem
             "pid": current_pid,
             "size_mb": round(size / 1024 / 1024, 1),
             "message": "downloaded — swap helper spawned, client exits in ~2s",
