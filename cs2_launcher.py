@@ -518,6 +518,106 @@ def _remote_call_with_wstring(process: int, func_addr: int, arg_addr: int, op_na
         _CloseHandle(thread)
 
 
+# ── v0.3.0-beta-3 — Bug #12 fix: force windowed mode in videosettings.txt ────
+#
+# CS2 (Source 2) lê videosettings.txt no boot ANTES de processar -windowed
+# / +mat_fullscreen 0 da CLI. Se o file estiver com fullscreen_mode=1
+# (porque último quit foi fullscreen, ou crash mid-render, ou user setou
+# manualmente), CS2 abre a janela em fullscreen → splash visível por ~500ms
+# até args overruled → mode switch. UX horrível pra render headless.
+#
+# Fix: pre-escrever videosettings com windowed mode antes de CreateProcess.
+# Idempotente: no-op se já estava windowed (não polui modtime). Backup
+# automático em videosettings.txt.fragreel.bak na primeira vez (recovery
+# do user se algo der errado).
+#
+# Hipótese + plano de teste: [[Bug #12 — CS2 Fullscreen Launch]] em Obsidian.
+
+import os
+import re
+
+# Regex aceita qualquer dígito (não só 0/1). CS2 fullscreen_mode pode ser:
+#   0 = windowed     (queremos isso)
+#   1 = fullscreen
+#   2 = exclusive fullscreen (raro mas existe)
+# Smoke test catched isso: regex original [01] deixava "2" passar.
+_VIDEOSETTINGS_FULLSCREEN_RE = re.compile(
+    r'("setting\.fullscreen_mode"\s*)"\d+"'
+)
+_VIDEOSETTINGS_NOWINDOWBORDER_RE = re.compile(
+    r'("setting\.nowindowborder"\s*)"\d+"'
+)
+
+
+def _videosettings_paths(cs2_exe: Path) -> list[Path]:
+    """Possíveis paths do videosettings.txt do CS2.
+
+    cs2_exe tipicamente em: <install>/game/bin/win64/cs2.exe
+    Retorna candidates ordenados por probabilidade — primeiro o per-install,
+    depois o LocalAppData (Steam Cloud sync).
+    """
+    candidates: list[Path] = []
+    try:
+        # Per-install: <install>/game/csgo/cfg/videosettings.txt
+        # cs2_exe.parent.parent.parent = <install>/game
+        install_cfg = cs2_exe.parent.parent.parent / "csgo" / "cfg" / "videosettings.txt"
+        candidates.append(install_cfg)
+    except Exception:
+        pass
+
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if localappdata:
+        candidates.append(Path(localappdata) / "CS2" / "cfg" / "videosettings.txt")
+
+    return [p for p in candidates if p.exists()]
+
+
+def force_windowed_videosettings(cs2_exe: Path) -> bool:
+    """Pre-escreve videosettings.txt com windowed mode pra evitar splash
+    fullscreen no boot do CS2 (Bug #12).
+
+    Returns True se escreveu (mudou estado), False se já estava OK ou se
+    não achou nenhum file de config.
+
+    Idempotente. Backup automático em <file>.fragreel.bak (uma vez só).
+    Falhas são logadas mas não-fatais — launch continua mesmo se falhar.
+    """
+    paths = _videosettings_paths(cs2_exe)
+    if not paths:
+        log.debug("Bug #12 fix: nenhum videosettings.txt encontrado, skip")
+        return False
+
+    wrote = False
+    for path in paths:
+        try:
+            content = path.read_text(encoding="utf-8")
+
+            # Backup uma vez
+            backup = path.with_suffix(".txt.fragreel.bak")
+            if not backup.exists():
+                try:
+                    backup.write_text(content, encoding="utf-8")
+                    log.info("Bug #12 fix: backup criado em %s", backup.name)
+                except Exception as e:
+                    log.warning("Bug #12 fix: não conseguiu criar backup %s: %s", backup, e)
+
+            # Force fullscreen_mode=0 (windowed)
+            new_content = _VIDEOSETTINGS_FULLSCREEN_RE.sub(r'\1"0"', content)
+            # Garantir nowindowborder=1 (preserva nosso -noborder do launch args)
+            new_content = _VIDEOSETTINGS_NOWINDOWBORDER_RE.sub(r'\1"1"', new_content)
+
+            if new_content != content:
+                path.write_text(new_content, encoding="utf-8")
+                log.info("Bug #12 fix: forcei windowed mode em %s", path.name)
+                wrote = True
+            else:
+                log.debug("Bug #12 fix: %s já estava em windowed (no-op)", path.name)
+        except Exception as e:
+            log.warning("Bug #12 fix: falhou em %s: %s (não-fatal, launch continua)", path, e)
+
+    return wrote
+
+
 def launch_cs2_injected(
     cs2_exe: Path,
     hook_dll: Path,
@@ -557,6 +657,18 @@ def launch_cs2_injected(
         killed = kill_running_cs2()
         if killed:
             log.info("killed %d existing cs2.exe before launch", killed)
+
+    # Bug #12 fix (v0.3.0-beta-3): force videosettings.txt em windowed mode
+    # ANTES do CreateProcess. CS2 Source 2 lê esse file no boot antes dos
+    # CLI args (-windowed, +mat_fullscreen 0). Sem isso, splash fullscreen
+    # aparece brevemente em launches onde o último quit foi fullscreen
+    # (intermitente). Só roda quando hide_offscreen=True (não quer dizer
+    # nada pra dev mode com janela visível).
+    if hide_offscreen:
+        try:
+            force_windowed_videosettings(cs2_exe)
+        except Exception as e:
+            log.warning("Bug #12 fix raised (non-fatal, continuing): %s", e)
 
     # CommandLine must be mutable (CreateProcessW may modify). Build as:
     #   "<cs2_exe>" arg1 arg2 ...
