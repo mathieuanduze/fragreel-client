@@ -167,6 +167,234 @@ DEFAULT_TICKRATE = 64
 quando for suportado, o tickrate virá no payload do server."""
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# v0.3.0-beta-2 — Cluster v2: scenario-aware window planning
+#
+# Calibrado em [[v0.3 Cluster Tuning Research]] após análise de 14 demos pro
+# (173 highlight rounds, 255 kills). Constantes e regras refletem feedback
+# do Mathieu (25/04) sobre cinematografia em POV.
+# ─────────────────────────────────────────────────────────────────────────
+
+V2_PAD_PRE_S = 7.0
+"""Pre-pad base (segundos antes da primeira kill do cluster). Sobe pra
+ver o player se posicionar/peekar antes do tiro. v1 era 5s — feedback do
+field foi 'curto demais aesthetically + insuficiente pro warmup do HLAE'."""
+
+V2_PAD_POST_S = 5.0
+"""Post-pad base (segundos depois da última kill). Captura a reação,
+body drop, reload início. v1 era 3.5s."""
+
+V2_GAP_THRESHOLD_S = 22.0
+"""Kills com gap <= este viram 1 cluster contínuo. v1 era 10s. Mais alto
+preserva storytelling entre kills (player navega entre engagements) ao
+invés de splittar em 2 windows pequenas. Trade-off: window maior, mais
+wall-clock. Mathieu pediu pra testar 22s vs alternativas (15 conservador,
+30 agressivo) — sweet spot vai depender do feedback do PC."""
+
+V2_MIN_WINDOW_S = 15.0
+"""Janela mínima absoluta (segundos). Garante:
+  (a) HLAE warmup: mirv_streams record precisa ~5-10s pra engatar;
+      janelas <12s perdem TGAs no take. 15s dá folga.
+  (b) Aesthetic floor: highlight de <10s soa 'snippet', não 'reel'.
+Quando uma janela natural cair abaixo, estende simetricamente clampando
+no round window."""
+
+V2_CLUTCH_PRE_BONUS_S = 3.0
+"""Bonus de pre-pad pra clutches (qualquer 1vN). FLAT, não escala com N.
+Justificativa (Mathieu, 25/04): em POV first-person, não tem broadcast
+narrating ou HUD-popup pra construir tensão; player só está caminhando.
+Bonus pequeno (+3s) sinaliza que o momento importa sem inflar wall-clock.
+v1 era 2*N (1v5 ganhava +10s = pad_pre 17s) — exagerado pra POV."""
+
+V2_RWK_POST_BONUS_S = 3.0
+"""Bonus de post-pad pra round-winning kill. Captura o "round won"
+notification pop + slow fade visual + reação satisfatória do player."""
+
+# ── Bomba: regra dura "defuse + plant inteiros" ─────────────────────────
+
+V2_PLANT_ANIM_S = 3.2
+"""Duração da animação de plant em CS2. Standard, sempre o mesmo."""
+
+V2_PLANT_PRE_BUFFER_S = 1.0
+"""Buffer antes do início da plant animation (ver player chegar no site)."""
+
+V2_PLANT_POST_BUFFER_S = 2.0
+"""Buffer após plant completa (beep + reação visual)."""
+
+V2_DEFUSE_ANIM_NOKIT_S = 10.0
+"""Duração worst-case de defuse SEM kit. Usado como assumption porque o
+parser não expõe inventário do CT defusando. Com kit a animação dura 5s
+— sobre-captura no caso com kit é OK (5s extras de 'antes do botão D')."""
+
+V2_DEFUSE_PRE_BUFFER_S = 1.0
+V2_DEFUSE_POST_BUFFER_S = 2.5
+
+V2_BOMB_KILL_MERGE_GAP_S = 5.0
+"""Se a janela do cluster termina dentro deste gap do início da janela do
+plant/defuse, MERGE em janela contínua. Caso contrário, mantém sub-window
+separada (Remotion edita o cut). Mathieu pediu (25/04): kill 'logo antes'
+do defuse → merge; kill longe (gap > 5s) → separa."""
+
+V2_TRADE_DIRECT_MAX_GAP_S = 3.0
+"""Window pra considerar 'trade direto' (refrag imediato após teammate
+cair). Se a primeira kill do cluster é trade dentro desse gap, estende
+pre-pad pra incluir o tick da morte do teammate (mostra a sequência
+narrativa). Acima de 3s, ignora — Mathieu (25/04): 'só se for realmente
+muito próximo, não vale o cara matar meu aliado no começo do round e eu
+tradar no final e mostrar tudo junto'."""
+
+
+def cluster_round_kills_v2(
+    kill_ticks: list[int] | tuple[int, ...],
+    kill_timestamps: list[float] | tuple[float, ...],
+    round_start_tick: int,
+    round_end_tick: int,
+    *,
+    tickrate: int = DEFAULT_TICKRATE,
+    # Scenario context (todos opcionais — None = ausente)
+    clutch_situation: str | None = None,
+    is_round_winning_kill: bool = False,
+    bomb_action: str | None = None,
+    bomb_action_tick: int | None = None,
+    trade_teammate_death_tick: int | None = None,  # opcional, futura
+) -> list[tuple[int, int]]:
+    """v0.3.0-beta-2 — janelas de captura scenario-aware.
+
+    Diferenças vs v1 `cluster_round_kills`:
+      • PAD 7/5 (era 5/3.5)
+      • GAP 22s (era 10s) — preserva narrativa entre kills
+      • MIN_WINDOW 15s — HLAE-safe + aesthetic floor
+      • Clutch pad bonus +3s flat
+      • RWK post bonus +3s
+      • Bomba: garante cobertura inteira da animação (defuse 10s, plant 3.2s)
+        com buffer pre/post. Merge contínuo se kill perto (gap <= 5s) ou
+        sub-window separada se longe.
+
+    Args:
+        kill_ticks: ticks exatos das kills do user no round (sorted asc).
+        kill_timestamps: mesmas em segundos do jogo.
+        round_start_tick / round_end_tick: bounds pra clamp.
+        tickrate: 64 (matchmaking) ou 128 (tournament).
+        clutch_situation: "1v1".."1v5" ou None — adiciona +3s pre flat.
+        is_round_winning_kill: bool — adiciona +3s post.
+        bomb_action: "defuse" | "plant_won" | None — gatilha extensão de
+            janela pra cobrir a animação inteira.
+        bomb_action_tick: tick de COMPLETION da bomba (planted/defused).
+            Cliente back-calcula o início da animação.
+        trade_teammate_death_tick: opcional, ainda não usado (futura).
+
+    Returns:
+        Lista `[(start_tick, end_tick), ...]` ordenada + merged. Clampada
+        no round window. Fallback pro round inteiro se kill data ausente
+        (preserva compat com scorers pre-v0.3.0-alpha).
+    """
+    if not kill_ticks or len(kill_ticks) != len(kill_timestamps):
+        return [(round_start_tick, round_end_tick)]
+    if round_end_tick <= round_start_tick:
+        raise ValueError(
+            f"invalid round window: start={round_start_tick} end={round_end_tick}"
+        )
+
+    # ── Pad ajustes por scenario ────────────────────────────────────────
+    pad_pre_s = V2_PAD_PRE_S
+    pad_post_s = V2_PAD_POST_S
+    if clutch_situation:
+        pad_pre_s += V2_CLUTCH_PRE_BONUS_S  # flat, não escala com N
+    if is_round_winning_kill:
+        pad_post_s += V2_RWK_POST_BONUS_S
+
+    pad_pre_ticks = int(pad_pre_s * tickrate)
+    pad_post_ticks = int(pad_post_s * tickrate)
+    min_window_ticks = int(V2_MIN_WINDOW_S * tickrate)
+
+    # ── 1. Agrupa kills por gap temporal ────────────────────────────────
+    cluster_indices: list[list[int]] = [[0]]
+    for i in range(1, len(kill_timestamps)):
+        last_in = cluster_indices[-1][-1]
+        gap = kill_timestamps[i] - kill_timestamps[last_in]
+        if gap <= V2_GAP_THRESHOLD_S:
+            cluster_indices[-1].append(i)
+        else:
+            cluster_indices.append([i])
+
+    # ── 2. Converte cada cluster numa janela com padding + min_width ────
+    windows: list[tuple[int, int]] = []
+    for indices in cluster_indices:
+        first = kill_ticks[indices[0]]
+        last = kill_ticks[indices[-1]]
+        s = max(round_start_tick, first - pad_pre_ticks)
+        e = min(round_end_tick, last + pad_post_ticks)
+
+        # Min width: estende simetricamente se janela curta. Clampa no round.
+        current_w = e - s
+        if current_w < min_window_ticks:
+            deficit = min_window_ticks - current_w
+            extend_pre = deficit // 2
+            extend_post = deficit - extend_pre
+            s_new = max(round_start_tick, s - extend_pre)
+            # Se clamp pre comeu o extend, joga sobra pro post
+            extend_post += (s - extend_pre) - s_new if s_new > (s - extend_pre) else 0
+            e_new = min(round_end_tick, e + extend_post)
+            s, e = s_new, e_new
+
+        if e <= s:
+            e = min(round_end_tick, s + 1)
+        windows.append((s, e))
+
+    # ── 3. Bomba: garante cobertura inteira da animação ─────────────────
+    if bomb_action and bomb_action_tick is not None:
+        if bomb_action == "defuse":
+            anim_start = bomb_action_tick - int(V2_DEFUSE_ANIM_NOKIT_S * tickrate)
+            buf_pre = int(V2_DEFUSE_PRE_BUFFER_S * tickrate)
+            buf_post = int(V2_DEFUSE_POST_BUFFER_S * tickrate)
+        elif bomb_action == "plant_won":
+            anim_start = bomb_action_tick - int(V2_PLANT_ANIM_S * tickrate)
+            buf_pre = int(V2_PLANT_PRE_BUFFER_S * tickrate)
+            buf_post = int(V2_PLANT_POST_BUFFER_S * tickrate)
+        else:
+            anim_start = None  # tipo desconhecido, skip
+
+        if anim_start is not None:
+            bomb_window = (
+                max(round_start_tick, anim_start - buf_pre),
+                min(round_end_tick, bomb_action_tick + buf_post),
+            )
+            # Decisão merge vs sub-window separada (regra Mathieu 25/04):
+            # se a última cluster window termina dentro de MERGE_GAP do
+            # início da bomb window → merge contínuo (kill perto da bomba).
+            # Senão → sub-window separada (deixa Remotion fazer cut).
+            merge_gap_ticks = int(V2_BOMB_KILL_MERGE_GAP_S * tickrate)
+            merged_into_existing = False
+            for i, (s, e) in enumerate(windows):
+                # Bomb antes do cluster (raro mas possível): kill close after plant
+                if bomb_window[1] >= s - merge_gap_ticks and bomb_window[0] <= s:
+                    windows[i] = (
+                        max(round_start_tick, min(s, bomb_window[0])),
+                        max(e, bomb_window[1]),
+                    )
+                    merged_into_existing = True
+                    break
+                # Bomb depois do cluster (caso comum): kill close before defuse/plant
+                if bomb_window[0] <= e + merge_gap_ticks and bomb_window[1] >= e:
+                    windows[i] = (s, min(round_end_tick, max(e, bomb_window[1])))
+                    merged_into_existing = True
+                    break
+            if not merged_into_existing:
+                # Sub-window separada — Remotion edita o cut entre cluster e bomba
+                windows.append(bomb_window)
+
+    # ── 4. Sort + greedy merge de overlap residual ──────────────────────
+    windows.sort(key=lambda w: w[0])
+    merged: list[tuple[int, int]] = []
+    for s, e in windows:
+        if merged and s <= merged[-1][1]:
+            ps, pe = merged[-1]
+            merged[-1] = (ps, max(pe, e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
 def cluster_round_kills(
     kill_ticks: list[int] | tuple[int, ...],
     kill_timestamps: list[float] | tuple[float, ...],

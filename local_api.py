@@ -297,63 +297,71 @@ def create_app(
 
         body = request.get_json(silent=True) or {}
 
-        # Each raw segment is (round_start_tick, round_end_tick, kill_ticks,
-        # kill_timestamps). The last two are opcionais — presentes a partir
-        # do v0.3.0-alpha (server expõe em HighlightOut) + web v0.3 (repassa
-        # no payload via RenderSegment.kill_ticks/kill_timestamps). Clients
-        # mais antigos ou demos parseadas com scorer pre-v0.3.0-alpha não
-        # têm esses campos e caem no comportamento round-inteiro (fallback
-        # gracioso sem quebrar).
+        # Cada raw segment carrega contexto v0.3.0-beta-2 enriquecido:
+        # base = (round_start_tick, round_end_tick) (campos sempre presentes)
+        # opcionais (None se ausente):
+        #   kill_ticks, kill_timestamps      → cluster + spread
+        #   clutch_situation                 → pad_pre += 3s flat
+        #   is_round_winning_kill            → pad_post += 3s
+        #   bomb_action + bomb_action_tick   → garante captura inteira da
+        #                                      animação (defuse 10s no-kit /
+        #                                      plant 3.2s)
+        # Clients antigos ou demos pré-v0.3.0-alpha não têm campos novos e
+        # caem em fallback gracioso (1 janela = round inteiro).
         try:
-            raw_segments: list[tuple[int, int, list[int], list[float]]] = []
+            raw_segments: list[dict] = []
             for s in body.get("segments", []):
-                start = int(s["start_tick"])
-                end = int(s["end_tick"])
-                kt = [int(t) for t in (s.get("kill_ticks") or [])]
-                ks = [float(t) for t in (s.get("kill_timestamps") or [])]
-                raw_segments.append((start, end, kt, ks))
+                raw_segments.append({
+                    "start_tick": int(s["start_tick"]),
+                    "end_tick": int(s["end_tick"]),
+                    "kill_ticks": [int(t) for t in (s.get("kill_ticks") or [])],
+                    "kill_timestamps": [float(t) for t in (s.get("kill_timestamps") or [])],
+                    "clutch_situation": s.get("clutch_situation"),
+                    "is_round_winning_kill": bool(s.get("is_round_winning_kill") or False),
+                    "bomb_action": s.get("bomb_action"),
+                    "bomb_action_tick": int(s["bomb_action_tick"]) if s.get("bomb_action_tick") is not None else None,
+                })
         except (KeyError, TypeError, ValueError) as e:
             return {"error": "bad_segments", "detail": str(e)}, 400
         if not raw_segments:
             return {"error": "no_segments"}, 400
 
-        # v0.3.0-beta — expand each round window into N capture windows via
-        # `cluster_round_kills()` when kill data is present. Round com triple
-        # kill rápido (<=10s entre cada) → 1 janela de ~10-15s. Round com 3
-        # kills espaçadas (>10s entre cada) → 3 janelas de ~8.5s cada. Captura
-        # fica ~3-5× mais rápida que o round inteiro (round dura ~120s, janelas
-        # somadas ~25-40s). Sem kill data → 1 janela cobrindo o round inteiro
-        # (fallback pre-v0.3). Spec em `v0.3 Plano Produto.md` §2.
+        # v0.3.0-beta-2 — clustering scenario-aware.
+        # Algoritmo final calibrado em [[v0.3 Cluster Tuning Research]] após
+        # análise de 14 demos pro (173 highlight rounds). Resolve 100% dos
+        # bugs de defuse/plant truncados (regra dura: animação INTEIRA
+        # capturada). Constantes: PAD 7/5, GAP 22, MIN 15, clutch +3 flat,
+        # RWK +3 post, bomb-merge se gap ≤ 5s.
         #
-        # ⚠️ v0.3.0-beta gating (24/04 noite): smoke test no PC mostrou que
-        # cluster windows curtas (~8s) fazem o HLAE travar em 7% / 0 TGAs no
-        # take0001. Hipótese: `mirv_streams record` precisa de ~5-10s pra
-        # engatar após `demo_gototick`, e segments curtos terminam antes do
-        # TGA writer aquecer. v0.2.16 funcionava porque cada segment era um
-        # round inteiro (~85s). Até a investigação ficar pronta (Bug #9 no
-        # Status do Projeto), o clustering é OPT-IN via env var. Default OFF
-        # = comportamento v0.2.16 (1 segment por round) → HLAE feliz +
-        # badges/RWK do v0.3 funcionam normalmente. Default ON quando o
-        # HLAE quirk for resolvido.
+        # Continua gated por FRAGREEL_ENABLE_CLUSTERING enquanto o quirk do
+        # HLAE warmup (Bug #9 no Status do Projeto) não for resolvido.
+        # MIN_WINDOW=15s deveria mitigar o issue (vs 8.5s do v1), mas só
+        # smoke test no PC vai confirmar. Default OFF preserva v0.2.16
+        # behavior (1 segment por round, HLAE-safe).
         clustering_enabled = os.environ.get(
             "FRAGREEL_ENABLE_CLUSTERING", ""
         ).strip().lower() in ("1", "true", "yes", "on")
 
-        from scripts.capture_script import cluster_round_kills  # lazy import (dev reload)
+        from scripts.capture_script import cluster_round_kills_v2  # lazy import
 
         expanded: list[tuple[int, int]] = []
         clusters_count = 0
-        for start, end, kt, ks in raw_segments:
+        for seg in raw_segments:
+            start, end = seg["start_tick"], seg["end_tick"]
             if end <= start:
                 continue
             if clustering_enabled:
-                windows = cluster_round_kills(
-                    kill_ticks=kt,
-                    kill_timestamps=ks,
+                windows = cluster_round_kills_v2(
+                    kill_ticks=seg["kill_ticks"],
+                    kill_timestamps=seg["kill_timestamps"],
                     round_start_tick=start,
                     round_end_tick=end,
+                    clutch_situation=seg["clutch_situation"],
+                    is_round_winning_kill=seg["is_round_winning_kill"],
+                    bomb_action=seg["bomb_action"],
+                    bomb_action_tick=seg["bomb_action_tick"],
                 )
-                if kt:
+                if seg["kill_ticks"]:
                     clusters_count += len(windows)
                 expanded.extend(windows)
             else:
@@ -385,12 +393,12 @@ def create_app(
             )
         if clustering_enabled and clusters_count:
             log.info(
-                "/render — v0.3.0-beta clustering ENABLED: %d rounds → %d cluster windows → %d final (after merge)",
+                "/render — v0.3.0-beta-2 clustering ENABLED: %d rounds → %d cluster windows → %d final (after merge)",
                 len(raw_segments), clusters_count, len(segments),
             )
         elif not clustering_enabled:
             log.info(
-                "/render — v0.3.0-beta clustering DISABLED (default): %d round windows → HLAE captura rounds inteiros (v0.2.16 behavior). Set FRAGREEL_ENABLE_CLUSTERING=1 pra ativar.",
+                "/render — v0.3.0-beta-2 clustering DISABLED (default): %d round windows → HLAE captura rounds inteiros (v0.2.16 behavior). Set FRAGREEL_ENABLE_CLUSTERING=1 pra ativar.",
                 len(segments),
             )
         if not segments:
