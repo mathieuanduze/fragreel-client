@@ -325,7 +325,18 @@ def cluster_round_kills_v2(
         s = max(round_start_tick, first - pad_pre_ticks)
         e = min(round_end_tick, last + pad_post_ticks)
 
-        # Min width: estende simetricamente se janela curta. Clampa no round.
+        # Min width: estende simetricamente se janela curta.
+        #
+        # ⚠️ v0.3.0-beta-2 fix (PC smoke test 25/04 madrugada-3): NÃO clampa
+        # extend_post em round_end_tick. O "round_end_tick" passado pelo
+        # local_api é o capture window upper bound do scorer (= last_kill +
+        # ROUND_POST_BUFFER, ou seja "fim do cluster de kills"), NÃO o
+        # round_end real do CS2. Pra rounds com bomba, o round CS2 só termina
+        # depois da animação que rola DEPOIS do round_end_tick do scorer.
+        # Clampar aqui silenciosamente cortava MIN_WINDOW perto do fim do
+        # round (R14 ficava em 13.4s mesmo com MIN=15s requested).
+        # Risco residual de extend invadir freezetime do round seguinte é
+        # baixo (5-7s extend_post << freezetime CS2 15s+).
         current_w = e - s
         if current_w < min_window_ticks:
             deficit = min_window_ticks - current_w
@@ -334,11 +345,11 @@ def cluster_round_kills_v2(
             s_new = max(round_start_tick, s - extend_pre)
             # Se clamp pre comeu o extend, joga sobra pro post
             extend_post += (s - extend_pre) - s_new if s_new > (s - extend_pre) else 0
-            e_new = min(round_end_tick, e + extend_post)
+            e_new = e + extend_post  # NÃO clampa em round_end_tick (ver comment acima)
             s, e = s_new, e_new
 
         if e <= s:
-            e = min(round_end_tick, s + 1)
+            e = s + 1  # idem: sem clamp em round_end_tick
         windows.append((s, e))
 
     # ── 3. Bomba: garante cobertura inteira da animação ─────────────────
@@ -355,9 +366,18 @@ def cluster_round_kills_v2(
             anim_start = None  # tipo desconhecido, skip
 
         if anim_start is not None:
+            # ⚠️ v0.3.0-beta-2 fix (PC smoke test 25/04 madrugada-3): NÃO
+            # clampa upper bound em round_end_tick. Bomb completion (defuse/
+            # plant) frequentemente acontece DEPOIS do round_end_tick do
+            # scorer (ex: R14 plant em tick 94242 vs round_end_tick=92691,
+            # 24s depois). Clamping silencioso transformava bomb_window em
+            # (start, round_end) com end < bomb_action_tick, depois local_api
+            # filtro `e > s` dropava a janela inteira. Plant nunca capturava.
+            # Lower bound mantém clamp em round_start_tick — bomb_window
+            # nunca vaza pra trás (anim_start é por definição < completion).
             bomb_window = (
                 max(round_start_tick, anim_start - buf_pre),
-                min(round_end_tick, bomb_action_tick + buf_post),
+                bomb_action_tick + buf_post,
             )
             # Decisão merge vs sub-window separada (regra Mathieu 25/04):
             # se a última cluster window termina dentro de MERGE_GAP do
@@ -376,7 +396,9 @@ def cluster_round_kills_v2(
                     break
                 # Bomb depois do cluster (caso comum): kill close before defuse/plant
                 if bomb_window[0] <= e + merge_gap_ticks and bomb_window[1] >= e:
-                    windows[i] = (s, min(round_end_tick, max(e, bomb_window[1])))
+                    # Mesmo motivo do unclamp acima: bomb_window[1] pode ser
+                    # > round_end_tick legitimamente. Aqui também sem clamp.
+                    windows[i] = (s, max(e, bomb_window[1]))
                     merged_into_existing = True
                     break
             if not merged_into_existing:
