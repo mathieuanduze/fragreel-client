@@ -324,6 +324,21 @@ def create_app(
         # fica ~3-5× mais rápida que o round inteiro (round dura ~120s, janelas
         # somadas ~25-40s). Sem kill data → 1 janela cobrindo o round inteiro
         # (fallback pre-v0.3). Spec em `v0.3 Plano Produto.md` §2.
+        #
+        # ⚠️ v0.3.0-beta gating (24/04 noite): smoke test no PC mostrou que
+        # cluster windows curtas (~8s) fazem o HLAE travar em 7% / 0 TGAs no
+        # take0001. Hipótese: `mirv_streams record` precisa de ~5-10s pra
+        # engatar após `demo_gototick`, e segments curtos terminam antes do
+        # TGA writer aquecer. v0.2.16 funcionava porque cada segment era um
+        # round inteiro (~85s). Até a investigação ficar pronta (Bug #9 no
+        # Status do Projeto), o clustering é OPT-IN via env var. Default OFF
+        # = comportamento v0.2.16 (1 segment por round) → HLAE feliz +
+        # badges/RWK do v0.3 funcionam normalmente. Default ON quando o
+        # HLAE quirk for resolvido.
+        clustering_enabled = os.environ.get(
+            "FRAGREEL_ENABLE_CLUSTERING", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+
         from scripts.capture_script import cluster_round_kills  # lazy import (dev reload)
 
         expanded: list[tuple[int, int]] = []
@@ -331,18 +346,19 @@ def create_app(
         for start, end, kt, ks in raw_segments:
             if end <= start:
                 continue
-            windows = cluster_round_kills(
-                kill_ticks=kt,
-                kill_timestamps=ks,
-                round_start_tick=start,
-                round_end_tick=end,
-            )
-            # Se houve cluster real (mais de 1 janela OU 1 janela menor que
-            # o round inteiro), loga pra debug. Sem kill data, windows==
-            # [(start, end)] e o ratio==1.0.
-            if kt:
-                clusters_count += len(windows)
-            expanded.extend(windows)
+            if clustering_enabled:
+                windows = cluster_round_kills(
+                    kill_ticks=kt,
+                    kill_timestamps=ks,
+                    round_start_tick=start,
+                    round_end_tick=end,
+                )
+                if kt:
+                    clusters_count += len(windows)
+                expanded.extend(windows)
+            else:
+                # v0.2.16-compat: 1 segment por round (HLAE-safe).
+                expanded.append((start, end))
 
         # The web sends segments in highlight-score order (not tick order),
         # and two highlights for kills close together can overlap by a few
@@ -367,10 +383,15 @@ def create_app(
                 "/render — merged %d overlapping segment(s) → %d final segment(s)",
                 len(expanded) - len(segments), len(segments),
             )
-        if clusters_count:
+        if clustering_enabled and clusters_count:
             log.info(
-                "/render — v0.3.0-beta clustering: %d rounds → %d cluster windows → %d final (after merge)",
+                "/render — v0.3.0-beta clustering ENABLED: %d rounds → %d cluster windows → %d final (after merge)",
                 len(raw_segments), clusters_count, len(segments),
+            )
+        elif not clustering_enabled:
+            log.info(
+                "/render — v0.3.0-beta clustering DISABLED (default): %d round windows → HLAE captura rounds inteiros (v0.2.16 behavior). Set FRAGREEL_ENABLE_CLUSTERING=1 pra ativar.",
+                len(segments),
             )
         if not segments:
             return {"error": "no_segments"}, 400
