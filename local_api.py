@@ -998,13 +998,78 @@ def _build_render_coordinator() -> Optional[RenderCoordinator]:
         output_dir = resolved.default
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    editor_dir = Path(__file__).parent.parent / "main" / "editor"
+    editor_dir = _resolve_editor_dir()
     config = HlaeRunnerConfig(cs2_install=cs2_install, hlae_dir=hlae_dir)
     return RenderCoordinator(
         config,
         output_dir=output_dir,
-        editor_dir=editor_dir if editor_dir.is_dir() else None,
+        editor_dir=editor_dir,
     )
+
+
+def _resolve_editor_dir() -> Path | None:
+    """Round 4c (Fase 1): resolve editor_dir corretamente em dev/frozen.
+
+    Bug histórico: local_api.py:1001 chumbava
+    `Path(__file__).parent.parent / "main" / "editor"` que NUNCA existia:
+      - Dev: __file__.parent.parent = <fragreel-client repo root>; o
+        editor vive em outro repo (<fragreel/editor/>), normalmente como
+        sibling do client repo no mesmo workspace
+      - Frozen .exe: __file__.parent.parent = _MEIPASS/.. (não existe);
+        editor não estava bundlado em FragReel.spec
+
+    Resultado: `editor_dir.is_dir()` sempre False → render_coordinator
+    Stage 5 sempre caía no fallback ffmpeg concat (cru, sem música/overlays
+    do Remotion). Mathieu viu MP4 concat há semanas — esperava reel editado.
+
+    Resolução nova com 3 fontes ranqueadas (escape hatches → defaults):
+      1. ENV var FRAGREEL_EDITOR_DIR (dev escape hatch)
+      2. Frozen .exe: _MEIPASS / 'editor' (Round 4c Fase 2 vai bundlar)
+      3. Dev sibling repo convention: <client>/../fragreel/editor
+
+    Retorna Path se válido, None se nenhum bate (Stage 5 cai no fallback
+    gracioso).
+    """
+    # 1. ENV var override
+    env_path = os.environ.get("FRAGREEL_EDITOR_DIR")
+    if env_path:
+        p = Path(env_path)
+        if p.is_dir():
+            log.info("editor_dir from FRAGREEL_EDITOR_DIR env: %s", p)
+            return p
+        log.warning(
+            "FRAGREEL_EDITOR_DIR set to %s but dir doesn't exist — fallback continua",
+            p,
+        )
+
+    # 2. Frozen .exe (Round 4c Fase 2 bundla editor/ em _MEIPASS via spec)
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            p = Path(meipass) / "editor"
+            if p.is_dir():
+                log.info("editor_dir from _MEIPASS (frozen): %s", p)
+                return p
+            log.debug("_MEIPASS/editor not found yet (Round 4c Fase 2 pending)")
+
+    # 3. Dev mode: sibling repo convention
+    # <fragreel-client>/local_api.py → ../fragreel/editor/
+    sibling = Path(__file__).parent.parent / "fragreel" / "editor"
+    if sibling.is_dir():
+        log.info("editor_dir from sibling repo (dev mode): %s", sibling)
+        return sibling
+
+    # 4. Last resort: parent dir convention (workspace setups variados)
+    workspace_parent = Path(__file__).parent.parent.parent / "fragreel" / "editor"
+    if workspace_parent.is_dir():
+        log.info("editor_dir from workspace parent (dev mode alt): %s", workspace_parent)
+        return workspace_parent
+
+    log.info(
+        "editor_dir not resolved — Stage 5 vai usar fallback ffmpeg concat. "
+        "Pra forçar Remotion: set FRAGREEL_EDITOR_DIR=<path/to/fragreel/editor>"
+    )
+    return None
 
 
 def serve(
