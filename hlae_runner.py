@@ -670,6 +670,19 @@ class HlaeRunner:
                 key=lambda h: h.get("rank", 0),
             )
 
+            # Round 4c Fase 1.7 — gameplayVideoSrc via HTTP local (não file://).
+            # PC test (26/04 madrugada-2) catched: Remotion @remotion/renderer
+            # rejeita file:// URIs em props que mapeiam pra <Video src=...>:
+            #   "Can only download URLs starting with http:// or https://,
+            #    got file:///C:/Users/.../seg00.mov"
+            # Tenta downloadAsset via HTTP client e aborta em schemes não-http.
+            #
+            # Fix: HTTP server local thread-only sirve as .mov files no take_dir.
+            # Spin up antes do subprocess, gameplayVideoSrc usa http://127.0.0.1:port,
+            # shutdown no finally. Servidor é daemon thread, encerra com processo
+            # se algo der errado.
+            #
+            # Pre-Fase 1.7: file:// URIs (rejected por Remotion → fallback)
             for take in result.takes:
                 if take.mov_path is None:
                     log.warning(
@@ -684,51 +697,148 @@ class HlaeRunner:
                     )
                     continue
                 target_rank = ordered_selected[take.segment_index].get("rank")
-                # file:// URI works on Windows (file:///C:/...) and POSIX.
-                src_uri = take.mov_path.absolute().as_uri()
+                # PLACEHOLDER URI — sobrescrito por http://127.0.0.1:PORT/<basename>
+                # após HTTP server subir abaixo. Mantemos só o basename do .mov
+                # aqui pra usar como key de mapping.
                 for h in highlights:
                     if h.get("rank") == target_rank:
-                        h["gameplayVideoSrc"] = src_uri
+                        h["gameplayVideoSrc"] = f"__PLACEHOLDER__/{take.mov_path.name}"
                         break
 
             match["highlights"] = highlights
             merged["match"] = match
 
-        # v0.3.1 (Round 4c Fase 1.5 — Windows subprocess fix):
-        # PC test (26/04) catched WinError 2 quando cmd=["npx", ...] +
-        # subprocess.run(shell=False) no Windows. Causa: Node ships só
-        # shims .cmd (npx.cmd, npm.cmd) sem .exe nativo. CreateProcess
-        # com shell=False NÃO honra PATHEXT — só resolve nomes literais
-        # com extensão (.exe). shutil.which() faz a lookup correta
-        # (PATH + PATHEXT no Windows, PATH no POSIX) e retorna o path
-        # absoluto que CreateProcess aceita.
-        # Fallback pra "npx" puro só pra retrocompat caso shutil.which
-        # falhe (improvável se Node tá instalado e no PATH).
+        # v0.3.1 Round 4c Fase 1.5 — Windows subprocess shim resolution.
+        # PC test catched WinError 2 com cmd=["npx",...]+shell=False no Win
+        # (Node ships só .cmd shims, CreateProcess sem PATHEXT não acha).
+        # shutil.which() faz lookup correto cross-platform.
         npm_exe_resolved = npm_exe or shutil.which("npx") or "npx"
-        cmd: list[str] = [
-            npm_exe_resolved,
-            "remotion",
-            "render",
-            composition,
-            str(output_mp4),
-            "--props",
-            json.dumps(merged),
+
+        # Round 4c Fase 1.7 — HTTP server local pros .mov files.
+        # Determina diretório comum dos .movs (todos no mesmo take dir geralmente).
+        # Spin up server na 1ª porta livre + replace placeholder URIs.
+        import http.server
+        import socketserver
+        import threading
+        from functools import partial
+
+        mov_paths_with_take = [
+            (t.segment_index, t.mov_path)
+            for t in result.takes if t.mov_path is not None
         ]
-        log.info(
-            "remotion render: composition=%s out=%s takes_with_mov=%d npx=%s",
-            composition, output_mp4,
-            sum(1 for t in result.takes if t.mov_path is not None),
-            npm_exe_resolved,
-        )
-        output_mp4.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            cmd,
-            cwd=editor_dir,
-            check=True,
-            shell=False,
-            creationflags=_NO_WINDOW,
-        )
-        return output_mp4
+        local_http_server = None
+        srv_thread = None
+        if mov_paths_with_take and highlights:
+            # Assume todos os .movs no mesmo dir (caso geral em
+            # convert_takes_to_prores). Se diferentes, server serve o pai
+            # comum + URLs incluem subpath relativo.
+            mov_dir = mov_paths_with_take[0][1].parent
+            handler = partial(
+                http.server.SimpleHTTPRequestHandler,
+                directory=str(mov_dir),
+            )
+            # Port 0 = OS escolhe livre. Bind localhost-only pra não expor net.
+            local_http_server = socketserver.ThreadingTCPServer(
+                ("127.0.0.1", 0), handler,
+            )
+            local_http_server.allow_reuse_address = True
+            port = local_http_server.server_address[1]
+            srv_thread = threading.Thread(
+                target=local_http_server.serve_forever, daemon=True,
+            )
+            srv_thread.start()
+            log.info(
+                "remotion: HTTP server local em http://127.0.0.1:%d serving %s",
+                port, mov_dir,
+            )
+
+            # Replace placeholder URIs com http://...
+            base_url = f"http://127.0.0.1:{port}"
+            for h in highlights:
+                src = h.get("gameplayVideoSrc", "")
+                if isinstance(src, str) and src.startswith("__PLACEHOLDER__/"):
+                    mov_basename = src.removeprefix("__PLACEHOLDER__/")
+                    h["gameplayVideoSrc"] = f"{base_url}/{mov_basename}"
+            match["highlights"] = highlights
+            merged["match"] = match
+
+        # Round 4c Fase 1.7 — props via tempfile (não inline).
+        # PC test catched: Windows CreateProcess command line limit (8191
+        # chars). Props JSON com 10 highlights + kills + kill_ticks +
+        # bomb_action_* + narrative em PT estoura o limite (6.5 KB+).
+        # Determinístico em qualquer payload com >2-3 highlights ricos.
+        # Fix: passar --props <path-to-json-file>.
+        import tempfile
+        props_file_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", prefix="fragreel_props_",
+                delete=False, encoding="utf-8",
+            ) as pf:
+                json.dump(merged, pf)
+                props_file_path = Path(pf.name)
+            log.info(
+                "remotion props serialized to tempfile (%d bytes): %s",
+                props_file_path.stat().st_size, props_file_path,
+            )
+
+            cmd: list[str] = [
+                npm_exe_resolved,
+                "remotion",
+                "render",
+                composition,
+                str(output_mp4),
+                "--props",
+                str(props_file_path),
+            ]
+            log.info(
+                "remotion render: composition=%s out=%s takes_with_mov=%d npx=%s",
+                composition, output_mp4,
+                len(mov_paths_with_take),
+                npm_exe_resolved,
+            )
+            output_mp4.parent.mkdir(parents=True, exist_ok=True)
+
+            # Round 4c Fase 1.7 — capture stderr pra debug. PC test reportou
+            # "exit 1 sem stderr" pq usávamos check=True sem capture_output.
+            # Agora capturamos + logamos last 2KB se falha.
+            result_proc = subprocess.run(
+                cmd,
+                cwd=editor_dir,
+                shell=False,
+                creationflags=_NO_WINDOW,
+                capture_output=True,
+                text=True,
+            )
+            if result_proc.returncode != 0:
+                # Last 2KB pra não floodar log mas pegar a stack trace
+                stderr_tail = (result_proc.stderr or "")[-2000:]
+                stdout_tail = (result_proc.stdout or "")[-1000:]
+                log.error(
+                    "remotion render failed (exit %d) — stderr tail:\n%s\n"
+                    "stdout tail:\n%s",
+                    result_proc.returncode, stderr_tail, stdout_tail,
+                )
+                raise subprocess.CalledProcessError(
+                    result_proc.returncode, cmd,
+                    output=result_proc.stdout,
+                    stderr=result_proc.stderr,
+                )
+            return output_mp4
+        finally:
+            # Cleanup: shutdown HTTP server + remove tempfile
+            if local_http_server is not None:
+                try:
+                    local_http_server.shutdown()
+                    local_http_server.server_close()
+                    log.debug("remotion HTTP server shut down")
+                except Exception as e:
+                    log.warning("HTTP server shutdown raised: %s", e)
+            if props_file_path is not None:
+                try:
+                    props_file_path.unlink(missing_ok=True)
+                except Exception as e:
+                    log.warning("props tempfile cleanup raised: %s", e)
 
     def convert_takes_to_prores(
         self,
