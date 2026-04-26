@@ -1103,16 +1103,32 @@ class HlaeRunner:
             cmd += ["-i", str(take.audio_path), "-c:a", "aac", "-b:a", "192k"]
         cmd += [
             "-c:v", "prores_ks",
-            "-profile:v", "4444",
-            "-pix_fmt", "yuva444p10le",
-            # Round 4c Fase 1.8 (PC catched 26/04): -movflags +faststart move
-            # o `moov` atom pro início do file. Sem isso, moov fica no fim
-            # de 5+GB (default mov muxer behavior) → Remotion's ffmpeg via
-            # HTTP precisa de múltiplos Range trips pra encontrá-lo antes
-            # de poder começar o decode. Com faststart, 1 read no início
-            # já tem todo o índice. Validado por PC via ffprobe -trace
-            # pre/post fix. Helps render performance + reduces HTTP server
-            # pressure (menos seeks).
+            # Round 4c Fase 1.9 (PC catched 26/04 03:25): trocar profile 4444
+            # → 3 (422 HQ) E pix_fmt yuva444p10le → yuv422p10le.
+            #
+            # Bug catched: Remotion's @remotion/renderer Rust compositor
+            # panics em frame 60/765 com:
+            #   "range end index 6220804 out of range for slice of length 6220800"
+            #   at scalable_frame.rs:343
+            # 1080×1920×3 (RGB) = 6,220,800 bytes ← slice len. +4 bytes overflow
+            # = exatamente 1 sample alpha em format 4-channel. Compositor
+            # tentava read 4-channel (alpha) do ProRes 4444 onde esperava
+            # 3-channel RGB. Off-by-alpha → panic.
+            #
+            # Fix: 422 HQ é canônico pra master video sem alpha. Trade-offs:
+            #   ✅ Resolve Bug Remotion compositor (3-channel safe)
+            #   ✅ File 60% menor (~120 Mbps vs ~330 Mbps) → menos disk write,
+            #      menos pressão no HTTP server, mais rápido convert_takes
+            #   ✅ Codec canônico de master video da indústria
+            #   ❌ Perde alpha channel (não usamos workflow alpha overlay
+            #      sobre gameplay anyway — Remotion adiciona overlays SOBRE
+            #      o gameplay decoded, não embed alpha no source)
+            #   ❌ Chroma 4:2:2 vs 4:4:4 (visualmente imperceptível em
+            #      material que passa por h264 CRF 18 do Remotion final)
+            "-profile:v", "3",          # ProRes 422 HQ (era "4444")
+            "-pix_fmt", "yuv422p10le",  # 3-channel sem alpha (era yuva444p10le)
+            # Round 4c Fase 1.8 (PC catched): faststart move moov atom pro
+            # início. Helps render performance + reduces seeks. Mantido.
             "-movflags", "+faststart",
             str(output_path),
         ]
