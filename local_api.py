@@ -1052,18 +1052,51 @@ def _resolve_editor_dir() -> Path | None:
                 return p
             log.debug("_MEIPASS/editor not found yet (Round 4c Fase 2 pending)")
 
-    # 3. Dev mode: sibling repo convention
-    # <fragreel-client>/local_api.py → ../fragreel/editor/
-    sibling = Path(__file__).parent.parent / "fragreel" / "editor"
-    if sibling.is_dir():
-        log.info("editor_dir from sibling repo (dev mode): %s", sibling)
-        return sibling
+    # 3. Dev mode: sibling repo conventions — testa nomes comuns. PC test
+    # (26/04) revelou layouts variados (e.g. `C:\FragReel\client` +
+    # `C:\FragReel\main` ao invés do `<root>/fragreel-client` + `<root>/fragreel`
+    # convencional). Testamos vários nomes pra evitar exigir rename/symlink.
+    client_parent = Path(__file__).parent.parent  # one level up from fragreel-client root
+    sibling_candidates_names = ["fragreel", "main", "fragreel-server", "server"]
+    for name in sibling_candidates_names:
+        candidate = client_parent / name / "editor"
+        if candidate.is_dir():
+            log.info("editor_dir from sibling repo '%s/' (dev mode): %s", name, candidate)
+            return candidate
 
-    # 4. Last resort: parent dir convention (workspace setups variados)
-    workspace_parent = Path(__file__).parent.parent.parent / "fragreel" / "editor"
-    if workspace_parent.is_dir():
-        log.info("editor_dir from workspace parent (dev mode alt): %s", workspace_parent)
-        return workspace_parent
+    # 4. Last resort: parent dir convention (workspace 1-level acima)
+    workspace_parent = client_parent.parent
+    for name in sibling_candidates_names:
+        candidate = workspace_parent / name / "editor"
+        if candidate.is_dir():
+            log.info("editor_dir from workspace parent '%s/' (dev mode alt): %s", name, candidate)
+            return candidate
+
+    # 5. Auto-discovery: glob qualquer sibling/editor com package.json+remotion
+    # (último resort caso layout seja exótico). Limitado a 1-level pra evitar
+    # full filesystem scan.
+    try:
+        for sibling_dir in client_parent.iterdir():
+            if not sibling_dir.is_dir() or sibling_dir == Path(__file__).parent:
+                continue
+            candidate = sibling_dir / "editor"
+            pkg_json = candidate / "package.json"
+            if candidate.is_dir() and pkg_json.is_file():
+                # Confirma que é repo do Remotion lendo package.json
+                try:
+                    import json
+                    pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
+                    deps = (pkg.get("dependencies") or {})
+                    if any("remotion" in k for k in deps):
+                        log.info(
+                            "editor_dir auto-discovered (sibling '%s/editor' has remotion): %s",
+                            sibling_dir.name, candidate,
+                        )
+                        return candidate
+                except Exception:
+                    continue
+    except (OSError, PermissionError):
+        pass
 
     log.info(
         "editor_dir not resolved — Stage 5 vai usar fallback ffmpeg concat. "

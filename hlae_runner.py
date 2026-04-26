@@ -630,7 +630,7 @@ class HlaeRunner:
         *,
         composition: str = "HighlightsReel",
         base_props: dict | None = None,
-        npm_exe: str = "npx",
+        npm_exe: str | None = None,
     ) -> Path:
         """Run `npx remotion render` against the editor repo.
 
@@ -694,8 +694,19 @@ class HlaeRunner:
             match["highlights"] = highlights
             merged["match"] = match
 
+        # v0.3.1 (Round 4c Fase 1.5 — Windows subprocess fix):
+        # PC test (26/04) catched WinError 2 quando cmd=["npx", ...] +
+        # subprocess.run(shell=False) no Windows. Causa: Node ships só
+        # shims .cmd (npx.cmd, npm.cmd) sem .exe nativo. CreateProcess
+        # com shell=False NÃO honra PATHEXT — só resolve nomes literais
+        # com extensão (.exe). shutil.which() faz a lookup correta
+        # (PATH + PATHEXT no Windows, PATH no POSIX) e retorna o path
+        # absoluto que CreateProcess aceita.
+        # Fallback pra "npx" puro só pra retrocompat caso shutil.which
+        # falhe (improvável se Node tá instalado e no PATH).
+        npm_exe_resolved = npm_exe or shutil.which("npx") or "npx"
         cmd: list[str] = [
-            npm_exe,
+            npm_exe_resolved,
             "remotion",
             "render",
             composition,
@@ -704,9 +715,10 @@ class HlaeRunner:
             json.dumps(merged),
         ]
         log.info(
-            "remotion render: composition=%s out=%s takes_with_mov=%d",
+            "remotion render: composition=%s out=%s takes_with_mov=%d npx=%s",
             composition, output_mp4,
             sum(1 for t in result.takes if t.mov_path is not None),
+            npm_exe_resolved,
         )
         output_mp4.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
