@@ -24,6 +24,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -715,12 +716,138 @@ class HlaeRunner:
         npm_exe_resolved = npm_exe or shutil.which("npx") or "npx"
 
         # Round 4c Fase 1.7 — HTTP server local pros .mov files.
-        # Determina diretório comum dos .movs (todos no mesmo take dir geralmente).
-        # Spin up server na 1ª porta livre + replace placeholder URIs.
+        # Round 4c Fase 1.8 (PC report 26/04 ~02:30) — UPGRADE pra _RangeAwareHandler:
+        #   PC catched que Python's stdlib SimpleHTTPRequestHandler NÃO honra
+        #   `Range: bytes=A-B` headers no Windows — sempre retorna o file
+        #   inteiro com 200 OK ignorando Range. Pra .mov de 5 GB ProRes 4444
+        #   isso é fatal: Remotion's <OffthreadVideo> usa ffmpeg que faz
+        #   range requests pra seek frame-by-frame. Sem 206 Partial Content,
+        #   ffmpeg recebe full file e abandona via timeout (28s delayRender).
+        #   Fix: subclasse com parsing de Range + 206 + Content-Range.
+        #   Plus debug log de cada GET pra confirmar Remotion HIT o server
+        #   E veio com Range header (validar hipótese H1 do PC: proxy interno
+        #   do Remotion CLI pode estar não-propagando Range).
         import http.server
         import socketserver
         import threading
         from functools import partial
+
+        class _RangeAwareHandler(http.server.SimpleHTTPRequestHandler):
+            """SimpleHTTPRequestHandler com suporte a HTTP Range requests.
+
+            PC catched (26/04): Win stdlib não honra `Range:` em SimpleHTTP
+            — sempre 200 + full file. Remotion's OffthreadVideo + ffmpeg
+            espera 206 Partial Content pra seek/buffer eficiente em videos
+            grandes. Sem 206 → 28s delayRender timeout → render falha.
+
+            Fix: parseia `Range: bytes=START-END`, retorna 206 + slice.
+            Suporta apenas single-range (Remotion's ffmpeg não usa multi-range).
+            """
+
+            def log_message(self, format, *args):
+                """Override pra logar via fragreel logger (não stderr).
+                Inclui Range header se presente — debug pra hipótese H1
+                (Remotion proxy não-propaga Range)."""
+                try:
+                    range_hdr = self.headers.get("Range", "(no Range)")
+                    log.info(
+                        "remotion HTTP: %s | Range=%s | UA=%s",
+                        format % args, range_hdr,
+                        (self.headers.get("User-Agent") or "?")[:80],
+                    )
+                except Exception:
+                    pass  # nunca deixa logging derrubar request
+
+            def send_head(self):
+                """Override pra suportar Range. Espelha SimpleHTTPRequestHandler.send_head
+                mas adiciona path 206 quando Range header presente.
+                """
+                path = self.translate_path(self.path)
+                f = None
+                ctype = self.guess_type(path)
+                try:
+                    f = open(path, "rb")
+                except OSError:
+                    self.send_error(404, "File not found")
+                    return None
+
+                try:
+                    fs = os.fstat(f.fileno())
+                    file_size = fs[6]
+
+                    # Parse Range header (single range only)
+                    range_hdr = self.headers.get("Range")
+                    if range_hdr and range_hdr.startswith("bytes="):
+                        try:
+                            range_spec = range_hdr[len("bytes="):].strip()
+                            # "bytes=A-B" ou "bytes=A-" ou "bytes=-N" (suffix length)
+                            if range_spec.startswith("-"):
+                                # Suffix range: last N bytes
+                                suffix_len = int(range_spec[1:])
+                                start = max(0, file_size - suffix_len)
+                                end = file_size - 1
+                            else:
+                                start_str, _, end_str = range_spec.partition("-")
+                                start = int(start_str)
+                                end = int(end_str) if end_str else file_size - 1
+                                end = min(end, file_size - 1)
+
+                            if start > end or start >= file_size:
+                                self.send_error(416, "Range Not Satisfiable")
+                                f.close()
+                                return None
+
+                            # 206 Partial Content
+                            self.send_response(206, "Partial Content")
+                            self.send_header("Content-Type", ctype)
+                            self.send_header(
+                                "Content-Range",
+                                f"bytes {start}-{end}/{file_size}",
+                            )
+                            self.send_header("Content-Length", str(end - start + 1))
+                            self.send_header("Accept-Ranges", "bytes")
+                            self.send_header("Last-Modified", self.date_time_string(fs.st_mtime))
+                            self.end_headers()
+                            f.seek(start)
+                            # copyfile() vai consumir o resto via shutil.copyfileobj —
+                            # mas precisamos limitar a end-start+1 bytes. Wrap num
+                            # iterator que para no end:
+                            return _RangedFile(f, start, end)
+                        except (ValueError, OSError) as e:
+                            log.warning("invalid Range header %r: %s — falling back 200", range_hdr, e)
+                            # Fallthrough pra 200 normal
+
+                    # No Range → 200 OK full file (comportamento original)
+                    self.send_response(200)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", str(file_size))
+                    self.send_header("Accept-Ranges", "bytes")  # advertise support
+                    self.send_header("Last-Modified", self.date_time_string(fs.st_mtime))
+                    self.end_headers()
+                    return f
+                except Exception:
+                    f.close()
+                    raise
+
+        class _RangedFile:
+            """Wrapper que limita read pra range bytes — usado pelo
+            SimpleHTTPRequestHandler.copyfile via shutil.copyfileobj."""
+
+            def __init__(self, f, start: int, end: int):
+                self._f = f
+                self._remaining = end - start + 1
+
+            def read(self, size=-1):
+                if self._remaining <= 0:
+                    return b""
+                if size < 0 or size > self._remaining:
+                    size = self._remaining
+                data = self._f.read(size)
+                self._remaining -= len(data)
+                return data
+
+            def close(self):
+                self._f.close()
 
         mov_paths_with_take = [
             (t.segment_index, t.mov_path)
@@ -734,7 +861,7 @@ class HlaeRunner:
             # comum + URLs incluem subpath relativo.
             mov_dir = mov_paths_with_take[0][1].parent
             handler = partial(
-                http.server.SimpleHTTPRequestHandler,
+                _RangeAwareHandler,
                 directory=str(mov_dir),
             )
             # Port 0 = OS escolhe livre. Bind localhost-only pra não expor net.
@@ -748,7 +875,7 @@ class HlaeRunner:
             )
             srv_thread.start()
             log.info(
-                "remotion: HTTP server local em http://127.0.0.1:%d serving %s",
+                "remotion: HTTP server local em http://127.0.0.1:%d serving %s (Range-aware)",
                 port, mov_dir,
             )
 
@@ -782,6 +909,12 @@ class HlaeRunner:
                 props_file_path.stat().st_size, props_file_path,
             )
 
+            # Round 4c Fase 1.8 — bump --timeout pra 120s (default delayRender
+            # é 28s). PC catched que mesmo com Range support OK, render
+            # estoura 28s tentando carregar 5GB ProRes via OffthreadVideo.
+            # H4 do report PC: se 120s ainda falhar, é H2 (codec ProRes 4444
+            # é simplesmente pesado demais pra OffthreadVideo) e próximo
+            # passo é transcode ProRes→h264 antes de render_remotion.
             cmd: list[str] = [
                 npm_exe_resolved,
                 "remotion",
@@ -790,6 +923,8 @@ class HlaeRunner:
                 str(output_mp4),
                 "--props",
                 str(props_file_path),
+                "--timeout",
+                "120000",  # 120s, vs default 28s
             ]
             log.info(
                 "remotion render: composition=%s out=%s takes_with_mov=%d npx=%s",
@@ -970,6 +1105,15 @@ class HlaeRunner:
             "-c:v", "prores_ks",
             "-profile:v", "4444",
             "-pix_fmt", "yuva444p10le",
+            # Round 4c Fase 1.8 (PC catched 26/04): -movflags +faststart move
+            # o `moov` atom pro início do file. Sem isso, moov fica no fim
+            # de 5+GB (default mov muxer behavior) → Remotion's ffmpeg via
+            # HTTP precisa de múltiplos Range trips pra encontrá-lo antes
+            # de poder começar o decode. Com faststart, 1 read no início
+            # já tem todo o índice. Validado por PC via ffprobe -trace
+            # pre/post fix. Helps render performance + reduces HTTP server
+            # pressure (menos seeks).
+            "-movflags", "+faststart",
             str(output_path),
         ]
 
