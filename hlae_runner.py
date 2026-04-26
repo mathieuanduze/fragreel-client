@@ -661,14 +661,26 @@ class HlaeRunner:
         highlights = list(match.get("highlights", []))
 
         if highlights:
-            # Selected highlights are the ones the segments map to. Editor
-            # filters by selectedRanks then sorts by rank ASC; we replicate
-            # that here so segment_index → highlight index is unambiguous.
+            # Round 4c Fase 1.10 (PC catched 26/04): mapping segment_index →
+            # highlight precisa estar em ordem CRONOLÓGICA (round_num), não
+            # por rank.
+            #
+            # Bug original: capture takes saem em ordem cronológica do demo
+            # (seg00=R7, seg01=R8, seg02=R14). Ordering por rank ASC dava
+            # [rank1=R8, rank2=R7, rank3=R14] → seg00→R8, seg01→R7 (SWAPPED).
+            # Highlight #1 (label R8 Defuse+Clutch) mostrava footage do R7,
+            # highlight #2 (label R7 2K) mostrava footage do R8 com defuse
+            # overlay. Mathieu validou visualmente.
+            #
+            # Fix: ordenar por round_num pra alinhar com ordem cronológica
+            # de capture. Display final continua POR RANK na composition —
+            # só a associação interna gameplayVideoSrc → highlight precisa
+            # ser temporal pra unambiguous mapping.
             selected_ranks = merged.get("selectedRanks") or [h.get("rank") for h in highlights]
             selected_ranks_set = set(selected_ranks)
             ordered_selected = sorted(
                 (h for h in highlights if h.get("rank") in selected_ranks_set),
-                key=lambda h: h.get("rank", 0),
+                key=lambda h: h.get("round_num", 0),  # CHRONOLOGICAL, not by rank
             )
 
             # Round 4c Fase 1.7 — gameplayVideoSrc via HTTP local (não file://).
