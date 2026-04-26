@@ -543,6 +543,14 @@ class CaptureScriptPlan:
     pre_seek_tick: int | None = None  # auto-seek to this tick right after demo loads
     extra_start_commands: tuple[str, ...] = field(default_factory=tuple)
     extra_end_commands: tuple[str, ...] = field(default_factory=tuple)
+    # Round 4c Fase 1.13 — HUD/minimap removal pro mobile vertical reel.
+    # Mathieu spec (Plano Produto §5): vertical 1080×1920 pra TikTok/Reels
+    # não precisa mostrar HUD do CS2 (radar, ammo, money, killfeed bar).
+    # Em vez disso o Remotion adiciona overlays mais legíveis em mobile.
+    # Default True pq reel-only é a decisão #1 do produto v1.0 (vertical
+    # mandatório). Comandos emitidos no setup ÚNICO antes do primeiro
+    # segment.
+    hide_hud: bool = True
 
     def __post_init__(self) -> None:
         if not self.segments:
@@ -607,6 +615,35 @@ def _setup_commands(plan: CaptureScriptPlan) -> list[str]:
         cmds += [
             f"mirv_deathmsg lifetime {plan.killfeed_lifetime_sec}",
             f"mirv_deathmsg localPlayer {plan.user_account_id}",
+        ]
+    # Round 4c Fase 1.13 — HUD/minimap removal pro mobile vertical reel.
+    # Plano Produto §5: vertical 1080×1920 não precisa mostrar HUD do CS2
+    # (radar/ammo/money/killfeed bar) — Remotion adiciona overlays mais
+    # legíveis em mobile. Default True (reel-only é decisão #1 do produto).
+    #
+    # Comandos canônicos pra "clean POV recording" no CS2 Source 2:
+    #   cl_drawhud 0          — kill HUD inteiro (radar, ammo, health, money,
+    #                            killfeed, defuse timer, crosshair, spec names)
+    #   cl_draw_only_deathnotices 0 — não mostrar APENAS killfeed (já off por hud=0)
+    #   cl_radar_always_centered 0 + cl_drawhud_force_radar -1 — defensive radar off
+    #   safezonex 1 + safezoney 1 — safezone overlay edges off
+    #   r_drawviewmodel 1     — KEEP viewmodel (queremos ver a arma do player)
+    #   crosshair 1           — KEEP crosshair (gameplay precisa pra ler aim)
+    # NOTE: cl_drawhud 0 também desliga crosshair. Reabilitamos via
+    # crosshair 1 + cl_show_crosshair 1 pra preservar ele especificamente.
+    # Trade: defuse timer + spec names também somem (Remotion vai cobrir).
+    if plan.hide_hud:
+        cmds += [
+            'echo "[FragReel] hide_hud=True — limpando HUD pra reel mobile"',
+            "cl_drawhud 0",
+            "cl_draw_only_deathnotices 0",
+            "cl_radar_always_centered 0",
+            "cl_drawhud_force_radar -1",
+            "safezonex 1",
+            "safezoney 1",
+            # Re-habilita crosshair (que cl_drawhud 0 desliga junto)
+            "crosshair 1",
+            "r_drawviewmodel 1",
         ]
     return cmds
 
