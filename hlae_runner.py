@@ -967,10 +967,22 @@ class HlaeRunner:
                 cmd,
                 cwd=editor_dir,
                 shell=False,
-                # Fase 1.11: BELOW_NORMAL_PRIORITY (Win) também aqui — Remotion
-                # render usa Chromium headless + ffmpeg encode no final, ambos
-                # CPU-heavy. Mesma motivação do prores_ks pass.
-                creationflags=_FFMPEG_CREATIONFLAGS,
+                # Round 4c Fase 1.11.1 — BELOW_NORMAL_PRIORITY removido daqui.
+                # PC test (26/04 ~13h) catched: aplicar BelowNormal ao npx
+                # subprocess CASCATEIA a priority pro Chromium headless que
+                # @remotion/renderer spawna via Puppeteer. Chrome compositor
+                # com BelowNormal não consegue keep up com frame rendering →
+                # "browser crashed while rendering frame N" (target-closed
+                # error) → retry loop infinito (3.5h sem progresso, ffmpeg
+                # PID com 26s CPU em 12500s elapsed = 0.2% util = stuck).
+                # Stderr: "The browser crashed while rendering frame 283,
+                # retrying 1 more times" repetindo.
+                # Fix: só _NO_WINDOW aqui. ffmpeg encoders pesados (TGA→ProRes
+                # linha ~1184 e concat fallback linha ~1395) MANTÊM
+                # _FFMPEG_CREATIONFLAGS — esses são puro CPU encode, sem
+                # subprocess Chromium em jogo. Thermal protection segue
+                # ativa onde realmente importa (encoding pesado).
+                creationflags=_NO_WINDOW,
                 capture_output=True,
                 text=True,
             )
