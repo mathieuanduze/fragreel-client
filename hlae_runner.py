@@ -77,6 +77,20 @@ log = logging.getLogger(__name__)
 # 0x08000000. On non-Windows this ends up as 0, a harmless flag.
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
+# Round 4c Fase 1.11 — thermal safeguard. Mathieu reportou que o PC desligou
+# durante render de TGA→ProRes (CPU 100% sustained → thermal shutdown). ffmpeg
+# com prores_ks satura todos os cores por ~1-2min seguidos. Mitigação:
+#   1. -threads 4: limita ffmpeg a 4 threads (em vez de all-cores). Trade-off:
+#      ~30% mais lento, mas user pode usar PC durante render sem travar.
+#   2. BELOW_NORMAL_PRIORITY_CLASS (Windows): scheduler dá menos CPU slice quando
+#      outros processos pedem. Sistema fica responsivo, ffmpeg cede prioridade.
+#      0x4000 é a constante; combina com CREATE_NO_WINDOW via OR.
+# Em conjunto: PC fica usável + thermal stress reduzido sem perder muito tempo
+# total (render move de ~60s pra ~80s no setup do Mathieu — aceitável).
+_BELOW_NORMAL_PRIORITY = 0x00004000 if sys.platform == "win32" else 0
+_FFMPEG_CREATIONFLAGS = _NO_WINDOW | _BELOW_NORMAL_PRIORITY
+_FFMPEG_THREAD_LIMIT = "4"  # cap ffmpeg threads pra deixar PC responsivo
+
 
 # ---------------------------------------------------------------------------
 # Path conventions inside the CS2 install
@@ -953,7 +967,10 @@ class HlaeRunner:
                 cmd,
                 cwd=editor_dir,
                 shell=False,
-                creationflags=_NO_WINDOW,
+                # Fase 1.11: BELOW_NORMAL_PRIORITY (Win) também aqui — Remotion
+                # render usa Chromium headless + ffmpeg encode no final, ambos
+                # CPU-heavy. Mesma motivação do prores_ks pass.
+                creationflags=_FFMPEG_CREATIONFLAGS,
                 capture_output=True,
                 text=True,
             )
@@ -1108,6 +1125,9 @@ class HlaeRunner:
         cmd: list[str] = [
             str(ffmpeg),
             "-y",
+            # Fase 1.11: thermal safeguard. Cap threads ANTES dos inputs (ffmpeg
+            # arg ordering: opções globais primeiro). Ver _FFMPEG_THREAD_LIMIT.
+            "-threads", _FFMPEG_THREAD_LIMIT,
             "-framerate", str(source_framerate),
             "-i", input_pattern,
         ]
@@ -1159,7 +1179,9 @@ class HlaeRunner:
             stderr=subprocess.PIPE,
             text=True,
             errors="replace",
-            creationflags=_NO_WINDOW,
+            # Fase 1.11: BELOW_NORMAL_PRIORITY (Win) + NO_WINDOW. Mantém PC
+            # responsivo durante render → previne CPU thermal saturation.
+            creationflags=_FFMPEG_CREATIONFLAGS,
             bufsize=1,  # line-buffered so we see progress as it happens
         )
 
@@ -1337,20 +1359,26 @@ class HlaeRunner:
         cmd: list[str] = [
             str(ff),
             "-y",
+            # Fase 1.11: thermal cap — mesma motivação do prores_ks pass.
+            "-threads", _FFMPEG_THREAD_LIMIT,
             "-f", "concat",
             "-safe", "0",
             "-i", str(list_file),
             # h264 high profile + yuv420p = playable in WMP, QuickTime,
-            # Discord, browsers. CRF 18 is "visually lossless" for the
-            # 1080p ProRes source we just produced; preset fast keeps
-            # encode time under ~30s for a typical 4-segment reel.
+            # Discord, browsers.
+            # Fase 1.11 (Mathieu reportou MP4 final 180MB): CRF 18 + preset fast
+            # produzia bitrate ~16Mbps em 1080p → 180MB pra reel de 90s. Reels/
+            # TikTok comprimem agressivamente upload → CRF 23 + preset medium
+            # gera ~3Mbps (~35MB pra 90s) sem perda visual perceptível depois
+            # do re-encode da plataforma. Sweet spot entre tamanho compartilhável
+            # (Discord 25MB free / 50MB Nitro / WhatsApp 100MB) e qualidade.
             "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "18",
+            "-preset", "medium",   # era "fast" — medium dá ~30% melhor compressão
+            "-crf", "23",          # era 18 — 23 é "high quality" web standard
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             "-c:a", "aac",
-            "-b:a", "192k",
+            "-b:a", "128k",        # era 192k — 128k AAC é transparente pra game audio
             str(output_mp4),
         ]
 
@@ -1363,7 +1391,8 @@ class HlaeRunner:
             capture_output=True,
             text=True,
             errors="replace",
-            creationflags=_NO_WINDOW,
+            # Fase 1.11: BELOW_NORMAL_PRIORITY (Win) — h264 encode é CPU-heavy.
+            creationflags=_FFMPEG_CREATIONFLAGS,
         )
         # Always remove the list file — it's just a manifest, not user data.
         try:
