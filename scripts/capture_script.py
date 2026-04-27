@@ -218,8 +218,13 @@ V2_PLANT_ANIM_S = 3.2
 V2_PLANT_PRE_BUFFER_S = 1.0
 """Buffer antes do início da plant animation (ver player chegar no site)."""
 
-V2_PLANT_POST_BUFFER_S = 2.0
-"""Buffer após plant completa (beep + reação visual)."""
+V2_PLANT_POST_BUFFER_S = 5.0
+"""Buffer após plant completa. Round 4c Fase 1.34 (Mathieu reportou pós-Fase
+1.33: "plant action começa mas NÃO mostra 'Bomba foi armada' notification").
+Bumped 2.0 → 5.0s pra cobrir CS2 native red bar "Bomba foi armada. 40 segundos
+até a detonação." (~2s readable) + beep + reaction. Antes 2s era curto demais
+— mov real cobria plant_complete + 2s de pós-action mas notification só lê
+~1s antes do scene cortar via mov_duration cap."""
 
 V2_DEFUSE_ANIM_NOKIT_S = 10.0
 """Duração worst-case de defuse SEM kit. Usado como assumption porque o
@@ -227,7 +232,11 @@ parser não expõe inventário do CT defusando. Com kit a animação dura 5s
 — sobre-captura no caso com kit é OK (5s extras de 'antes do botão D')."""
 
 V2_DEFUSE_PRE_BUFFER_S = 1.0
-V2_DEFUSE_POST_BUFFER_S = 2.5
+V2_DEFUSE_POST_BUFFER_S = 5.0
+"""Round 4c Fase 1.34 — bumped 2.5 → 5.0s. Mathieu reportou: "Defuse animation
+começa mas NÃO termina, 'Bomba defusada' notification não aparece". 2.5s
+era curto pra cobrir defuse completion + "Bomba defusada" red→green
+notification (~3s readable). 5s dá margem confortável."""
 
 V2_BOMB_KILL_MERGE_GAP_S = 5.0
 """Se a janela do cluster termina dentro deste gap do início da janela do
