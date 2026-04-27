@@ -782,11 +782,23 @@ class HlaeRunner:
                 for h in ordered_selected:
                     h_start_tick = int(h.get("start", 0.0) * tickrate)
                     h_end_tick = int(h.get("end", 0.0) * tickrate)
+                    # Round 4c Fase 1.29 (PC catched 27/04 night escalation):
+                    # bomb_action_tick frequentemente está APÓS highlight.end
+                    # (R14 example: highlight.end=92691 mas bomb_action_tick
+                    # =94242, 24s depois). W4 plant capture seg start=93980
+                    # caía FORA do range → órfão. Fix: extender range_end pra
+                    # incluir bomb_action_tick + 10s cobertura defuse no-kit
+                    # (worst case 10s, plant 3.2s — 10s cobre ambos).
+                    bomb_tick = h.get("bomb_action_tick")
+                    if bomb_tick is not None:
+                        range_end = max(h_end_tick, int(bomb_tick) + 10 * tickrate)
+                    else:
+                        range_end = h_end_tick
                     # Take cai dentro do highlight se take overlap > 50% do
                     # take com highlight range. Usa midpoint do take pra
                     # decidir (robust a small jitter no cluster windows).
                     take_mid_tick = (seg_start_tick + seg_end_tick) // 2
-                    if h_start_tick <= take_mid_tick <= h_end_tick:
+                    if h_start_tick <= take_mid_tick <= range_end:
                         matched_rank = h.get("rank")
                         break
                 if matched_rank is None:
@@ -816,7 +828,17 @@ class HlaeRunner:
                 for h in ordered_selected:
                     h_start_tick = int(h.get("start", 0.0) * tickrate)
                     h_end_tick = int(h.get("end", 0.0) * tickrate)
-                    if h_start_tick <= take_mid_tick <= h_end_tick:
+                    # Fase 1.29 — mesma extensão de bomb_action_tick que no
+                    # primeiro loop pra consistency. Sem isso, gameplayStartSec
+                    # não seria populado pra W4 plant takes (mesmo W4 sendo
+                    # mapeado via primeiro loop).
+                    bomb_tick = h.get("bomb_action_tick")
+                    range_end = (
+                        max(h_end_tick, int(bomb_tick) + 10 * tickrate)
+                        if bomb_tick is not None
+                        else h_end_tick
+                    )
+                    if h_start_tick <= take_mid_tick <= range_end:
                         rank = h.get("rank")
                         # Min start tick across multiple takes do mesmo highlight
                         cur = highlight_gameplay_start.get(rank, float("inf"))
