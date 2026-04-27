@@ -616,6 +616,13 @@ def _setup_commands(plan: CaptureScriptPlan) -> list[str]:
         # didn't attach. We turn it back to 0 at shutdown.
         "developer 1",
         f'echo "[FragReel] setup tick — stream={plan.stream_name} record={plan.record_name}"',
+        # Round 4c Fase 1.25 — instrumentação plant diagnostic. Mathieu
+        # reportou múltiplas vezes "plant não aparece no MP4". Logging
+        # explícito ajuda diagnosticar se: (a) cluster cobre bomb_event_tick;
+        # (b) spec_player permanece no player certo no tick do plant; (c)
+        # bomb event chega ao parser. Output vai pro console.log do CS2
+        # (com -condebug). PC pode grep "[FragReel] bomb" pra debug.
+        f'echo "[FragReel] bomb diagnostic — spec_player={plan.user_player_name or "(none)"} segments_count={len(plan.segments)}"',
         f"mirv_streams add normal {plan.stream_name}",
         f"mirv_streams record name {plan.record_name}",
     ]
