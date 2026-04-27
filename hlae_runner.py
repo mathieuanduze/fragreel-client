@@ -715,7 +715,36 @@ class HlaeRunner:
             # shutdown no finally. Servidor é daemon thread, encerra com processo
             # se algo der errado.
             #
-            # Pre-Fase 1.7: file:// URIs (rejected por Remotion → fallback)
+            # Round 4c Fase 1.26 (PC catched 27/04, root cause C):
+            # Bug original — mapping `take.segment_index → ordered_selected
+            # [segment_index]` assumia 1 take por highlight. Mas cluster v2
+            # pode gerar 2+ windows por round (W3 kills + W4 plant separados
+            # por gap > MERGE_GAP). R14 highlight tinha 1 entry em
+            # ordered_selected mas takes incluía W3+W4 (2 takes pro mesmo
+            # highlight). seg_idx=3 caía out-of-bounds → "no matching" warning
+            # → W4 (plant) órfão → plant nunca chegava ao Remotion → "plant
+            # não aparece" reportado pelo Mathieu múltiplas vezes.
+            #
+            # Fix: mapear takes → highlight via TICK RANGE OVERLAP (não por
+            # segment_index). Múltiplos takes do mesmo highlight são CONCAT-
+            # eted via ffmpeg em 1 .mov gameplay-contínuo antes do Remotion.
+            #
+            # Algoritmo:
+            # 1. Pra cada take: descobrir start_tick = plan.segments[seg_idx][0]
+            # 2. Pra cada highlight: achar TODOS takes cujo start_tick cai
+            #    dentro de (highlight.start*tickrate, highlight.end*tickrate)
+            # 3. Se 1 take: usa direto
+            # 4. Se 2+: ffmpeg concat → highlight_<rank>_concat.mov
+            # Fase 1.26 — tickrate hardcoded 64 (CS2 matchmaking padrão).
+            # Tournaments usam 128 mas demos pessoais raramente. Pra demos
+            # 128-tick, mapping pode falhar marginally em edge — TODO: passar
+            # tickrate no payload do server (já temos no parser).
+            tickrate = 64
+            plan_segments = list(plan.segments)  # [(start_tick, end_tick), ...]
+            ffmpeg_resolved = self.config.resolved_ffmpeg()
+
+            # Map highlight → list of mov paths (em ordem cronológica)
+            highlight_takes: dict[int, list[Path]] = {}
             for take in result.takes:
                 if take.mov_path is None:
                     log.warning(
@@ -723,19 +752,87 @@ class HlaeRunner:
                         "to placeholder gradient", take.segment_index,
                     )
                     continue
-                if take.segment_index >= len(ordered_selected):
+                if take.segment_index >= len(plan_segments):
                     log.warning(
-                        "segment %d has no matching highlight (only %d selected)",
-                        take.segment_index, len(ordered_selected),
+                        "segment %d has no plan_segments entry (only %d) — skip",
+                        take.segment_index, len(plan_segments),
                     )
                     continue
-                target_rank = ordered_selected[take.segment_index].get("rank")
+                seg_start_tick, seg_end_tick = plan_segments[take.segment_index]
+                # Match contra ALL highlights (não só ordered_selected) por
+                # tick range overlap. Highlights são em SEGUNDOS, segments em
+                # TICKS. Convert e check overlap.
+                matched_rank: int | None = None
+                for h in ordered_selected:
+                    h_start_tick = int(h.get("start", 0.0) * tickrate)
+                    h_end_tick = int(h.get("end", 0.0) * tickrate)
+                    # Take cai dentro do highlight se take overlap > 50% do
+                    # take com highlight range. Usa midpoint do take pra
+                    # decidir (robust a small jitter no cluster windows).
+                    take_mid_tick = (seg_start_tick + seg_end_tick) // 2
+                    if h_start_tick <= take_mid_tick <= h_end_tick:
+                        matched_rank = h.get("rank")
+                        break
+                if matched_rank is None:
+                    log.warning(
+                        "take seg %d (ticks %d-%d) sem highlight matching — orphan",
+                        take.segment_index, seg_start_tick, seg_end_tick,
+                    )
+                    continue
+                highlight_takes.setdefault(matched_rank, []).append(take.mov_path)
+                log.info(
+                    "take seg %d (ticks %d-%d) → highlight rank=%d",
+                    take.segment_index, seg_start_tick, seg_end_tick, matched_rank,
+                )
+
+            # Pra cada highlight, descobrir gameplay_start_sec (demo time
+            # do PRIMEIRO frame do .mov gameplay). Round 4c Fase 1.28 fix
+            # pro killfeed atrasado: editor antes assumia gameplay começava
+            # em highlight.start + frontSkip, mas cluster window pode
+            # começar MUCH LATER (PAD_PRE 7s do first kill, não do round
+            # start). killTimeInSceneSec calcula offset usando esse field.
+            highlight_gameplay_start: dict[int, float] = {}
+            for take in result.takes:
+                if take.mov_path is None or take.segment_index >= len(plan_segments):
+                    continue
+                seg_start_tick, seg_end_tick = plan_segments[take.segment_index]
+                take_mid_tick = (seg_start_tick + seg_end_tick) // 2
+                for h in ordered_selected:
+                    h_start_tick = int(h.get("start", 0.0) * tickrate)
+                    h_end_tick = int(h.get("end", 0.0) * tickrate)
+                    if h_start_tick <= take_mid_tick <= h_end_tick:
+                        rank = h.get("rank")
+                        # Min start tick across multiple takes do mesmo highlight
+                        cur = highlight_gameplay_start.get(rank, float("inf"))
+                        highlight_gameplay_start[rank] = min(
+                            cur, seg_start_tick / tickrate,
+                        )
+                        break
+
+            # Concat múltiplos takes do mesmo highlight via ffmpeg.
+            # Single take: usa direto. 2+: ffmpeg concat → 1 .mov.
+            for rank, mov_paths in highlight_takes.items():
+                if len(mov_paths) == 1:
+                    final_mov = mov_paths[0]
+                else:
+                    log.info(
+                        "highlight rank=%d tem %d takes — concat via ffmpeg",
+                        rank, len(mov_paths),
+                    )
+                    final_mov = self._concat_movs_for_highlight(
+                        mov_paths, rank, ffmpeg_path=ffmpeg_resolved,
+                    )
                 # PLACEHOLDER URI — sobrescrito por http://127.0.0.1:PORT/<basename>
-                # após HTTP server subir abaixo. Mantemos só o basename do .mov
-                # aqui pra usar como key de mapping.
+                # após HTTP server subir abaixo.
+                # Round 4c Fase 1.28 — anexa gameplay_start_sec pro editor
+                # alinhar killfeed/timeline corretamente. Field opcional —
+                # editor fallback pro Fase 1.20 behavior se ausente.
                 for h in highlights:
-                    if h.get("rank") == target_rank:
-                        h["gameplayVideoSrc"] = f"__PLACEHOLDER__/{take.mov_path.name}"
+                    if h.get("rank") == rank:
+                        h["gameplayVideoSrc"] = f"__PLACEHOLDER__/{final_mov.name}"
+                        gs = highlight_gameplay_start.get(rank)
+                        if gs is not None:
+                            h["gameplayStartSec"] = gs
                         break
 
             match["highlights"] = highlights
@@ -1342,6 +1439,83 @@ class HlaeRunner:
                 log.warning("could not clean take dir %s: %s", take.take_dir, e)
 
     # -- stage 5 fallback ----------------------------------------------------
+
+    def _concat_movs_for_highlight(
+        self,
+        mov_paths: list[Path],
+        rank: int,
+        *,
+        ffmpeg_path: Path | None = None,
+    ) -> Path:
+        """Round 4c Fase 1.26 — concat múltiplos takes do MESMO highlight em
+        UM .mov contínuo. Usado quando cluster v2 gera windows separadas
+        no mesmo round (kills cluster + plant separados por gap > MERGE_GAP).
+        Output mantém formato ProRes 422 HQ (lossless concat via stream
+        copy quando codecs match — fast, sem re-encode).
+
+        Args:
+            mov_paths: ordered list de .mov ProRes do mesmo highlight.
+            rank: rank do highlight (usado pra naming output).
+            ffmpeg_path: opcional; defaults pra config.resolved_ffmpeg().
+
+        Returns: path do .mov concatenado (no mesmo dir do primeiro input).
+        """
+        if not mov_paths:
+            raise ValueError("no movs to concat for highlight")
+        if len(mov_paths) == 1:
+            return mov_paths[0]  # nada a concatenar
+
+        ff = ffmpeg_path or self.config.resolved_ffmpeg()
+        if ff is None:
+            raise RuntimeError(
+                "ffmpeg not found pra concat takes do highlight"
+            )
+
+        # Output ao lado do primeiro take, naming explícito
+        first = mov_paths[0]
+        output = first.parent / f"highlight_rank{rank}_concat.mov"
+
+        # Concat list file
+        list_file = output.with_suffix(".concat.txt")
+        with list_file.open("w", encoding="utf-8") as fh:
+            for mov in mov_paths:
+                escaped = str(mov).replace("\\", "/").replace("'", "'\\''")
+                fh.write(f"file '{escaped}'\n")
+
+        # Concat demuxer + stream copy (no re-encode — fast, lossless).
+        # Funciona pra .movs com codecs idênticos (são todos prores_ks 422 HQ
+        # gerados pelo mesmo _convert_one_take). Falha se headers divergem;
+        # fallback raro = re-encode (não implementado, error explícito).
+        cmd = [
+            str(ff), "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(list_file),
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(output),
+        ]
+        log.info(
+            "concat highlight rank=%d: %d takes → %s",
+            rank, len(mov_paths), output.name,
+        )
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            creationflags=_FFMPEG_CREATIONFLAGS,
+        )
+        try:
+            list_file.unlink()
+        except OSError:
+            pass
+        if proc.returncode != 0:
+            tail = "\n".join((proc.stderr or "").splitlines()[-30:])
+            raise RuntimeError(
+                f"ffmpeg concat highlight rank={rank} failed (exit {proc.returncode}). "
+                f"stderr tail:\n{tail}"
+            )
+        return output
 
     def concat_movs_to_mp4(
         self,
