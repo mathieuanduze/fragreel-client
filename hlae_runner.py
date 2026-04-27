@@ -860,17 +860,44 @@ class HlaeRunner:
                     final_mov = self._concat_movs_for_highlight(
                         mov_paths, rank, ffmpeg_path=ffmpeg_resolved,
                     )
+
+                # Round 4c Fase 1.33 (Mathieu reportou pós-Fase 1.32 PC PASS:
+                # freeze residual entre 1:00-1:16 do MP4). Diagnóstico Mac
+                # via análise frame-by-frame: cluster v2 R14 gera W3 (kills,
+                # ~15s) + W4 (plant, ~6s) com GAP de ~18s no demo time entre
+                # eles. ffmpeg concat junta os 2 .movs (21s real total) MAS
+                # Editor calc available baseado em SOURCE TIME (35s+ incluindo
+                # gap) → roda 21s de video e HOLDS LAST FRAME por ~12s
+                # (= gap não capturado).
+                # Fix: probe mov duration REAL pós-concat e anexa ao payload.
+                # Editor cap scene_end pelo mov real duration em vez de
+                # source-time estimate. Single takes: probe ainda funciona
+                # mas geralmente bate com source — não é problema lá.
+                actual_mov_duration_sec: float | None = None
+                try:
+                    actual_mov_duration_sec = self._probe_mov_duration(
+                        final_mov, ffmpeg_path=ffmpeg_resolved,
+                    )
+                    log.info(
+                        "highlight rank=%d mov %.2fs (probed)",
+                        rank, actual_mov_duration_sec,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "ffprobe duration failed pra rank %d (%s) — fallback editor scene_end",
+                        rank, exc,
+                    )
+
                 # PLACEHOLDER URI — sobrescrito por http://127.0.0.1:PORT/<basename>
                 # após HTTP server subir abaixo.
-                # Round 4c Fase 1.28 — anexa gameplay_start_sec pro editor
-                # alinhar killfeed/timeline corretamente. Field opcional —
-                # editor fallback pro Fase 1.20 behavior se ausente.
                 for h in highlights:
                     if h.get("rank") == rank:
                         h["gameplayVideoSrc"] = f"__PLACEHOLDER__/{final_mov.name}"
                         gs = highlight_gameplay_start.get(rank)
                         if gs is not None:
                             h["gameplayStartSec"] = gs
+                        if actual_mov_duration_sec is not None:
+                            h["actualMovDurationSec"] = actual_mov_duration_sec
                         break
 
             match["highlights"] = highlights
@@ -1477,6 +1504,57 @@ class HlaeRunner:
                 log.warning("could not clean take dir %s: %s", take.take_dir, e)
 
     # -- stage 5 fallback ----------------------------------------------------
+
+    def _probe_mov_duration(
+        self,
+        mov_path: Path,
+        *,
+        ffmpeg_path: Path | None = None,
+    ) -> float:
+        """Round 4c Fase 1.33 — probe duração real do .mov via ffprobe.
+
+        Pra concats W3+W4 (cluster v2 gera 2 windows pra mesmo highlight),
+        a soma dos 2 .movs é a duração real, NÃO a janela source (que
+        inclui gap entre as windows não capturadas). Editor precisa
+        dessa info pra cap scene_end e evitar HOLD LAST FRAME residual.
+
+        Resolve ffprobe na mesma dir do ffmpeg (vendor/hlae/ffmpeg + ffprobe
+        no mesmo bin dir, pattern ffmpeg/ffprobe na maioria das distros).
+
+        Returns: duração em segundos (float).
+        Raises: RuntimeError se ffprobe não achar binary OU exit non-zero.
+        """
+        ff = ffmpeg_path or self.config.resolved_ffmpeg()
+        if ff is None:
+            raise RuntimeError("ffmpeg/ffprobe não encontrado pra probe duration")
+
+        # ffprobe geralmente vive ao lado do ffmpeg
+        ffprobe = ff.parent / ("ffprobe.exe" if ff.suffix.lower() == ".exe" else "ffprobe")
+        if not ffprobe.exists():
+            raise RuntimeError(f"ffprobe binary não achado em {ffprobe}")
+
+        cmd = [
+            str(ffprobe), "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(mov_path),
+        ]
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            creationflags=_NO_WINDOW,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffprobe exit {proc.returncode}: {proc.stderr.strip()[:200]}"
+            )
+        out = proc.stdout.strip()
+        if not out:
+            raise RuntimeError("ffprobe duration vazio")
+        return float(out)
 
     def _concat_movs_for_highlight(
         self,
