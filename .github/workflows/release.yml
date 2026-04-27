@@ -68,11 +68,15 @@ jobs:
       # adjacente ao client repo (mesma convention de dev mode pro
       # `_resolve_editor_dir` discovery), depois `npm ci` no editor pra
       # popular node_modules, depois copia pra vendor/editor/.
+      # GitHub Actions checkout exige path DENTRO do GITHUB_WORKSPACE.
+      # Antes tentamos `../fragreel` (Round 4c Fase 2 v1) — falhou:
+      # "Repository path 'D:\a\fragreel-client\fragreel' is not under
+      # 'D:\a\fragreel-client\fragreel-client'". Fix: subdir do workspace.
       - name: Checkout fragreel sibling repo (editor source)
         uses: actions/checkout@v4
         with:
           repository: mathieuanduze/fragreel
-          path: ../fragreel
+          path: fragreel-sibling
           ref: main
           fetch-depth: 1
 
@@ -81,14 +85,14 @@ jobs:
         with:
           node-version: "20"
           cache: npm
-          cache-dependency-path: ../fragreel/editor/package-lock.json
+          cache-dependency-path: fragreel-sibling/editor/package-lock.json
 
       - name: npm ci no editor (pra popular node_modules)
-        working-directory: ../fragreel/editor
+        working-directory: fragreel-sibling/editor
         run: npm ci
 
       - name: Copy editor → vendor/editor/ pra bundling
-        run: python setup_editor.py --source ../fragreel/editor --force
+        run: python setup_editor.py --source fragreel-sibling/editor --force
 
       - name: Verify vendor/editor/ is complete
         run: python setup_editor.py --check
