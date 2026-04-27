@@ -131,6 +131,10 @@ class RenderPlan:
     user_player_name: str | None = None
     record_name: str = "fragreel"
     stream_name: str = "default"
+    # Round 4c Fase 1.21 — x-ray opt-in. Web envia `show_xray` no payload
+    # /render. Default False (sem x-ray). Quando True, capture.cfg emite
+    # `spec_show_xray 1` em vez de `spec_show_xray 0` (Fase 1.19 #7).
+    show_xray: bool = False
 
     @classmethod
     def from_json(cls, payload: dict) -> "RenderPlan":
@@ -141,6 +145,7 @@ class RenderPlan:
             user_player_name=payload.get("user_player_name"),
             record_name=payload.get("record_name", "fragreel"),
             stream_name=payload.get("stream_name", "default"),
+            show_xray=bool(payload.get("show_xray", False)),
         )
 
     @property
@@ -273,6 +278,7 @@ class HlaeRunner:
             user_player_name=plan.user_player_name,
             record_name=plan.record_name,
             stream_name=plan.stream_name,
+            show_xray=plan.show_xray,
         )
 
     # -- stage 2 ------------------------------------------------------------
@@ -1146,6 +1152,30 @@ class HlaeRunner:
         if take.audio_path is not None:
             cmd += ["-i", str(take.audio_path), "-c:a", "aac", "-b:a", "192k"]
         cmd += [
+            # Round 4c Fase 1.21 — crop bottom 60px pra remover demo playback
+            # bar do CS2 Source 2 (faixa preta + scrubber + "[G] ativar
+            # controle..." + "1x" label). Fase 1.19 #7 tentou 6 cvars
+            # defensive Panorama (`spec_show_xray 0`, `cl_show_observer_*`,
+            # etc.) mas PC test confirmou demo bar AINDA visível em t=20s,
+            # 26s, 38s, 50s, 56s, 65s. Esses widgets vivem em sistema
+            # Panorama separado do HUD bag controlado por cl_drawhud, sem
+            # cvar conhecido pra desligar (pesquisa community indecisa).
+            #
+            # Solution determinística: ffmpeg crop. Demo bar fica nos últimos
+            # ~40-60px do bottom. Crop 60px com pad to keep aspect 1080×1920
+            # (senão Remotion OffthreadVideo precisa stretch). pad cor preta
+            # = invisível no fundo escuro do reel + tem o gradient overlay
+            # bottom do FragReel Remotion na cena.
+            #
+            # Trade-off: perde 60px de gameplay no bottom (~3% da altura
+            # 1920px). Aceito vs UX broken por demo bar visível. Pad bottom
+            # de 60px preto fica invisível pq Remotion adiciona gradient
+            # overlay bottom (HighlightScene line ~244-249).
+            #
+            # Pro futuro (Fase 2+): tentar HLAE `mirv_streams add world` em
+            # vez de `normal` (captura framebuffer pré-Panorama compositing)
+            # OU SDK Source 2 widget unhide via reverse-engineering.
+            "-vf", "crop=iw:ih-60:0:0,pad=iw:ih+60:0:0:black",
             "-c:v", "prores_ks",
             # Round 4c Fase 1.9 (PC catched 26/04 03:25): trocar profile 4444
             # → 3 (422 HQ) E pix_fmt yuva444p10le → yuv422p10le.

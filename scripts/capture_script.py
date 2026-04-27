@@ -551,6 +551,14 @@ class CaptureScriptPlan:
     # mandatório). Comandos emitidos no setup ÚNICO antes do primeiro
     # segment.
     hide_hud: bool = True
+    # Round 4c Fase 1.21 — X-ray toggle (Mathieu Fase 1.21 feedback:
+    # "x-ray eu percebi que ele saiu nesse vídeo e acho que isso pode
+    # ser uma opção a ser adicionada pelo usuário"). X-ray (silhuetas
+    # glow dos players através de paredes em spec mode) é cinemático
+    # pra alguns reels mas distrai outros. User decide via UI toggle
+    # no match-page → web envia `show_xray` no payload → client
+    # converte pra `spec_show_xray 1` (ON) ou `0` (OFF, default).
+    show_xray: bool = False
 
     def __post_init__(self) -> None:
         if not self.segments:
@@ -647,7 +655,10 @@ def _setup_commands(plan: CaptureScriptPlan) -> list[str]:
             "cl_drawhud_force_deathnotices -1",   # force off death notices
             "cl_show_team_equipment 0",           # equipment bar in spec
             "cl_show_observer_crosshair 0",       # observer crosshair overlay
-            "spec_show_xray 0",                   # xray wallhack overlay
+            # Round 4c Fase 1.21 — x-ray opt-in (era hard-coded 0 desde
+            # Fase 1.19). Default False pq cinematicamente x-ray distrai
+            # do gameplay POV. User opt-in via UI toggle.
+            f"spec_show_xray {1 if plan.show_xray else 0}",
             "hud_drawhistory_time 0",             # damage history overlay
             "cl_drawhud_nofreezecam 1",           # freeze cam overlay off
             "safezonex 1",
@@ -915,6 +926,7 @@ def generate_capture_cfg(
     pre_seek_tick: int | None = None,
     extra_start_commands: Iterable[str] = (),
     extra_end_commands: Iterable[str] = (),
+    show_xray: bool = False,
 ) -> Path:
     """Write a `.cfg` file at `output_path` that captures the given segments.
 
@@ -960,6 +972,7 @@ def generate_capture_cfg(
         pre_seek_tick=resolved_pre_seek,
         extra_start_commands=tuple(extra_start_commands),
         extra_end_commands=tuple(extra_end_commands),
+        show_xray=show_xray,
     )
 
     target = Path(output_path)

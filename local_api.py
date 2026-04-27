@@ -436,6 +436,8 @@ def create_app(
             user_player_name=user_player_name,
             record_name=body.get("record_name", "fragreel"),
             stream_name=body.get("stream_name", "default"),
+            # Round 4c Fase 1.21 — x-ray opt-in. Web envia bool no payload.
+            show_xray=bool(body.get("show_xray", False)),
         )
 
         render_id = body.get("render_id") or uuid.uuid4().hex[:12]
