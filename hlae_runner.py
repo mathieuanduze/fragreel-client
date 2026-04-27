@@ -92,6 +92,37 @@ _FFMPEG_CREATIONFLAGS = _NO_WINDOW | _BELOW_NORMAL_PRIORITY
 _FFMPEG_THREAD_LIMIT = "4"  # cap ffmpeg threads pra deixar PC responsivo
 
 
+def _resolve_bundled_npx() -> str | None:
+    """Round 4c Fase 2 — resolve npx do Node portable bundlado.
+
+    Frozen mode (.exe), Node 20 LTS Windows x64 vive em
+    `_MEIPASS/vendor/node/npx.cmd`. Source/dev mode, busca
+    `<client>/vendor/node/npx.cmd` (criado por setup_node.py).
+
+    Retorna str do path se achado, senão None (caller fallback pra
+    `shutil.which("npx")`).
+    """
+    candidates: list[Path] = []
+
+    # Frozen: PyInstaller _MEIPASS extraction
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "vendor" / "node" / "npx.cmd")
+            candidates.append(Path(meipass) / "vendor" / "node" / "npx")  # non-Windows fallback
+
+    # Source/dev: <client>/vendor/node/
+    client_root = Path(__file__).parent
+    candidates.append(client_root / "vendor" / "node" / "npx.cmd")
+    candidates.append(client_root / "vendor" / "node" / "npx")
+
+    for c in candidates:
+        if c.exists():
+            log.info("npx bundled resolved: %s", c)
+            return str(c)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Path conventions inside the CS2 install
 # ---------------------------------------------------------------------------
@@ -907,7 +938,12 @@ class HlaeRunner:
         # PC test catched WinError 2 com cmd=["npx",...]+shell=False no Win
         # (Node ships só .cmd shims, CreateProcess sem PATHEXT não acha).
         # shutil.which() faz lookup correto cross-platform.
-        npm_exe_resolved = npm_exe or shutil.which("npx") or "npx"
+        #
+        # Round 4c Fase 2 — frozen mode usa Node bundled em _MEIPASS/vendor/
+        # node/npx.cmd. Sem isso, user final que baixar .exe sem Node
+        # instalado falha em "FileNotFoundError: 'npx'". Bundling Node 20
+        # portable (~30MB) elimina dep externa.
+        npm_exe_resolved = npm_exe or _resolve_bundled_npx() or shutil.which("npx") or "npx"
 
         # Round 4c Fase 1.7 — HTTP server local pros .mov files.
         # Round 4c Fase 1.8 (PC report 26/04 ~02:30) — UPGRADE pra _RangeAwareHandler:

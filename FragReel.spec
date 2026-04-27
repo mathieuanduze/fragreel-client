@@ -41,9 +41,22 @@ def _bundle_tree(source: Path, dest_in_bundle: str) -> list[tuple[str, str]]:
     return out
 
 
-# Vendor (HLAE + ffmpeg) — ~200MB. Skipped silently if setup_vendor.py
-# hasn't been run yet so devs can still build a "no-render" .exe locally.
+# Vendor (HLAE + ffmpeg + Node + editor) — ~450MB total. Skipped silently
+# se setup scripts ainda não rodaram, dev pode build local sem render.
 vendor_datas = _bundle_tree(VENDOR_DIR, "vendor")
+
+# Round 4c Fase 2 — Node + editor bundle pra escalabilidade user final.
+# vendor/node/ vem de setup_node.py (~30MB Node 20 LTS portable Win x64).
+# vendor/editor/ vem de setup_editor.py (clone fragreel sibling + npm ci
+# editor + copy ~200-300MB com node_modules).
+# hlae_runner._resolve_editor_dir() já tem case _MEIPASS/editor — pra
+# aproveitar isso, copiamos editor no `editor/` direto (sem prefix vendor),
+# mantendo Node em `vendor/node/`.
+NODE_DIR = VENDOR_DIR / "node"
+EDITOR_DIR_VENDOR = VENDOR_DIR / "editor"
+node_datas = _bundle_tree(NODE_DIR, "vendor/node") if NODE_DIR.is_dir() else []
+# Editor vai pra `editor/` (sem prefix vendor/) pra match _resolve_editor_dir.
+editor_datas = _bundle_tree(EDITOR_DIR_VENDOR, "editor") if EDITOR_DIR_VENDOR.is_dir() else []
 
 # scripts/ holds the .cfg generator imported by hlae_runner.py — needs to
 # travel with the .exe so the bundled Python interpreter can import it.
@@ -54,7 +67,7 @@ a = Analysis(
     ['main.py'],
     pathex=['.'],
     binaries=[],
-    datas=vendor_datas + scripts_datas,
+    datas=vendor_datas + node_datas + editor_datas + scripts_datas,
     hiddenimports=[
         'plyer.platforms.win.notification',
         'pystray._win32',
@@ -81,6 +94,8 @@ a = Analysis(
         'hlae_runner',
         'render_coordinator',
         'setup_vendor',
+        'setup_node',
+        'setup_editor',
         'scripts.capture_script',
         # v0.2.7: client_config holds output_dir persistence. Imported by
         # local_api at top level, so a missing bundle would crash the entire

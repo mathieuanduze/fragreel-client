@@ -45,6 +45,54 @@ jobs:
       - name: Verify vendor/ is complete
         run: python setup_vendor.py --check
 
+      # Round 4c Fase 2 — Node + editor bundle pra escalabilidade user
+      # final. setup_node.py baixa Node 20 LTS portable Win x64 (~30MB).
+      # setup_editor.py copia editor Remotion + node_modules do sibling
+      # repo `fragreel` clonado no step abaixo. Cache de Node por pinned
+      # version (NODE_VERSION em setup_node.py).
+      - name: Cache vendor/node/ (Node 20 LTS portable)
+        id: node-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/node
+          key: node-${{ runner.os }}-${{ hashFiles('setup_node.py') }}
+
+      - name: Download Node portable into vendor/node/
+        if: steps.node-cache.outputs.cache-hit != 'true'
+        run: python setup_node.py
+
+      - name: Verify vendor/node/ is complete
+        run: python setup_node.py --check
+
+      # Editor (Remotion) — checkout do sibling repo `fragreel` numa pasta
+      # adjacente ao client repo (mesma convention de dev mode pro
+      # `_resolve_editor_dir` discovery), depois `npm ci` no editor pra
+      # popular node_modules, depois copia pra vendor/editor/.
+      - name: Checkout fragreel sibling repo (editor source)
+        uses: actions/checkout@v4
+        with:
+          repository: mathieuanduze/fragreel
+          path: ../fragreel
+          ref: main
+          fetch-depth: 1
+
+      - name: Set up Node.js (for npm ci)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ../fragreel/editor/package-lock.json
+
+      - name: npm ci no editor (pra popular node_modules)
+        working-directory: ../fragreel/editor
+        run: npm ci
+
+      - name: Copy editor → vendor/editor/ pra bundling
+        run: python setup_editor.py --source ../fragreel/editor --force
+
+      - name: Verify vendor/editor/ is complete
+        run: python setup_editor.py --check
+
       # Sobrescreve version.py com a tag que disparou o workflow (ou um
       # sentinel pra workflow_dispatch manual). O .exe final sempre carrega
       # a versão que o CI registrou — nunca o fallback de dev. Isso elimina
@@ -82,10 +130,14 @@ jobs:
           }
           $exe = Get-Item dist\FragReel.exe
           $exe | Select-Object Name, Length, LastWriteTime
-          # Sanity: post-vendor bundle should clear ~250MB. A sub-50MB build
-          # means PyInstaller skipped the vendor/ datas tree silently.
+          # Sanity check post-bundle:
+          # - Round 4c Fase 1: ~250MB (HLAE 200MB + ffmpeg 50MB)
+          # - Round 4c Fase 2: ~450-500MB (+ Node 30MB + editor 200MB)
           if ($exe.Length -lt 100MB) {
             Write-Warning "FragReel.exe is suspiciously small ($($exe.Length) bytes) — vendor/ may not be bundled"
+          }
+          if ($exe.Length -lt 350MB) {
+            Write-Warning "FragReel.exe < 350MB — Node + editor bundle pode estar faltando (Fase 2)"
           }
 
       - name: Upload unsigned artifact
