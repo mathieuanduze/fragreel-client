@@ -1,6 +1,10 @@
 # FragReel Client
 
-Windows companion app for [FragReel](https://fragreel.vercel.app) — a free service that turns your Counter-Strike 2 demos into shareable highlight videos automatically.
+[![Code signing courtesy of](https://img.shields.io/badge/code%20signing-SignPath%20Foundation-blue?logo=microsoft&logoColor=white)](https://signpath.org/foundation)
+
+Windows companion app for [FragReel](https://fragreel.gg) — a free service that turns your Counter-Strike 2 demos into shareable highlight videos automatically.
+
+> **Code signing**: This project's Windows binaries are digitally signed thanks to a free certificate provided by the [SignPath Foundation](https://signpath.org/foundation), the open source code signing program. Signature verification on every download protects users from tampered builds.
 
 The client runs silently in your system tray, watches the folders where CS2 stores match demos, and uploads new `.dem` files to the FragReel API. The server parses the demo, scores the best plays, and renders a vertical highlight reel you can share on WhatsApp, Instagram, or TikTok.
 
