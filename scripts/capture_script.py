@@ -639,6 +639,17 @@ def _setup_commands(plan: CaptureScriptPlan) -> list[str]:
             "cl_draw_only_deathnotices 0",
             "cl_radar_always_centered 0",
             "cl_drawhud_force_radar -1",
+            # Round 4c Fase 1.19 — defensive cvars pra eliminar Panorama
+            # widgets que sobrevivem cl_drawhud 0 (demo control bar +
+            # spec hint "[G] ativar controle..." + label "1x" playback
+            # rate). Esses são CS2 Source 2 panorama overlays separados
+            # do HUD bag que cl_drawhud filtra. Tentativa em camadas:
+            "cl_drawhud_force_deathnotices -1",   # force off death notices
+            "cl_show_team_equipment 0",           # equipment bar in spec
+            "cl_show_observer_crosshair 0",       # observer crosshair overlay
+            "spec_show_xray 0",                   # xray wallhack overlay
+            "hud_drawhistory_time 0",             # damage history overlay
+            "cl_drawhud_nofreezecam 1",           # freeze cam overlay off
             "safezonex 1",
             "safezoney 1",
             # Re-habilita crosshair (que cl_drawhud 0 desliga junto)
