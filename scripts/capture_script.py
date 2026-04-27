@@ -218,13 +218,16 @@ V2_PLANT_ANIM_S = 3.2
 V2_PLANT_PRE_BUFFER_S = 1.0
 """Buffer antes do início da plant animation (ver player chegar no site)."""
 
-V2_PLANT_POST_BUFFER_S = 5.0
-"""Buffer após plant completa. Round 4c Fase 1.34 (Mathieu reportou pós-Fase
-1.33: "plant action começa mas NÃO mostra 'Bomba foi armada' notification").
-Bumped 2.0 → 5.0s pra cobrir CS2 native red bar "Bomba foi armada. 40 segundos
-até a detonação." (~2s readable) + beep + reaction. Antes 2s era curto demais
-— mov real cobria plant_complete + 2s de pós-action mas notification só lê
-~1s antes do scene cortar via mov_duration cap."""
+V2_PLANT_POST_BUFFER_S = 7.0
+"""Buffer após plant completa. Evolução por iterações:
+  - v0.3.0-beta-2: 2.0s (curto demais)
+  - Fase 1.34: 5.0s (cobria notification mas red bar mal visível)
+  - Fase 1.35: 7.0s (PC catched pós-Fase 1.34: action complete + bomb
+    on ground visível MAS "Bomba foi armada" red bar overlay ainda
+    cortado pelo mov_duration cap). CS2 native plant notification
+    appears ~1.5s pós-action e dura ~2s readable. 5s buffer cortava
+    no meio do popup. 7s = 1.5s appear delay + 3s readable + 2.5s
+    buffer comfort."""
 
 V2_DEFUSE_ANIM_NOKIT_S = 10.0
 """Duração worst-case de defuse SEM kit. Usado como assumption porque o
