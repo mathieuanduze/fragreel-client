@@ -549,6 +549,7 @@ class RenderCoordinator:
                         output_mp4=mp4_path,
                         editor_dir=self.editor_dir,
                         base_props=reel_props or {},
+                        plan=plan,  # Round 4c Fase 1.26.1 — required pra plant takes mapping
                     )
                     with self._lock:
                         if self._session:

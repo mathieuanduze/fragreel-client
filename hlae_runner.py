@@ -652,6 +652,7 @@ class HlaeRunner:
         composition: str = "HighlightsReel",
         base_props: dict | None = None,
         npm_exe: str | None = None,
+        plan: "RenderPlan | None" = None,
     ) -> Path:
         """Run `npx remotion render` against the editor repo.
 
@@ -740,7 +741,22 @@ class HlaeRunner:
             # 128-tick, mapping pode falhar marginally em edge — TODO: passar
             # tickrate no payload do server (já temos no parser).
             tickrate = 64
-            plan_segments = list(plan.segments)  # [(start_tick, end_tick), ...]
+            # Round 4c Fase 1.26.1 — defensive guard: plan is optional (caller
+            # must pass it pra plant takes mapping funcionar). Sem plan, cai
+            # no behavior pre-1.26: 1 take per highlight, plant fica órfão.
+            # PC test catched (27/04 ~11h): commit 0e47f9b adicionou
+            # `plan.segments` reference SEM atualizar signature (plan kwarg)
+            # NEM o caller no render_coordinator.py:547. NameError → fallback
+            # ffmpeg concat → MP4 cru sem editor. Fix: signature ganha
+            # `plan: RenderPlan | None = None`, caller passa `plan=plan`.
+            if plan is None:
+                log.warning(
+                    "render_remotion called without plan kwarg — Fase 1.26 plant "
+                    "mapping disabled, falling back to legacy 1-take-per-highlight",
+                )
+                plan_segments = [(0, 0)] * len(result.takes)  # placeholder neutralizando o map
+            else:
+                plan_segments = list(plan.segments)  # [(start_tick, end_tick), ...]
             ffmpeg_resolved = self.config.resolved_ffmpeg()
 
             # Map highlight → list of mov paths (em ordem cronológica)
