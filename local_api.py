@@ -1034,6 +1034,11 @@ def _build_render_coordinator() -> Optional[RenderCoordinator]:
     # de sessões antigas pré-v0.4.6 (51.7 GB no PC dele). Roda 1x na startup
     # do client. Cleanup-on-crash do v0.4.6 (Bug #21 V1) só protege sessões
     # NOVAS — esse fix cobre o legacy. Falhas aqui são logged mas não fatais.
+    #
+    # Bug #21 V2 path fix (PC test catched 28/04): primeira impl não logava
+    # quando 0 takes encontrados — PC interpretou como "feature não rodou".
+    # Agora SEMPRE logamos resultado pra facilitar debug.
+    log.info("Boot cleanup: iniciando varredura de orfãos legacy (Bug #21 V2)")
     try:
         deleted, freed = coordinator.cleanup_legacy_orphans(max_age_min=5)
         if deleted > 0:
@@ -1041,6 +1046,8 @@ def _build_render_coordinator() -> Optional[RenderCoordinator]:
                 "Boot cleanup: liberou %.2f GB de %d take dirs orfãos antigos",
                 freed / (1024 ** 3), deleted,
             )
+        else:
+            log.info("Boot cleanup: nenhum take orfão pra remover (limpo)")
     except Exception as e:
         log.warning("Boot cleanup falhou (não-fatal): %s", e)
 

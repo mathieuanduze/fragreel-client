@@ -802,19 +802,35 @@ class RenderCoordinator:
         Mathieu reportou 51.7 GB legacy no PC test. Pra evitar pedir
         comando manual cada vez que isso aconteça, varremos no startup.
 
+        Bug #21 V2 path fix (28/04 PC test catched): primeira impl usava
+        `recording_parent` direto (= `<cs2_install>/game/bin/win64/`),
+        mas takes ficam em `<recording_parent>/<record_name>/takeNNNN/`
+        (subpasta `fragreel/` por default — record_name default em
+        hlae_runner.RenderPlan). Cleanup achava 0 takes em prod no PC
+        test. Fix: scanea `recording_parent / "fragreel"` (default
+        record_name pra clientes que usam config padrão).
+
         Lógica:
-        - Lista takeNNNN/ dentro de recording_parent (Steam/.../fragreel/)
+        - Lista takeNNNN/ dentro de recording_parent/fragreel/
         - Filtra mtime > max_age_min atrás (5 min default — evita deletar
           takes em uso por render concorrente que iniciou bem antes)
         - rmtree cada um, somando bytes pra log
 
-        Roda apenas no startup (chamado por main.py). Não roda durante
-        operação normal — pra isso temos `_cleanup_scratch_dirs`.
+        Roda apenas no startup (chamado por main.py via local_api factory).
+        Não roda durante operação normal — pra isso temos
+        `_cleanup_scratch_dirs`.
 
         Returns (dirs_deleted, bytes_freed_bytes).
         """
-        record_root = self.config.recording_parent
+        # Bug #21 V2 path fix: takes ficam em recording_parent/fragreel/,
+        # não direto em recording_parent. Default record_name = "fragreel"
+        # (vide CS2_RECORDING_PARENT_REL doc em hlae_runner.py).
+        record_root = self.config.recording_parent / "fragreel"
         if not record_root.exists():
+            log.info(
+                "Legacy cleanup: %s não existe — sem takes pra limpar (OK)",
+                record_root,
+            )
             return 0, 0
 
         cutoff_time = time.time() - (max_age_min * 60)
@@ -826,6 +842,17 @@ class RenderCoordinator:
         except OSError as e:
             log.warning("legacy cleanup: cannot list %s: %s", record_root, e)
             return 0, 0
+
+        # Sempre logar quantos candidates foram considerados — facilita
+        # debugar quando user reporta "feature não rodou" sem disk delta.
+        candidate_count = sum(
+            1 for c in children
+            if c.is_dir() and c.name.startswith("take") and c.name[4:].isdigit()
+        )
+        log.info(
+            "Legacy cleanup scan: %d takeNNNN candidate(s) em %s",
+            candidate_count, record_root,
+        )
 
         for child in children:
             if not child.is_dir() or not child.name.startswith("take"):
@@ -843,7 +870,10 @@ class RenderCoordinator:
             except OSError:
                 continue
             if mtime > cutoff_time:
-                log.debug("legacy cleanup: skipping recent take %s", child.name)
+                log.info(
+                    "Legacy cleanup: skip %s (mtime %.1f min < threshold)",
+                    child.name, (time.time() - mtime) / 60,
+                )
                 continue
 
             # Best-effort size sum + delete
@@ -867,6 +897,11 @@ class RenderCoordinator:
             log.info(
                 "Legacy cleanup: removed %d orphan take dir(s), freed %.2f GB from %s",
                 dirs_deleted, bytes_freed / (1024 ** 3), record_root,
+            )
+        else:
+            log.info(
+                "Legacy cleanup: 0 orphans removed (de %d candidates) em %s",
+                candidate_count, record_root,
             )
         return dirs_deleted, bytes_freed
 
