@@ -548,9 +548,23 @@ _VIDEOSETTINGS_NOWINDOWBORDER_RE = re.compile(
     r'("setting\.nowindowborder"\s*)"\d+"'
 )
 
+# Bug #14 (28/04, descoberto em v0.4.2 PC test): CS2 agora tem um
+# SEGUNDO arquivo de config em <Steam>/userdata/<UID>/730/local/cfg/cs2_video.txt
+# que VENCE sobre videosettings.txt + CLI args. Chave é "setting.fullscreen"
+# (NÃO "setting.fullscreen_mode" do videosettings.txt antigo).
+#
+# Sem esse fix, mesmo com Bug #12 fix correto + CLI -windowed -noborder,
+# CS2 abre fullscreen porque cs2_video.txt tem setting.fullscreen "1".
+_CS2VIDEO_FULLSCREEN_RE = re.compile(
+    r'("setting\.fullscreen"\s*)"\d+"'
+)
+_CS2VIDEO_NOWINDOWBORDER_RE = re.compile(
+    r'("setting\.nowindowborder"\s*)"\d+"'
+)
+
 
 def _videosettings_paths(cs2_exe: Path) -> list[Path]:
-    """Possíveis paths do videosettings.txt do CS2.
+    """Possíveis paths do videosettings.txt do CS2 (Bug #12).
 
     cs2_exe tipicamente em: <install>/game/bin/win64/cs2.exe
     Retorna candidates ordenados por probabilidade — primeiro o per-install,
@@ -570,6 +584,80 @@ def _videosettings_paths(cs2_exe: Path) -> list[Path]:
         candidates.append(Path(localappdata) / "CS2" / "cfg" / "videosettings.txt")
 
     return [p for p in candidates if p.exists()]
+
+
+def _cs2video_paths(cs2_exe: Path) -> list[Path]:
+    """Bug #14 (28/04): cs2_video.txt em <Steam>/userdata/<UID>/730/local/cfg/.
+
+    Steam root descoberto subindo a partir de cs2_exe:
+      cs2.exe → win64 → bin → game → Counter-Strike Global Offensive
+            → common → steamapps → <Steam root>
+
+    Glob em userdata/* pra cobrir multi-account (raro mas possível). Retorna
+    todos os arquivos existentes — se múltiplos accounts logados, escreve
+    em todos (idempotente, no harm).
+    """
+    candidates: list[Path] = []
+    try:
+        # cs2.exe: 7 níveis acima = Steam root
+        steam_root = cs2_exe.parent.parent.parent.parent.parent.parent.parent
+        userdata = steam_root / "userdata"
+        if userdata.is_dir():
+            for uid_dir in userdata.iterdir():
+                if uid_dir.is_dir() and uid_dir.name.isdigit():
+                    cfg = uid_dir / "730" / "local" / "cfg" / "cs2_video.txt"
+                    if cfg.exists():
+                        candidates.append(cfg)
+    except Exception:
+        pass
+
+    return candidates
+
+
+def force_windowed_cs2_video(cs2_exe: Path) -> bool:
+    """Bug #14 fix: force setting.fullscreen "0" em cs2_video.txt antes do launch.
+
+    Análogo ao force_windowed_videosettings (Bug #12) mas pro arquivo NOVO
+    introduzido em alguma versão recente do CS2 que VENCE sobre tudo:
+    videosettings.txt + CLI -windowed -noborder + +mat_fullscreen 0.
+
+    Returns True se escreveu em algum file, False se nada precisava update.
+    Idempotente. Backup automático em <file>.fragreel.bak (uma vez só).
+    """
+    paths = _cs2video_paths(cs2_exe)
+    if not paths:
+        log.debug("Bug #14 fix: nenhum cs2_video.txt encontrado em userdata, skip")
+        return False
+
+    wrote = False
+    for path in paths:
+        try:
+            content = path.read_text(encoding="utf-8")
+
+            # Backup uma vez por path
+            backup = path.with_suffix(".txt.fragreel.bak")
+            if not backup.exists():
+                try:
+                    backup.write_text(content, encoding="utf-8")
+                    log.info("Bug #14 fix: backup criado em %s", backup.name)
+                except Exception as e:
+                    log.warning("Bug #14 fix: falhou backup %s: %s", backup, e)
+
+            # Force setting.fullscreen=0 (windowed)
+            new_content = _CS2VIDEO_FULLSCREEN_RE.sub(r'\1"0"', content)
+            # Garantir nowindowborder=1
+            new_content = _CS2VIDEO_NOWINDOWBORDER_RE.sub(r'\1"1"', new_content)
+
+            if new_content != content:
+                path.write_text(new_content, encoding="utf-8")
+                log.info("Bug #14 fix: forcei windowed em %s", path)
+                wrote = True
+            else:
+                log.debug("Bug #14 fix: %s já estava em windowed (no-op)", path)
+        except Exception as e:
+            log.warning("Bug #14 fix: falhou em %s: %s (não-fatal, launch continua)", path, e)
+
+    return wrote
 
 
 def force_windowed_videosettings(cs2_exe: Path) -> bool:
@@ -669,6 +757,13 @@ def launch_cs2_injected(
             force_windowed_videosettings(cs2_exe)
         except Exception as e:
             log.warning("Bug #12 fix raised (non-fatal, continuing): %s", e)
+        # Bug #14 (28/04): cs2_video.txt em Steam/userdata/<UID>/730/local/cfg/
+        # tem setting.fullscreen "1" que VENCE sobre videosettings.txt + CLI args.
+        # Aplicar SEMPRE quando hide_offscreen=True (mesmo flow do Bug #12).
+        try:
+            force_windowed_cs2_video(cs2_exe)
+        except Exception as e:
+            log.warning("Bug #14 fix raised (non-fatal, continuing): %s", e)
 
     # CommandLine must be mutable (CreateProcessW may modify). Build as:
     #   "<cs2_exe>" arg1 arg2 ...

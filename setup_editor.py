@@ -63,11 +63,27 @@ class EditorLayout:
     def is_complete(self) -> bool:
         # node_modules é o sinal mais forte — package.json sozinho indica
         # repo cloned mas npm install ainda pendente.
+        # Bug #13 (28/04): adicionado check de @remotion/cli/dist/ pra
+        # detectar bundle mutilado (PyInstaller filtrou dist/ recursivo)
+        # ANTES de tagar release — CI agora falha se faltar.
+        remotion_cli_dist = self.node_modules / "@remotion" / "cli" / "dist"
         return (
             self.package_json.exists()
             and self.remotion_config.exists()
             and self.node_modules.is_dir()
+            and remotion_cli_dist.is_dir()
         )
+
+    def diagnose(self) -> dict[str, bool]:
+        """Detailed check pra logging — qual peça especificamente falta."""
+        return {
+            "package_json": self.package_json.exists(),
+            "remotion_config": self.remotion_config.exists(),
+            "node_modules": self.node_modules.is_dir(),
+            "remotion_cli_dist": (self.node_modules / "@remotion" / "cli" / "dist").is_dir(),
+            "remotion_renderer_dist": (self.node_modules / "@remotion" / "renderer" / "dist").is_dir(),
+            "remotion_bundler_dist": (self.node_modules / "@remotion" / "bundler" / "dist").is_dir(),
+        }
 
 
 def default_layout() -> EditorLayout:
@@ -153,11 +169,39 @@ def copy_editor_to_vendor(
 
     log.info("copying %s → %s (incluindo node_modules)", source_editor, layout.editor_dir)
 
-    # Skip dirs que não precisam ir no bundle final
-    SKIP_DIRS = {".git", ".next", "dist", "build", ".vercel", ".turbo", "out"}
+    # Skip dirs que não precisam ir no bundle final.
+    #
+    # Bug #13 (28/04, descoberto em v0.4.2 PC test): dist/build/out são
+    # build outputs do EDITOR (top-level), mas TAMBÉM são dirs essenciais
+    # dentro de node_modules/<pkg>/dist/ (compiled JS de cada pacote).
+    # SKIP_DIRS antigo {.git,.next,"dist","build",.vercel,.turbo,"out"}
+    # mutilava node_modules/@remotion/cli/dist/ → Cannot find module './dist/index'
+    # → fallback ffmpeg concat (sem música/orientation/transitions).
+    #
+    # Fix: separar em 2 sets — SKIP_ALWAYS (irrelevantes em qualquer
+    # lugar) + SKIP_TOPLEVEL_ONLY (só pula no root do editor, NUNCA
+    # dentro de node_modules onde dist/ é obrigatório).
+    SKIP_ALWAYS = {".git", ".next", ".vercel", ".turbo"}
+    SKIP_TOPLEVEL_ONLY = {"dist", "build", "out"}
+
+    source_str = str(source_editor)
 
     def _ignore(path: str, names: list[str]) -> list[str]:
-        return [n for n in names if n in SKIP_DIRS]
+        # Path absoluto vs source root: se contém /node_modules/ em
+        # qualquer ponto, é dependência transitiva — preserva tudo.
+        rel_path = path[len(source_str):].replace("\\", "/").lstrip("/")
+        in_node_modules = "node_modules/" in (rel_path + "/")
+
+        skipped = []
+        for n in names:
+            if n in SKIP_ALWAYS:
+                skipped.append(n)
+            elif n in SKIP_TOPLEVEL_ONLY and not in_node_modules:
+                # Top-level editor build outputs — safe to skip.
+                # Dentro de node_modules/<pkg>/dist/ é COMPILED CODE
+                # do pacote — NÃO pode skipar (Bug #13).
+                skipped.append(n)
+        return skipped
 
     shutil.copytree(
         source_editor,
@@ -212,13 +256,15 @@ def _main() -> int:
 
     if args.check:
         ok = layout.is_complete()
-        log.info(
-            "editor vendor check: %s (package=%s, config=%s, node_modules=%s)",
-            "OK" if ok else "MISSING",
-            layout.package_json.exists(),
-            layout.remotion_config.exists(),
-            layout.node_modules.is_dir(),
-        )
+        diag = layout.diagnose()
+        log.info("editor vendor check: %s", "OK" if ok else "MISSING")
+        for piece, present in diag.items():
+            log.info("  %s: %s", piece, "✓" if present else "✗ MISSING")
+        if not ok:
+            log.error(
+                "Bug #13 sanity check: alguma peça crítica faltando. Ver diagnose acima. "
+                "Se remotion_cli_dist=✗ → SKIP_DIRS está mutilando node_modules — revisar setup_editor.py copy_editor_to_vendor()."
+            )
         return 0 if ok else 1
 
     source = args.source or find_sibling_editor()

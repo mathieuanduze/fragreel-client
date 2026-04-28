@@ -400,14 +400,51 @@ class RenderCoordinator:
             # ~1 segment of TGAs instead of N segments. The previous flow
             # (wait-all-then-convert-all) blew up with ENOSPC when the
             # user had < ~50 GB free for a 2-segment 120 fps capture.
-            self._update(state="capturing", stage="capturing gameplay")
+            self._update(state="capturing", stage="capturing gameplay (CS2 carregando demo)")
 
             mov_dir = self.output_dir / plan.demo_basename
             mov_dir.mkdir(parents=True, exist_ok=True)
             self._active_mov_dir = mov_dir
             converted_movs: dict[int, Path] = {}
 
+            # Bug #15 (28/04 PC test) fix: heartbeat thread atualiza stage
+            # text durante o "silêncio" entre CS2 launch e primeira frame
+            # capturada (HLAE warmup, 1-3min). User reportava como "stuck
+            # at 7%" e cancelava. Sem isso, UI mostra mesma string + mesma
+            # % por minutos = sensação de travamento.
+            warmup_start = time.time()
+            first_frame_seen = threading.Event()
+            warmup_stop = threading.Event()
+
+            def _warmup_heartbeat() -> None:
+                while not warmup_stop.is_set() and not first_frame_seen.is_set():
+                    if self._cancel_requested.is_set():
+                        return
+                    elapsed = int(time.time() - warmup_start)
+                    if elapsed < 30:
+                        msg = f"capturing gameplay (CS2 carregando demo — {elapsed}s)"
+                    elif elapsed < 120:
+                        msg = f"capturing gameplay (HLAE warmup — {elapsed}s, isso pode levar 1-3 min)"
+                    else:
+                        msg = f"capturing gameplay (preparando — {elapsed}s, paciência aí)"
+                    with self._lock:
+                        if self._session is not None:
+                            self._session.stage = msg
+                    # Sleep curto pra responder a cancel rapidamente
+                    warmup_stop.wait(timeout=5.0)
+
+            warmup_thread = threading.Thread(
+                target=_warmup_heartbeat,
+                name="fragreel-warmup-heartbeat",
+                daemon=True,
+            )
+            warmup_thread.start()
+
             def on_progress(now: int, prev: int) -> None:
+                # Bug #15: primeira frame chegou — para heartbeat warmup.
+                if not first_frame_seen.is_set():
+                    first_frame_seen.set()
+                    warmup_stop.set()
                 if self._cancel_requested.is_set():
                     return
                 with self._lock:
