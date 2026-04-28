@@ -1024,11 +1024,27 @@ def _build_render_coordinator() -> Optional[RenderCoordinator]:
 
     editor_dir = _resolve_editor_dir()
     config = HlaeRunnerConfig(cs2_install=cs2_install, hlae_dir=hlae_dir)
-    return RenderCoordinator(
+    coordinator = RenderCoordinator(
         config,
         output_dir=output_dir,
         editor_dir=editor_dir,
     )
+
+    # Bug #21 V2 (28/04, Mathieu pediu): cleanup retroativo de TGAs orfãos
+    # de sessões antigas pré-v0.4.6 (51.7 GB no PC dele). Roda 1x na startup
+    # do client. Cleanup-on-crash do v0.4.6 (Bug #21 V1) só protege sessões
+    # NOVAS — esse fix cobre o legacy. Falhas aqui são logged mas não fatais.
+    try:
+        deleted, freed = coordinator.cleanup_legacy_orphans(max_age_min=5)
+        if deleted > 0:
+            log.info(
+                "Boot cleanup: liberou %.2f GB de %d take dirs orfãos antigos",
+                freed / (1024 ** 3), deleted,
+            )
+    except Exception as e:
+        log.warning("Boot cleanup falhou (não-fatal): %s", e)
+
+    return coordinator
 
 
 def _resolve_editor_dir() -> Path | None:

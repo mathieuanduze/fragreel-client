@@ -792,6 +792,84 @@ class RenderCoordinator:
             self._session.progress = 0.85
             self._session.finished_at = time.time()
 
+    def cleanup_legacy_orphans(self, *, max_age_min: int = 5) -> tuple[int, int]:
+        """Bug #21 V2 (28/04, Mathieu pediu): cleanup retroativo de TGA
+        orfãos de sessões ANTIGAS que crasharam antes do fix do v0.4.6.
+
+        Bug #21 V1 (commit 0053c12) só limpa orfãos da sessão ATUAL via
+        `_cleanup_scratch_dirs(reason)` — não conhece takes pre-existentes
+        de versões antigas (v0.4.2/v0.4.3 etc) que crasharam silenciosamente.
+        Mathieu reportou 51.7 GB legacy no PC test. Pra evitar pedir
+        comando manual cada vez que isso aconteça, varremos no startup.
+
+        Lógica:
+        - Lista takeNNNN/ dentro de recording_parent (Steam/.../fragreel/)
+        - Filtra mtime > max_age_min atrás (5 min default — evita deletar
+          takes em uso por render concorrente que iniciou bem antes)
+        - rmtree cada um, somando bytes pra log
+
+        Roda apenas no startup (chamado por main.py). Não roda durante
+        operação normal — pra isso temos `_cleanup_scratch_dirs`.
+
+        Returns (dirs_deleted, bytes_freed_bytes).
+        """
+        record_root = self.config.recording_parent
+        if not record_root.exists():
+            return 0, 0
+
+        cutoff_time = time.time() - (max_age_min * 60)
+        dirs_deleted = 0
+        bytes_freed = 0
+
+        try:
+            children = list(record_root.iterdir())
+        except OSError as e:
+            log.warning("legacy cleanup: cannot list %s: %s", record_root, e)
+            return 0, 0
+
+        for child in children:
+            if not child.is_dir() or not child.name.startswith("take"):
+                continue
+            # Validate "takeNNNN" pattern (digits após "take")
+            try:
+                int(child.name[4:])
+            except ValueError:
+                continue
+            # Skip takes muito recentes (possível render concorrente).
+            # max_age_min=5 cobre 99% dos casos sem risco — render típica
+            # leva > 12min até primeiro take terminar.
+            try:
+                mtime = child.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > cutoff_time:
+                log.debug("legacy cleanup: skipping recent take %s", child.name)
+                continue
+
+            # Best-effort size sum + delete
+            try:
+                try:
+                    bytes_freed += sum(
+                        p.stat().st_size for p in child.rglob("*") if p.is_file()
+                    )
+                except OSError:
+                    pass  # alguns files podem ser unreadable, mesmo assim deleta
+                shutil.rmtree(child, ignore_errors=True)
+                # Confirma que deletou (rmtree ignore_errors pode falhar silent)
+                if not child.exists():
+                    dirs_deleted += 1
+                else:
+                    log.warning("legacy cleanup: %s still exists post-rmtree", child)
+            except OSError as e:
+                log.warning("legacy cleanup: cannot remove %s: %s", child, e)
+
+        if dirs_deleted > 0:
+            log.info(
+                "Legacy cleanup: removed %d orphan take dir(s), freed %.2f GB from %s",
+                dirs_deleted, bytes_freed / (1024 ** 3), record_root,
+            )
+        return dirs_deleted, bytes_freed
+
     def _mark_cancelled(self) -> None:
         with self._lock:
             if self._session is None:
