@@ -4,7 +4,7 @@ FragReel Client — entry point.
 Modelo on-demand:
   1. Detecta SteamID + todas as pastas onde o CS2 salva .dem
   2. Inicia a UploadQueue (worker único, on-demand via API local)
-  3. Sobe API HTTP local em 127.0.0.1:5775 — fragreel.vercel.app conversa com ela
+  3. Sobe API HTTP local em 127.0.0.1:5775 — fragreel.gg conversa com ela
   4. Aguarda comandos vindos da web (lista demos, dispara upload de uma específica)
 
 Usage:
@@ -291,14 +291,29 @@ def main() -> None:
     # ── Local API (web descobre demos + dispara uploads via 127.0.0.1:5775) ──
     from local_api import serve as serve_local_api
     serve_local_api(steamid=steamid, demo_dirs=demo_dirs, queue=queue, stop_event=_stop_event)
-    log.info("Pronto. Aguardando ações via fragreel.vercel.app …")
+    log.info("Pronto. Aguardando ações via fragreel.gg …")
+
+    # Bug #16 (28/04): fechar PyInstaller splash screen agora que boot
+    # completou. pyi_splash só existe quando rodando como .exe frozen com
+    # Splash() configurado no spec — em dev mode o módulo não existe, então
+    # try/except é gracioso.
+    try:
+        import pyi_splash  # type: ignore[import-not-found]
+        pyi_splash.close()
+        log.info("Splash screen closed")
+    except (ImportError, ModuleNotFoundError):
+        # Dev mode (não-frozen) — sem splash, sem problema
+        pass
+    except Exception as e:
+        log.warning(f"Splash close failed (non-fatal): {e}")
 
     # Notificação desktop confirmando que o client está vivo — sem isso, em modo
     # windowed (sem terminal preto) o user pode achar que não aconteceu nada.
+    # Bug #17 (28/04): URL atualizada de fragreel.vercel.app → fragreel.gg.
     try:
         from notifier import notify
         notify("FragReel está rodando",
-               "Pronto! Abra fragreel.vercel.app/library pra ver suas demos.")
+               "Pronto! Abra fragreel.gg/library pra ver suas demos.")
     except Exception:
         pass
 

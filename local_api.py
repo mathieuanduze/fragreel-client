@@ -68,7 +68,11 @@ log = logging.getLogger("fragreel.local_api")
 
 import re
 
+# Bug #17 (28/04): adicionado fragreel.gg (domínio próprio comprado).
+# Vercel mantido pra: (a) preview deploys de PR, (b) fallback se DNS quebrar.
 ALLOWED_ORIGINS = [
+    "https://fragreel.gg",
+    "https://www.fragreel.gg",
     "https://fragreel.vercel.app",
     re.compile(r"^https://.*\.vercel\.app$"),
     re.compile(r"^http://(localhost|127\.0\.0\.1):\d+$"),

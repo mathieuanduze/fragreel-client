@@ -12,8 +12,9 @@ CS2_DEMO_DIR = os.getenv("FRAGREEL_DEMO_DIR", "")
 # Polling fallback interval (seconds) if watchdog inotify fails
 POLL_INTERVAL = int(os.getenv("FRAGREEL_POLL_INTERVAL", "5"))
 
-# Dashboard URL opened after highlights are ready
-DASHBOARD_URL = os.getenv("FRAGREEL_DASHBOARD_URL", "https://fragreel.vercel.app")
+# Dashboard URL opened after highlights are ready.
+# Bug #17 (28/04): default agora é fragreel.gg (domínio próprio).
+DASHBOARD_URL = os.getenv("FRAGREEL_DASHBOARD_URL", "https://fragreel.gg")
 
 # Minimum file size (bytes) to consider a .dem valid (avoids temp files)
 MIN_DEMO_BYTES = 1024 * 50  # 50 KB

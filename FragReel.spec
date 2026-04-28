@@ -16,6 +16,7 @@ from PyInstaller.utils.hooks import collect_data_files
 PROJECT_ROOT = Path(os.path.abspath(os.getcwd()))
 VENDOR_DIR = PROJECT_ROOT / "vendor"
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+SPLASH_PATH = PROJECT_ROOT / "splash.png"
 
 
 def _bundle_tree(source: Path, dest_in_bundle: str) -> list[tuple[str, str]]:
@@ -111,12 +112,34 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
+# Bug #16 (28/04): Splash screen pra dar feedback visual durante extract
+# do .exe ONEFILE (5-15s pra extrair 354MB pra %TEMP% antes de iniciar
+# UI). Sem isso user pensa que travou.
+#
+# splash.png é gerado por generate_splash.py (480x360, brand FragReel +
+# "Carregando..."). main.py chama pyi_splash.close() após boot completo.
+# Splash() ausente sem erro se splash.png faltar — fallback gracioso.
+splash = None
+splash_binaries = []
+if SPLASH_PATH.is_file():
+    splash = Splash(
+        str(SPLASH_PATH),
+        binaries=a.binaries,
+        datas=a.datas,
+        text_pos=None,
+        text_size=12,
+        minify_script=True,
+        always_on_top=True,
+    )
+    splash_binaries = splash.binaries
+
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
     a.zipfiles,
     a.datas,
+    *([splash, splash_binaries] if splash else []),
     [],
     name='FragReel',
     debug=False,
