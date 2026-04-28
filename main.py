@@ -293,19 +293,21 @@ def main() -> None:
     serve_local_api(steamid=steamid, demo_dirs=demo_dirs, queue=queue, stop_event=_stop_event)
     log.info("Pronto. Aguardando ações via fragreel.gg …")
 
-    # Bug #16 (28/04): fechar PyInstaller splash screen agora que boot
-    # completou. pyi_splash só existe quando rodando como .exe frozen com
-    # Splash() configurado no spec — em dev mode o módulo não existe, então
-    # try/except é gracioso.
+    # Bug #18 (28/04): SPLASH desabilitado em v0.4.4 (FragReel.spec).
+    # v0.4.3 splash quebrou app por falta de tcl/tk DLLs. pyi_splash.close()
+    # mantido defensivo pra QUALQUER exceção (incluindo BaseException tipo
+    # SystemExit/KeyboardInterrupt) pra evitar 30 telas de erro reportado
+    # pelo Mathieu — qualquer traceback aqui não pode propagar.
     try:
         import pyi_splash  # type: ignore[import-not-found]
-        pyi_splash.close()
-        log.info("Splash screen closed")
-    except (ImportError, ModuleNotFoundError):
-        # Dev mode (não-frozen) — sem splash, sem problema
+        try:
+            pyi_splash.close()
+            log.info("Splash screen closed")
+        except BaseException as e:
+            log.warning(f"pyi_splash.close failed (non-fatal): {e!r}")
+    except BaseException:
+        # Splash desabilitado OU dev mode — sem problema
         pass
-    except Exception as e:
-        log.warning(f"Splash close failed (non-fatal): {e}")
 
     # Notificação desktop confirmando que o client está vivo — sem isso, em modo
     # windowed (sem terminal preto) o user pode achar que não aconteceu nada.

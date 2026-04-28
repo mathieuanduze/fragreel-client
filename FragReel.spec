@@ -11,7 +11,7 @@
 
 import os
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 PROJECT_ROOT = Path(os.path.abspath(os.getcwd()))
 VENDOR_DIR = PROJECT_ROOT / "vendor"
@@ -64,10 +64,21 @@ editor_datas = _bundle_tree(EDITOR_DIR_VENDOR, "editor") if EDITOR_DIR_VENDOR.is
 scripts_datas = _bundle_tree(SCRIPTS_DIR, "scripts")
 
 
+# Bug #18 (28/04, descoberto em v0.4.3 PC test): PyInstaller Splash() exige
+# Tcl/Tk DLLs (tcl86t.dll, tk86t.dll) bundled, mas eles NÃO são auto-coletados
+# unless tkinter está em hiddenimports + binaries explicitly.
+# Sintoma v0.4.3: "failed to load tcl DLL - tcl86t.dll não foi possível
+# encontrar o módulo especificado" + "SPLASH:Failed to load Tcl/Tk shared
+# libraries" → app não inicia.
+# Fix: collect_dynamic_libs('tcl') + collect_dynamic_libs('tk') puxa os
+# .dll nativos. Plus tkinter + _tkinter em hiddenimports pra garantir
+# Python wrapper layer também.
+tcl_tk_binaries = collect_dynamic_libs('tcl') + collect_dynamic_libs('tk')
+
 a = Analysis(
     ['main.py'],
     pathex=['.'],
-    binaries=[],
+    binaries=tcl_tk_binaries,
     datas=vendor_datas + node_datas + editor_datas + scripts_datas,
     hiddenimports=[
         'plyer.platforms.win.notification',
@@ -78,6 +89,12 @@ a = Analysis(
         'flask_cors',
         'werkzeug.serving',
         'demoparser2',
+        # Bug #18 (28/04): tkinter + _tkinter explicitly pra Splash()
+        # achar Tcl/Tk DLLs. PIL._tkinter_finder acima ajuda Pillow
+        # mas NÃO é suficiente pro splash bootloader.
+        'tkinter',
+        '_tkinter',
+        'tkinter.ttk',
         # polars + pyarrow são deps transitivas do demoparser2. parse_event()
         # tenta polars primeiro, pyarrow como fallback — sem ambos o Rust
         # faz .unwrap() num Err e estoura PanicException. Listamos as .lib
@@ -112,26 +129,34 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
-# Bug #16 (28/04): Splash screen pra dar feedback visual durante extract
-# do .exe ONEFILE (5-15s pra extrair 354MB pra %TEMP% antes de iniciar
-# UI). Sem isso user pensa que travou.
+# Bug #18 (28/04): SPLASH DESABILITADO TEMPORARIAMENTE em v0.4.4.
+# v0.4.3 introduziu Splash() mas PyInstaller bootloader falhou em loadar
+# tcl/tk DLLs ("failed to load tcl DLL - tcl86t.dll não foi possível
+# encontrar"), travando o app antes do Python iniciar. Erro é do bootloader
+# nativo, não do Python — try/except em main.py NÃO captura.
 #
-# splash.png é gerado por generate_splash.py (480x360, brand FragReel +
-# "Carregando..."). main.py chama pyi_splash.close() após boot completo.
-# Splash() ausente sem erro se splash.png faltar — fallback gracioso.
+# Fix preparado mas NÃO ativado nesta release:
+#   - collect_dynamic_libs('tcl')+('tk') adicionado em binaries (acima)
+#   - tkinter + _tkinter + tkinter.ttk em hiddenimports
+# Antes de re-ativar Splash(), preciso validar em ambiente PyInstaller
+# real (Windows VM ou GH Actions matrix com smoke test do .exe extraído).
+#
+# splash.png + generate_splash.py + main.py pyi_splash.close() ficam no
+# repo aguardando próxima rodada com smoke test dedicado.
 splash = None
 splash_binaries = []
-if SPLASH_PATH.is_file():
-    splash = Splash(
-        str(SPLASH_PATH),
-        binaries=a.binaries,
-        datas=a.datas,
-        text_pos=None,
-        text_size=12,
-        minify_script=True,
-        always_on_top=True,
-    )
-    splash_binaries = splash.binaries
+# DESABILITADO até validar tcl/tk bundle:
+# if SPLASH_PATH.is_file():
+#     splash = Splash(
+#         str(SPLASH_PATH),
+#         binaries=a.binaries,
+#         datas=a.datas,
+#         text_pos=None,
+#         text_size=12,
+#         minify_script=True,
+#         always_on_top=True,
+#     )
+#     splash_binaries = splash.binaries
 
 exe = EXE(
     pyz,
