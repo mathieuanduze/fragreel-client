@@ -79,22 +79,36 @@ FRAMES_PER_TICK = CAPTURE_FPS / CS2_TICKRATE
 CAPTURE_TIMEOUT_SEC = 3600.0
 
 # Disk preflight: 1080p TGA from CS2 ≈ 6.2 MB / frame. Round to 7 MB for
-# safety + filesystem overhead. Com v0.2.6 streaming convert, peak TGA
-# usage = o segmento ativo sendo capturado + no MÁXIMO o próximo segmento
-# esperando conversão — quase nunca chegam a sobrepor de verdade.
+# safety + filesystem overhead.
 #
-# v0.2.16 Bug #8 tuning: multiplicador 2× + 5 GB buffer estavam exigindo
-# ~74 GB livres pra um reel de 5 highlights, bloqueando SSDs de 256GB/512GB
-# comuns em PCs gamer mid-tier. Em 30+ captures de field test, o pico real
-# observado foi 1.2-1.3× o maior segmento (o converter raramente fica mais
-# de 1 segmento atrás), e o buffer de "overhead" (engine logs, audio.wav,
-# ProRes scratch) nunca passou de ~800 MB. Reduzimos pra 1.5× e 2 GB,
-# mantendo margem mas sem gatekeep agressivo.
+# Bug #22 (28/04, PC test): preflight subestimava peak real. PC observou
+# 3 takes simultâneos ocupando 51.7 GB (25.78 + 25.27 + 0.67) quando o
+# converter ficou pra trás (ProRes encoding lento OU disco lento). Crash
+# por ENOSPC em 3.5 GB livres mesmo com preflight tendo passado em 57 GB.
+#
+# Fix: usar TOTAL frames (não só max segment) × 1.0 × BYTES_PER_FRAME_TGA
+# como pior caso (todos os segmentos como TGAs simultâneos = converter
+# completamente atrás, qual aconteceu na sessão do PC). Plus DISK_SAFETY
+# elevado pra 5 GB (engine logs, audio.wav, OS swap, browser cache).
+#
+# Caveat: pode ser conservador demais pra users com SSDs rápidos onde
+# converter sempre acompanha. Aceitamos trade-off (false negative = user
+# vê mensagem clara "disco insuficiente" vs ENOSPC mid-render que perde
+# o trabalho).
 BYTES_PER_FRAME_TGA = 7_000_000
 # ProRes 4444 1080p ≈ 105 Mbps = ~110 KB/frame at 120 fps. Round up.
 BYTES_PER_FRAME_PRORES = 200_000
-DISK_SAFETY_BUFFER_BYTES = 2 * 1024 ** 3  # 2 GB (era 5 GB até v0.2.15)
-TGA_PEAK_OVERLAP_FACTOR = 1.5  # era 2.0 até v0.2.15
+DISK_SAFETY_BUFFER_BYTES = 5 * 1024 ** 3  # 5 GB (Bug #22, era 2 GB)
+TGA_PEAK_OVERLAP_FACTOR = 1.5   # mantido pra cálculo otimista (single-take peak)
+# Bug #22: cap pessimista. Se converter ficar atrás, todos N takes ficam
+# simultâneos. Multiplicar pelo total_frames assume worst case.
+TGA_WORST_CASE_FACTOR = 1.0     # 100% do total_frames como TGAs ao mesmo tempo
+
+# Bug #22: mid-capture disk monitor — aborta render se disco cair abaixo
+# desse threshold durante a captura (em vez de esperar ENOSPC explodir).
+# 3 GB dá ~430 frames de margem antes de quebrar (3 GB / 7 MB).
+MID_CAPTURE_DISK_FLOOR_BYTES = 3 * 1024 ** 3  # 3 GB
+MID_CAPTURE_DISK_CHECK_INTERVAL_SEC = 15.0    # checa a cada 15s
 
 
 class InsufficientDiskError(RuntimeError):
@@ -243,12 +257,16 @@ class RenderCoordinator:
         max_seg_frames = int(max(seg_ticks) * FRAMES_PER_TICK)
         total_frames = int(sum(seg_ticks) * FRAMES_PER_TICK)
 
-        # CS2 drive: streaming convert means peak = 1 active segment being
-        # captured + parte do próximo esperando conversão. Em v0.2.15 a
-        # gente usava 2× como "dois segmentos inteiros simultâneos" (pior
-        # caso paranoico), mas field data mostrou que o converter raramente
-        # fica mais de ~50% atrás. Ver TGA_PEAK_OVERLAP_FACTOR.
-        peak_tga_bytes = int(TGA_PEAK_OVERLAP_FACTOR * max_seg_frames * BYTES_PER_FRAME_TGA) + DISK_SAFETY_BUFFER_BYTES
+        # Bug #22 (28/04 PC test): peak ANTERIOR usava só max_seg × 1.5
+        # (assume converter acompanha). PC mostrou 3 takes simultâneos
+        # (51.7 GB orfãos) quando converter atrasou. Novo cálculo pega o
+        # MAIOR dos dois: optimistic (max_seg × OVERLAP_FACTOR) vs
+        # pessimistic (total_frames × WORST_CASE_FACTOR). Optimistic cobre
+        # SSDs rápidos comuns; pessimistic protege contra HDDs / discos
+        # cheios onde converter atrasa.
+        peak_optimistic = int(TGA_PEAK_OVERLAP_FACTOR * max_seg_frames * BYTES_PER_FRAME_TGA)
+        peak_pessimistic = int(TGA_WORST_CASE_FACTOR * total_frames * BYTES_PER_FRAME_TGA)
+        peak_tga_bytes = max(peak_optimistic, peak_pessimistic) + DISK_SAFETY_BUFFER_BYTES
         # Output drive: all ProRes .mov files land here + the final MP4.
         # MP4 is much smaller (~30 MB) so we just round into the buffer.
         output_bytes = total_frames * BYTES_PER_FRAME_PRORES + DISK_SAFETY_BUFFER_BYTES
@@ -440,6 +458,52 @@ class RenderCoordinator:
             )
             warmup_thread.start()
 
+            # Bug #22 (28/04 PC test): mid-capture disk monitor. PC reportou
+            # ENOSPC mid-capture (3.5 GB free) mesmo com preflight tendo
+            # passado em 57 GB. Causa: 3 takes simultâneos quando converter
+            # atrasou. Esse thread checa disk a cada 15s e ABORTA gracefully
+            # se chegar abaixo de MID_CAPTURE_DISK_FLOOR_BYTES — em vez de
+            # esperar ENOSPC explodir + render crashar + 51 GB orfãos.
+            disk_monitor_stop = threading.Event()
+            cs2_drive = self.config.recording_parent
+
+            def _disk_monitor() -> None:
+                while not disk_monitor_stop.is_set():
+                    if self._cancel_requested.is_set():
+                        return
+                    try:
+                        free = shutil.disk_usage(cs2_drive).free
+                    except OSError:
+                        # Drive sumiu — provavelmente unplug. Não-fatal aqui.
+                        free = -1
+                    if 0 < free < MID_CAPTURE_DISK_FLOOR_BYTES:
+                        log.error(
+                            "mid-capture disk monitor: %.2f GB livres em %s "
+                            "< floor %.1f GB → cancelando render pra evitar ENOSPC",
+                            free / (1024 ** 3), cs2_drive,
+                            MID_CAPTURE_DISK_FLOOR_BYTES / (1024 ** 3),
+                        )
+                        with self._lock:
+                            if self._session is not None:
+                                self._session.stage = (
+                                    f"abortado: disco quase cheio "
+                                    f"({free / (1024 ** 3):.1f} GB livres) — "
+                                    f"libere espaço e tente de novo"
+                                )
+                        # Trigger cancel flow — _run() vai cair no except
+                        # RenderCancelled, que faz _mark_cancelled() +
+                        # _cleanup_scratch_dirs(reason="cancel") (Bug #21).
+                        self._cancel_requested.set()
+                        return
+                    disk_monitor_stop.wait(timeout=MID_CAPTURE_DISK_CHECK_INTERVAL_SEC)
+
+            disk_monitor_thread = threading.Thread(
+                target=_disk_monitor,
+                name="fragreel-disk-monitor",
+                daemon=True,
+            )
+            disk_monitor_thread.start()
+
             def on_progress(now: int, prev: int) -> None:
                 # Bug #15: primeira frame chegou — para heartbeat warmup.
                 if not first_frame_seen.is_set():
@@ -542,6 +606,11 @@ class RenderCoordinator:
                 # in mov_dir lets us debug, but the reel is incomplete.
                 log.error("stream-convert failed mid-capture: %s", e)
                 raise
+            finally:
+                # Bug #22 (28/04): captura terminou (success/error/cancel)
+                # — para o disk monitor e o warmup heartbeat se ainda ativos.
+                disk_monitor_stop.set()
+                warmup_stop.set()
 
             # Backfill mov_paths into the result dataclass.
             result = result.with_movs(converted_movs)
@@ -676,6 +745,11 @@ class RenderCoordinator:
                 kill_running_cs2()
             except Exception:
                 pass
+            # Bug #21 (28/04, PC test): cleanup TGA take dirs + partial .movs
+            # MESMO em crash path. Antes desse fix, render falhado deixava
+            # ~25 GB de TGAs orfãos por take — em poucas tentativas o disco
+            # do user enchia (PC reportou 57 GB → 3.5 GB em 1 sessão).
+            self._cleanup_scratch_dirs(reason="crash")
 
     # -- helpers ------------------------------------------------------------
 
@@ -729,9 +803,21 @@ class RenderCoordinator:
             kill_running_cs2()
         except Exception:
             pass
-        # Best-effort scratch cleanup. v0.2.9 left orphan TGAs (multi-GB)
-        # and an empty <match_id>/ subdir under Desktop whenever a
-        # render was aborted — both reported as bug by testing user.
+        self._cleanup_scratch_dirs(reason="cancel")
+
+    def _cleanup_scratch_dirs(self, *, reason: str) -> None:
+        """Bug #21 (28/04, PC test): cleanup defensive de TGA take dirs +
+        partial .movs em QUALQUER caminho de saída (success, cancel, crash).
+
+        v0.4.5 e anteriores tinham essa lógica inline em _mark_cancelled —
+        crash path (`except Exception`) só fazia kill_running_cs2() e deixava
+        51+ GB de TGAs orfãos por render falhado. PC reportou disco caindo
+        de 57 GB → 3.5 GB livres em poucas tentativas (cada take ~25 GB).
+
+        `reason` apenas pra log distinguir cancel vs crash vs sucesso parcial.
+        Best-effort em tudo: failures aqui são logged mas não propagam (não
+        queremos cleanup quebrar o terminal state da render).
+        """
         record_root = self._active_record_root
         pre_take = self._active_pre_take
         if record_root is not None:
@@ -741,16 +827,16 @@ class RenderCoordinator:
                 )
                 if deleted:
                     log.info(
-                        "cancel cleanup: removed %d orphan take dir(s), freed %.2f GB",
-                        deleted, freed / (1024 ** 3),
+                        "%s cleanup: removed %d orphan take dir(s), freed %.2f GB",
+                        reason, deleted, freed / (1024 ** 3),
                     )
             except Exception as e:
-                log.warning("cancel cleanup (take dirs) failed: %s", e)
+                log.warning("%s cleanup (take dirs) failed: %s", reason, e)
         mov_dir = self._active_mov_dir
         if mov_dir is not None and mov_dir.exists():
             try:
                 # mov_dir may have partial .movs from segments finalized
-                # before cancel. Delete them + the now-empty parent so
+                # before crash/cancel. Delete them + the now-empty parent so
                 # Desktop doesn't accumulate `fragreel/<match_id>/` shells.
                 for p in mov_dir.iterdir():
                     try:
@@ -763,6 +849,6 @@ class RenderCoordinator:
                 except OSError:
                     pass  # non-empty (subdir we don't understand) — leave it
             except Exception as e:
-                log.warning("cancel cleanup (mov dir %s) failed: %s", mov_dir, e)
+                log.warning("%s cleanup (mov dir %s) failed: %s", reason, mov_dir, e)
         self._active_record_root = None
         self._active_mov_dir = None
