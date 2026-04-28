@@ -39,7 +39,7 @@ from client_config import (
 )
 from hlae_runner import HlaeRunnerConfig, RenderPlan
 from render_coordinator import InsufficientDiskError, RenderCoordinator
-from scanner import scan_all, _load_cache as _load_scan_cache, get_cached_processing
+from scanner import scan_all, _load_cache as _load_scan_cache, get_cached_processing, clear_cached_processing
 from uploader import UploadQueue
 from version import __version__ as CLIENT_VERSION
 
@@ -228,6 +228,23 @@ def create_app(
         if not path.exists():
             return {"error": "file_missing"}, 410
 
+        # Bug #10 fix V2 (28/04 — Mathieu reportou ciclo infinito):
+        # ?force=true bypassa cache E invalida o match_id local stale.
+        # Frontend usa quando detecta 404 no /match/{id} (server perdeu
+        # dados após Railway redeploy). Sem isso o ciclo era:
+        #   1. user clica "Mapear" → cache hit retorna match_id antigo
+        #   2. /match/{antigo} → 404 (server perdeu)
+        #   3. user volta → demo ainda mostra "processada" → loop.
+        # Com ?force=true a invalidação local quebra o ciclo + dispara
+        # upload real → novo match_id válido.
+        force = request.args.get("force", "").lower() in ("1", "true", "yes")
+        if force:
+            log.info("/demos/%s/upload — force=true: invalidando cache local + re-upload", sha)
+            try:
+                clear_cached_processing(path)
+            except Exception as e:
+                log.warning("/demos/%s/upload — clear cache falhou: %s (não-fatal)", sha, e)
+
         # v0.2.16 Bug #6v3 (cache-hit cold-start):
         # A versão anterior confiava na rama "cache HIT [web]" dentro de
         # uploader.enqueue(), que recomputa a sha via _sha1_quick(path). Na
@@ -242,7 +259,8 @@ def create_app(
         # Se a cache em disco tem match_id pra ESSA sha, força o job
         # direto no dicionário sob essa sha e responde 200 imediatamente,
         # sem passar pelo enqueue/recomputação.
-        cached = get_cached_processing(path)
+        # NOTA: skipar esse bloco quando force=true (já invalidamos acima).
+        cached = None if force else get_cached_processing(path)
         if cached and cached.get("match_id"):
             match_id = cached["match_id"]
             highlights = int(cached.get("highlights") or 0)

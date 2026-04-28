@@ -382,3 +382,30 @@ def get_cached_processing(path: Path) -> Optional[dict]:
     if entry and entry.get("match_id"):
         return dict(entry)
     return None
+
+
+def clear_cached_processing(path: Path) -> bool:
+    """Bug #10 fix V2 (28/04, Mathieu): apaga match_id + processed_at do
+    cache local pra essa demo, forçando próxima request a fazer upload real.
+
+    Usado quando frontend detecta que server perdeu o match_id (Railway
+    storage ephemeral resetou após redeploy). Sem isso, get_cached_processing
+    continua retornando match_id antigo → cache hit → /match/{stale} 404
+    → loop infinito.
+
+    Returns True se removeu algo, False se não tinha cache pra essa sha.
+    Outros campos da entry (mtime, size, map_name, etc) são preservados —
+    só limpa os campos de "processado".
+    """
+    cache = _load_cache()
+    sha = _sha1_quick(path)
+    entry = cache.get(sha)
+    if not entry:
+        return False
+    if not entry.get("match_id") and not entry.get("processed_at"):
+        return False
+    # Preserva metadata estática, limpa só campos de processamento
+    cleared = {k: v for k, v in entry.items() if k not in ("match_id", "processed_at", "highlights")}
+    cache[sha] = cleared
+    _save_cache(cache)
+    return True
