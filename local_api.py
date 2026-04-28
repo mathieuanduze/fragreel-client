@@ -299,6 +299,54 @@ def create_app(
             return {"error": "no_such_job"}, 404
         return jsonify(job)
 
+    # ── Sprint I.5 — local matches endpoints ──────────────────────────────
+    # Espelha o que Railway oferecia em /matches/{id}. Web (fragreel.gg)
+    # consulta o cliente local primeiro (Sprint I.5 Fase 5: web getMatch
+    # com fallback Railway). Match docs vêm de
+    # `api_client.parse_and_score_locally()` salvos via
+    # `local_matches_store.save_match()`.
+
+    @app.get("/matches/<match_id>")
+    def get_match(match_id: str):
+        """Retorna match_doc local (parse_and_score_locally output).
+
+        Returns 404 se match_id não existe localmente — web pode fazer
+        fallback pro Railway.
+        """
+        try:
+            from local_matches_store import load_match
+        except ImportError:
+            return {"error": "local_matches_store_unavailable"}, 500
+
+        match_doc = load_match(match_id)
+        if match_doc is None:
+            return {"error": "not_found", "match_id": match_id}, 404
+        return jsonify(match_doc)
+
+    @app.get("/matches")
+    def list_matches_endpoint():
+        """Lista summary de todos matches locais (sorted desc por mtime)."""
+        try:
+            from local_matches_store import list_matches
+        except ImportError:
+            return {"error": "local_matches_store_unavailable"}, 500
+        summaries = list_matches()
+        return jsonify({"matches": summaries, "count": len(summaries)})
+
+    @app.delete("/matches/<match_id>")
+    def delete_match_endpoint(match_id: str):
+        """Remove match_doc local (user pediu pra refazer scoring).
+
+        Web pode chamar quando user quer "re-mapear" sem trigger automático
+        do AutoReanalyze (Bug #10 V2). Não toca a .dem em disco.
+        """
+        try:
+            from local_matches_store import delete_match
+        except ImportError:
+            return {"error": "local_matches_store_unavailable"}, 500
+        ok = delete_match(match_id)
+        return jsonify({"deleted": ok, "match_id": match_id})
+
     # ── Render endpoints (HLAE capture pipeline) ───────────────────────
 
     @app.get("/render/preflight")
@@ -1050,6 +1098,16 @@ def _build_render_coordinator() -> Optional[RenderCoordinator]:
             log.info("Boot cleanup: nenhum take orfão pra remover (limpo)")
     except Exception as e:
         log.warning("Boot cleanup falhou (não-fatal): %s", e)
+
+    # Sprint I.5 — cleanup matches locais > 30 dias old (lifecycle pra
+    # manter %APPDATA%/FragReel/matches/ enxuto). Falhas non-fatal.
+    try:
+        from local_matches_store import cleanup_old_matches
+        n_removed = cleanup_old_matches(max_age_days=30)
+        if n_removed > 0:
+            log.info("Boot cleanup matches: removeu %d matches > 30 dias", n_removed)
+    except Exception as e:
+        log.warning("Boot cleanup matches falhou (não-fatal): %s", e)
 
     return coordinator
 

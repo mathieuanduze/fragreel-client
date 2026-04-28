@@ -46,6 +46,13 @@ log = logging.getLogger("fragreel.uploader")
 # produção. Ative com FRAGREEL_API_CROSS_CHECK=1 pra validação.
 _CROSS_CHECK_ENABLED = os.environ.get("FRAGREEL_API_CROSS_CHECK", "").lower() in ("1", "true", "yes")
 
+# Sprint I.5 — full migration flag. Quando ON, cliente NÃO uploads .dem
+# pro Railway — parseia local + chama Vercel /api/score + salva match doc
+# em ~/.fragreel/matches/ (servido por local_api /matches/{id}).
+# Default OFF inicialmente (rollout gradual). User opt-in via env var,
+# ou default ON em v0.5.x quando estável.
+_USE_API_ENABLED = os.environ.get("FRAGREEL_USE_API", "").lower() in ("1", "true", "yes")
+
 MAX_RETRIES = 3
 RETRY_BACKOFF = 5  # segundos entre tentativas
 
@@ -236,6 +243,58 @@ class UploadQueue:
                 if self._queue.empty():
                     self.on_event("idle", {})
 
+    def _process_local_api(
+        self, job: UploadJob, path: Path, sha: str,
+    ) -> None:
+        """Sprint I.5 (28/04 noite): pipeline LOCAL — parse + score API + save local.
+
+        Substitui o flow Railway upload quando FRAGREEL_USE_API=1.
+        Failures aqui são propagadas pro caller (que faz fallback Railway).
+
+        Steps:
+        1. api_client.parse_and_score_locally(path, steamid) → match_doc
+           (parseia .dem local + chama /api/score TS + builds match doc)
+        2. local_matches_store.save_match(match_id, match_doc) → disco
+        3. mark_processed(sha, match_id, highlights) → cache scanner
+        4. self.on_event("done", ...) → tray + UI feedback
+
+        Sem upload de bytes pro Railway. Toda a inteligência vem da API
+        (scorer.ts) ou fallback offline_lite. Match doc fica em
+        ~/.fragreel/matches/<match_id>.json, servido por
+        local_api.py /matches/{id}.
+        """
+        from api_client import parse_and_score_locally
+        from local_matches_store import save_match
+
+        self.on_event("uploading", {"path": str(path), "sha": sha, "attempt": 1})
+        t0 = time.time()
+
+        match_doc = parse_and_score_locally(path, self.steamid)
+
+        match_id = match_doc.get("id") or path.stem
+        highlights_count = match_doc.get("highlights_count", 0)
+        scoring_source = match_doc.get("scoring_source", "unknown")
+
+        # Salva match_doc em disco pra local_api /matches/{id} servir
+        save_match(match_id, match_doc)
+
+        # Cache scanner (compat com Bug #6v2 cache-hit fast path)
+        mark_processed(sha, match_id, highlights=highlights_count)
+
+        duration = round(time.time() - t0, 1)
+        log.info(
+            "✓ Sprint I.5: %s → match_id=%s (%d highlights, source=%s, %ds total)",
+            path.name, match_id, highlights_count, scoring_source, duration,
+        )
+        self.on_event("done", {
+            "path": str(path),
+            "sha": sha,
+            "match_id": match_id,
+            "highlights": highlights_count,
+            "duration_s": duration,
+            "scoring_source": scoring_source,
+        })
+
     def _process(self, job: UploadJob) -> None:
         path = job.demo_path
         sha = _sha1_quick(path) if path.exists() else ""
@@ -247,6 +306,23 @@ class UploadQueue:
             log.warning(f"Não estabilizou: {path.name}")
             self.on_event("failed", {"path": str(path), "sha": sha, "error": "file_not_stable"})
             return
+
+        # Sprint I.5 — branch arquitetural por flag opt-in.
+        # Default (legacy): upload .dem inteiro pro Railway, scoring server-side.
+        # FRAGREEL_USE_API=1 (novo): parse local + Vercel /api/score + save local.
+        if _USE_API_ENABLED:
+            try:
+                self._process_local_api(job, path, sha)
+            except Exception as e:
+                log.error(
+                    "Sprint I.5: parse_and_score_locally falhou pra %s: %s — "
+                    "FALLBACK pro Railway upload",
+                    path.name, e,
+                )
+                # Fallback gracioso: se Sprint I.5 path falha, tenta Railway
+                # (preserva UX enquanto migração estabiliza)
+            else:
+                return  # sucesso Sprint I.5, skip Railway upload
 
         for attempt in range(1, MAX_RETRIES + 1):
             job.attempts = attempt

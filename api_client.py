@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -277,6 +278,201 @@ def score_with_fallback(
     except ApiUnavailable as e:
         log.info("score_via_api unavailable (%s) — using offline_lite", e)
         return score_offline_lite(parsed_demo, player_steamid), "offline_lite"
+
+
+# ── Sprint I.5 — Full migration end-to-end (parse local + score API) ─────────
+
+
+def parse_and_score_locally(
+    demo_path: "PathLike",
+    player_steamid: str,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> dict[str, Any]:
+    """Sprint I.5 (28/04 noite): pipeline completo CLIENT-SIDE — parse local
+    da .dem + score via API + build match doc no schema do Railway.
+
+    Substitui o flow legacy:
+        client → upload .dem (50-200MB) → Railway → parse + score → match_id
+
+    Pelo flow novo:
+        client → parse_and_score_locally(demo_path) → match_doc
+
+    Output: dict no MESMO schema que Railway retornava em /matches/{id},
+    pra cliente expor via /matches/{id} no local_api.py (Fase 3 de Sprint I.5)
+    e pra web consumir transparente.
+
+    Args:
+        demo_path: Path do .dem local
+        player_steamid: SteamID do user (pra filtrar player_kills)
+        timeout: timeout HTTP pra /api/score (default 5s)
+
+    Returns:
+        match_doc: dict com chaves esperadas por web/lib/api.ts:
+            - id, map, date, score, status, highlights_count, top_play
+            - rating, kd, stats {kd, hs, adr, rating}
+            - player_name, game_mode
+            - highlights[] (cada um com rank, label, narrative, score, start,
+              end, kills, kill_ticks/timestamps, alive_timeline,
+              clutch_situation, won_round, bomb_action, etc)
+
+    Raises:
+        FileNotFoundError: demo path inválido
+        RuntimeError: demoparser2 não disponível (build incompleto)
+        ApiUnavailable: /api/score down + sem fallback offline_lite ainda
+                        (Sprint I.5 minimal version dispara fallback se
+                        FRAGREEL_USE_API_FALLBACK=1, senão raise)
+        ApiSchemaError: client/server schema mismatch — propagar pra UI
+                        mostrar "atualize o FragReel"
+    """
+    from pathlib import Path
+    from local_parser.demo_parser import parse as _parse  # type: ignore[import-not-found]
+
+    demo_path = Path(demo_path)
+    if not demo_path.exists():
+        raise FileNotFoundError(f"demo not found: {demo_path}")
+
+    log.info("Sprint I.5: parsing local %s (steamid=%s)", demo_path.name, player_steamid)
+    t0 = time.time()
+    parsed = _parse(demo_path, player_steamid=player_steamid)
+    parse_ms = int((time.time() - t0) * 1000)
+    log.info(
+        "Sprint I.5: parse OK em %dms — %d player_kills, %d all_kills, "
+        "%d bomb_events, %d round_states, map=%s",
+        parse_ms, len(parsed.player_kills), len(parsed.all_kills),
+        len(parsed.bomb_events), len(parsed.round_states), parsed.map_name,
+    )
+
+    # Score via /api/score (TS scorer, validado bit-exact com Python no
+    # Sprint I.4). Fallback LITE se API down e flag opt-in setada.
+    fallback_enabled = os.environ.get("FRAGREEL_USE_API_FALLBACK", "1").lower() in (
+        "1", "true", "yes"
+    )
+
+    t1 = time.time()
+    try:
+        highlights = score_via_api(parsed, player_steamid, timeout=timeout)
+        scoring_source = "api"
+    except ApiUnavailable as e:
+        if not fallback_enabled:
+            log.error("Sprint I.5: API down + FRAGREEL_USE_API_FALLBACK=0 → propagando")
+            raise
+        log.warning(
+            "Sprint I.5: /api/score down (%s), fallback LITE — qualidade reduzida", e
+        )
+        highlights = score_offline_lite(parsed, player_steamid)
+        scoring_source = "offline_lite"
+    score_ms = int((time.time() - t1) * 1000)
+    log.info(
+        "Sprint I.5: scoring OK em %dms — %d highlights (source=%s)",
+        score_ms, len(highlights), scoring_source,
+    )
+
+    # Build match_doc — schema espelha Railway pro web ler transparente.
+    match_id = demo_path.stem  # ex: "match730_003abc" from "match730_003abc.dem"
+    match_doc = _build_match_doc(parsed, highlights, match_id, scoring_source)
+
+    return match_doc
+
+
+def _build_match_doc(
+    parsed: Any,
+    highlights: list[HighlightFromApi],
+    match_id: str,
+    scoring_source: str,
+) -> dict[str, Any]:
+    """Constrói match_doc no schema esperado por web (espelha Railway).
+
+    Schema source: api/routes/demo.py em fragreel repo, build do match_doc
+    pós-parse + score (linhas 88-172). Mantemos compatibilidade pra web não
+    precisar mudar consumo.
+    """
+    from datetime import datetime, timezone
+
+    total_kills = len(parsed.player_kills)
+    hs_kills = sum(1 for k in parsed.player_kills if k.headshot)
+
+    player_deaths = (
+        sum(
+            1 for k in parsed.all_kills
+            if k.victim_steamid == parsed.player_steamid
+        )
+        if parsed.player_steamid
+        else (len(parsed.all_kills) - total_kills)
+    )
+
+    rounds_from_score = parsed.ct_score + parsed.t_score
+    rounds_from_kills = max((k.round_num for k in parsed.all_kills), default=1)
+    total_rounds = max(rounds_from_score, rounds_from_kills, 1)
+
+    adr_approx = round((total_kills * 100) / total_rounds, 1)
+    kd_approx = f"{total_kills}/{player_deaths}"
+    rating = _estimate_rating(total_kills, total_rounds)
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    return {
+        # Identity
+        "steamid": parsed.player_steamid or "",
+        "player_name": parsed.player_name,
+        "game_mode": parsed.game_mode,
+        # Summary fields (for list view)
+        "id": match_id,
+        "map": parsed.map_name,
+        "date": today,
+        "score": f"{parsed.ct_score}–{parsed.t_score}",
+        "side": "ct",  # Static — Railway tinha mesma constante (compat)
+        "status": "parsed",
+        "highlights_count": len(highlights),
+        "top_play": highlights[0].label if highlights else "—",
+        "rating": rating,
+        "kd": kd_approx,
+        # Sprint I.5 specific — telemetria de qual scorer foi usado
+        "scoring_source": scoring_source,  # "api" | "offline_lite"
+        # Detail fields (for match view)
+        "stats": {
+            "kd": kd_approx,
+            "hs": f"{round(hs_kills / total_kills * 100)}%" if total_kills else "0%",
+            "adr": str(adr_approx),
+            "rating": rating,
+        },
+        "highlights": [
+            {
+                "rank": h.rank,
+                "round_num": h.round_num,
+                "label": h.label,
+                "narrative": h.narrative,
+                "score": h.score,
+                "start": h.start,
+                "end": h.end,
+                "kills": h.kills,
+                "clutch_situation": h.clutch_situation,
+                "won_round": h.won_round,
+                "bomb_action": h.bomb_action,
+                "is_round_winning_kill": h.is_round_winning_kill,
+                "kill_ticks": h.kill_ticks,
+                "kill_timestamps": h.kill_timestamps,
+                "alive_timeline": h.alive_timeline,
+                "bomb_action_tick": getattr(h, "bomb_action_tick", None),
+                "bomb_action_timestamp": getattr(h, "bomb_action_timestamp", None),
+            }
+            for h in highlights
+        ],
+    }
+
+
+def _estimate_rating(kills: int, rounds: int) -> str:
+    """Approx rating 2.0 — mesma fórmula do Railway."""
+    if rounds <= 0:
+        return "1.00"
+    kpr = kills / rounds  # kills per round
+    # Magic numbers from Railway api/routes/demo.py
+    rating = 0.0073 * 100.0 + 0.3591 * kpr + 0.5329
+    return f"{rating:.2f}"
+
+
+# Type alias for clarity
+PathLike = Any  # accepts str | os.PathLike
 
 
 # ── Internals ─────────────────────────────────────────────────────────────────
