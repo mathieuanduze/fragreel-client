@@ -77,6 +77,28 @@ logging.basicConfig(
 log = logging.getLogger("fragreel")
 log.info(f"=== FragReel iniciando · log em {LOG_FILE} ===")
 
+# Sprint I.5 mode visibility (28/04 PC test sugestão): logar explicitamente
+# se FRAGREEL_USE_API está ativo pra debug futuro fácil. PC reportou que
+# antes só dava pra inferir o mode pelo comportamento posterior — dificulta
+# diagnóstico quando algo dá errado.
+_use_api_flag = os.environ.get("FRAGREEL_USE_API", "").lower() in ("1", "true", "yes")
+_cross_check_flag = os.environ.get("FRAGREEL_API_CROSS_CHECK", "").lower() in ("1", "true", "yes")
+if _use_api_flag:
+    log.info(
+        "Sprint I.5 mode: ENABLED (FRAGREEL_USE_API=1) — cliente parseia local "
+        "+ chama Vercel /api/score, salva match_doc em ~/.fragreel/matches/"
+    )
+elif _cross_check_flag:
+    log.info(
+        "Sprint I.4 mode: ENABLED (FRAGREEL_API_CROSS_CHECK=1) — cliente envia "
+        "demo pro Railway + cross-check paralelo com /api/score"
+    )
+else:
+    log.info(
+        "Pipeline mode: LEGACY (Railway scoring). "
+        "Set FRAGREEL_USE_API=1 pra Sprint I.5 (parse local + Vercel TS scorer)."
+    )
+
 _stop_event = threading.Event()
 _BOOT_TIME = time.time()
 
