@@ -10,11 +10,19 @@ Por que uma fila?
 Uma única thread de worker consome a fila. Cada item é uploaded com retry
 e, ao terminar, marca a demo no cache do scanner para nunca mais ser
 re-processada.
+
+Sprint I.4 (28/04, validation cross-check): se env FRAGREEL_API_CROSS_CHECK=1,
+após receber resposta do Railway com highlights (Python scorer), passa
+events parseados pelo Railway pro fragreel.gg/api/score (TS scorer) e
+compara highlights field-a-field. Loga divergências em fragreel.log pra
+detectar drift entre os dois scorers em produção real, ANTES de migrar
+pro TS scorer no Sprint I.5.
 """
 from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import queue
 import threading
 import time
@@ -33,6 +41,10 @@ from scanner import (
 )
 
 log = logging.getLogger("fragreel.uploader")
+
+# Sprint I.4 — cross-check opt-in flag. Default OFF: zero impact em
+# produção. Ative com FRAGREEL_API_CROSS_CHECK=1 pra validação.
+_CROSS_CHECK_ENABLED = os.environ.get("FRAGREEL_API_CROSS_CHECK", "").lower() in ("1", "true", "yes")
 
 MAX_RETRIES = 3
 RETRY_BACKOFF = 5  # segundos entre tentativas
@@ -242,10 +254,16 @@ class UploadQueue:
             t0 = time.time()
             try:
                 with path.open("rb") as f:
+                    # Sprint I.4: include_events=true quando cross-check opt-in
+                    # ativo. Railway responde com events parseados pra cliente
+                    # comparar com /api/score (TS scorer) em paralelo.
+                    params = {"steamid": self.steamid}
+                    if _CROSS_CHECK_ENABLED:
+                        params["include_events"] = "true"
                     resp = requests.post(
                         f"{API_URL}/demo/analyze",
                         files={"file": (path.name, f, "application/octet-stream")},
-                        params={"steamid": self.steamid},
+                        params=params,
                         timeout=180,
                     )
                 resp.raise_for_status()
@@ -260,6 +278,22 @@ class UploadQueue:
 
                 duration = round(time.time() - t0, 1)
                 log.info(f"✓ {path.name} → match_id={match_id} ({highlights} highlights, {duration}s)")
+
+                # Sprint I.4 cross-check (silencioso, não-disruptivo):
+                # compara Railway Python scorer vs Vercel TS scorer pra
+                # detectar drift em produção. Failures aqui são logged mas
+                # não afetam o fluxo principal — flag opt-in via env var.
+                if _CROSS_CHECK_ENABLED and "events" in data:
+                    try:
+                        _run_api_cross_check(
+                            data, match_id=match_id, demo_basename=path.name
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "Sprint I.4 cross-check raised (non-fatal): %s: %s",
+                            type(e).__name__, e,
+                        )
+
                 self.on_event("done", {
                     "path": str(path),
                     "sha": sha,
@@ -299,3 +333,184 @@ def _is_stable(path: Path, wait: float = 2.0) -> bool:
         return a == b and b >= MIN_DEMO_BYTES
     except FileNotFoundError:
         return False
+
+
+# ── Sprint I.4 — Cross-check Railway vs Vercel TS scorer ──────────────────────
+
+
+def _run_api_cross_check(
+    railway_data: dict,
+    *,
+    match_id: str,
+    demo_basename: str,
+) -> None:
+    """Sprint I.4 (28/04): compara Railway Python scorer vs Vercel TS scorer.
+
+    Recebe `railway_data` (resposta do /demo/analyze com `?include_events=true`),
+    extrai os events parseados pelo Railway, manda pro fragreel.gg/api/score
+    (TS scorer), e compara highlights field-a-field. Loga divergências.
+
+    Não bloqueia o fluxo principal — silent failure se API down ou response
+    incompatível. Objetivo é COLETAR DATA em produção pra validar que
+    portar pro TS scorer (Sprint I.5) é seguro.
+
+    Args:
+        railway_data: dict da resposta do POST /demo/analyze (inclui events,
+            demo_meta, player_steamid quando ?include_events=true)
+        match_id: pra logging/correlação
+        demo_basename: pra logging
+    """
+    events = railway_data.get("events")
+    demo_meta = railway_data.get("demo_meta")
+    player_steamid = railway_data.get("player_steamid")
+    if not events or not demo_meta or not player_steamid:
+        log.debug(
+            "Sprint I.4 cross-check skip (match=%s): payload incompleto. "
+            "events=%s demo_meta=%s player_steamid=%s",
+            match_id, bool(events), bool(demo_meta), bool(player_steamid),
+        )
+        return
+
+    # Build payload pro Vercel /api/score
+    api_payload = {
+        "schema_version": "1",
+        "client_version": _client_version(),
+        "demo_meta": demo_meta,
+        "player_steamid": player_steamid,
+        "events": events,
+    }
+
+    api_url = os.environ.get("FRAGREEL_API_URL", "https://fragreel.gg").rstrip("/")
+    score_endpoint = f"{api_url}/api/score"
+
+    t0 = time.time()
+    try:
+        resp = requests.post(
+            score_endpoint,
+            json=api_payload,
+            headers={"Content-Type": "application/json"},
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        log.warning(
+            "Sprint I.4 cross-check (match=%s): API call failed: %s",
+            match_id, e,
+        )
+        return
+
+    api_call_ms = int((time.time() - t0) * 1000)
+
+    if resp.status_code != 200:
+        log.warning(
+            "Sprint I.4 cross-check (match=%s): /api/score HTTP %d: %s",
+            match_id, resp.status_code, resp.text[:300],
+        )
+        return
+
+    api_response = resp.json()
+    api_highlights = api_response.get("highlights", [])
+    scorer_version = api_response.get("scorer_version", "unknown")
+
+    # Get Railway highlights from a separate call to /matches/{id} —
+    # mais limpo do que tentar parsear o resumo do /demo/analyze
+    # que só tem o count, não os highlights inteiros.
+    try:
+        match_resp = requests.get(
+            f"{API_URL}/matches/{match_id}",
+            timeout=10,
+        )
+        match_resp.raise_for_status()
+        match_data = match_resp.json()
+        railway_highlights = match_data.get("highlights", [])
+    except requests.RequestException as e:
+        log.warning(
+            "Sprint I.4 cross-check (match=%s): falhou buscar highlights "
+            "do Railway pra comparar: %s",
+            match_id, e,
+        )
+        return
+
+    # Comparação minimalista — campos críticos
+    diffs = _compare_highlights(railway_highlights, api_highlights)
+
+    if not diffs:
+        log.info(
+            "Sprint I.4 cross-check ✅ MATCH (match=%s, demo=%s, "
+            "api_ms=%d, scorer=%s, n_highlights=%d): Railway Python == Vercel TS",
+            match_id, demo_basename, api_call_ms, scorer_version,
+            len(railway_highlights),
+        )
+    else:
+        log.warning(
+            "Sprint I.4 cross-check ❌ DIVERGENCE (match=%s, demo=%s, "
+            "api_ms=%d, scorer=%s, n_diffs=%d): Railway Python ≠ Vercel TS",
+            match_id, demo_basename, api_call_ms, scorer_version, len(diffs),
+        )
+        for diff in diffs[:10]:  # Cap pra não inflacionar log
+            log.warning("  diff: %s", diff)
+        if len(diffs) > 10:
+            log.warning("  ... and %d more diffs (truncated)", len(diffs) - 10)
+
+
+def _compare_highlights(
+    railway_highlights: list[dict],
+    api_highlights: list[dict],
+) -> list[str]:
+    """Compara highlights field-a-field. Retorna lista de strings descrevendo
+    divergências. Vazia = bit-exact match.
+
+    Compara campos críticos: rank, round_num, score, label, narrative,
+    clutch_situation, won_round, bomb_action, is_round_winning_kill.
+    Tolerância 0.05 pra floats (start/end timestamps).
+    """
+    diffs: list[str] = []
+
+    if len(railway_highlights) != len(api_highlights):
+        diffs.append(
+            f"count mismatch: railway={len(railway_highlights)} "
+            f"vs api={len(api_highlights)}"
+        )
+        return diffs  # Sem comparação detalhada se contagem difere
+
+    fields_exact = (
+        "rank", "round_num", "label", "narrative",
+        "clutch_situation", "won_round", "bomb_action",
+        "is_round_winning_kill",
+    )
+    fields_float = ("score", "start", "end")
+
+    for i, (rwy, api) in enumerate(zip(railway_highlights, api_highlights)):
+        for f in fields_exact:
+            rv = rwy.get(f)
+            av = api.get(f)
+            if rv != av:
+                diffs.append(
+                    f"#{i+1} R{rwy.get('round_num')} {f}: "
+                    f"railway={rv!r} vs api={av!r}"
+                )
+        for f in fields_float:
+            rv = rwy.get(f)
+            av = api.get(f)
+            if rv is None or av is None:
+                if rv != av:
+                    diffs.append(f"#{i+1} {f}: railway={rv} vs api={av}")
+                continue
+            try:
+                if abs(float(rv) - float(av)) > 0.05:
+                    diffs.append(
+                        f"#{i+1} R{rwy.get('round_num')} {f}: "
+                        f"railway={rv} vs api={av} (Δ={abs(float(rv) - float(av)):.3f})"
+                    )
+            except (TypeError, ValueError):
+                pass
+
+    return diffs
+
+
+def _client_version() -> str:
+    """Lê __version__ do version.py pra incluir no payload do /api/score."""
+    try:
+        from version import __version__
+        return __version__
+    except Exception:
+        return "unknown"
