@@ -106,35 +106,59 @@ jobs:
       # compiled JS de cada pacote npm — Remotion precisa deles em runtime).
       # Round 4c teve 36 fases pra resolver bug parecido — NÃO regredir.
       #
-      # Strategy: usar 7z com -x! (não-recursive exclude) pra remover SÓ os
-      # build outputs do top-level editor, preservando tudo dentro de
-      # node_modules/. Validation pós-zip via 7z l + findstr garante.
+      # Strategy: usar Python inline com lógica path-aware (mesmo padrão de
+      # setup_editor.py SKIP_DIRS path-aware do v0.4.5+). Garante semântica
+      # consistente entre CI zip e copy_editor_to_vendor. Skip dirs SÓ no
+      # top-level do editor (não recursive em node_modules).
+      #
+      # Histórico: tentamos 7z primeiro mas 7-Zip 26.x rejeitou syntax
+      # -xr! ("Too short switch r!"). Python é portable + previsível.
       - name: Create vendor-editor.zip pra Sprint J runtime download
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
-          cd vendor/editor
-          # 7z já disponível no runner Windows
-          # -x!dist (sem recursive) pula `vendor/editor/dist` mas preserva
-          # `vendor/editor/node_modules/@remotion/cli/dist/` etc.
-          7z a -tzip -mx=5 ../../vendor-editor.zip . `
-            -xr!.git -xr!.next -xr!.vercel -xr!.turbo `
-            -x!dist -x!build -x!out
-          cd ../..
+          python -c "
+          import os, sys, zipfile
+          from pathlib import Path
 
-          # Bug #13 V2 sanity check: confirma node_modules/@remotion/cli/dist/
-          # está dentro do zip. Falha CI se não.
-          $zipCheck = 7z l vendor-editor.zip | Select-String "@remotion[/\\]cli[/\\]dist[/\\]index"
-          if (-not $zipCheck) {
-              Write-Error "Bug #13 V2 risk: @remotion/cli/dist/index.js NOT found em vendor-editor.zip — zip ignore patterns mutilaram node_modules. Aborting."
-              exit 1
-          }
-          Write-Output "Bug #13 V2 sanity check: @remotion/cli/dist OK"
-          Write-Output ($zipCheck | Out-String)
+          source = Path('vendor/editor')
+          target = Path('vendor-editor.zip')
 
-          # Tamanho final
-          $zip = Get-Item vendor-editor.zip
-          Write-Output "vendor-editor.zip: $([math]::Round($zip.Length / 1MB, 1)) MB"
+          # Path-aware skip (Bug #13 V2 fix lição):
+          # - SKIP_ALWAYS: irrelevantes em qualquer lugar
+          # - SKIP_TOPLEVEL_ONLY: só no root do editor, NUNCA em node_modules
+          SKIP_ALWAYS = {'.git', '.next', '.vercel', '.turbo'}
+          SKIP_TOPLEVEL_ONLY = {'dist', 'build', 'out'}
+
+          source_str = str(source.resolve())
+          n_files = 0
+          remotion_cli_dist_found = False
+
+          with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED, compresslevel=5) as zf:
+              for root, dirs, files in os.walk(source):
+                  rel = os.path.relpath(root, source).replace('\\\\', '/')
+                  in_node_modules = '/node_modules/' in ('/' + rel + '/')
+
+                  # Filter dirs IN PLACE pra os.walk skipar entrando neles
+                  dirs[:] = [d for d in dirs if d not in SKIP_ALWAYS]
+                  if not in_node_modules:
+                      dirs[:] = [d for d in dirs if d not in SKIP_TOPLEVEL_ONLY]
+
+                  for f in files:
+                      abs_path = os.path.join(root, f)
+                      rel_path = os.path.relpath(abs_path, source).replace('\\\\', '/')
+                      zf.write(abs_path, rel_path)
+                      n_files += 1
+                      if 'node_modules/@remotion/cli/dist/index.js' in rel_path:
+                          remotion_cli_dist_found = True
+
+          size_mb = target.stat().st_size / 1024 / 1024
+          print(f'vendor-editor.zip: {size_mb:.1f} MB ({n_files} files)')
+          if not remotion_cli_dist_found:
+              print('ERROR: Bug #13 V2 risk — @remotion/cli/dist/index.js NOT in zip!', file=sys.stderr)
+              sys.exit(1)
+          print('Bug #13 V2 sanity check: @remotion/cli/dist/index.js OK')
+          "
 
       - name: Upload vendor-editor.zip artifact
         if: startsWith(github.ref, 'refs/tags/v')
