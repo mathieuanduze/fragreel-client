@@ -29,6 +29,13 @@ import sys
 import zipfile
 from pathlib import Path
 
+# GitHub Actions Windows runner default encoding é cp1252 — Unicode breaks.
+# Force stdout/stderr UTF-8 pra script funcionar consistente entre OSes.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 
 # Top-level skip (build outputs do editor):
 # .git/.next/.vercel/.turbo são VCS/build caches sempre irrelevantes
@@ -54,7 +61,7 @@ def main() -> int:
         print(f"ERROR: source dir não existe: {source}", file=sys.stderr)
         return 2
 
-    print(f"Zipping {source} → {target}")
+    print(f"Zipping {source} -> {target}")
     print(f"  TOP_LEVEL_SKIP: {TOP_LEVEL_SKIP}")
     print(f"  ALWAYS_SKIP_RECURSIVE: {ALWAYS_SKIP_RECURSIVE}")
 
@@ -67,7 +74,7 @@ def main() -> int:
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED, compresslevel=5) as zf:
         for root, dirs, files in os.walk(source, topdown=True):
             n_dirs_walked += 1
-            # Normalize rel path (Windows backslash → forward slash)
+            # Normalize rel path (Windows backslash -> forward slash)
             rel = os.path.relpath(root, source).replace("\\", "/")
             is_top_level = rel == "."
 
@@ -127,7 +134,7 @@ def main() -> int:
         print(f"\nERROR: {REMOTION_CLI_DIST_MARKER} NOT in zip — Remotion vai falhar em runtime", file=sys.stderr)
         return 1
 
-    print(f"\n✓ Bug #13 V2 sanity check OK")
+    print(f"\n[OK] Bug #13 V2 sanity check passed")
     return 0
 
 
