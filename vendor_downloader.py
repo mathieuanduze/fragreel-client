@@ -201,7 +201,12 @@ def ensure_vendor_runtime(*, force: bool = False, on_progress: Optional[Progress
     try:
         from setup_editor_download import ensure_editor
         log.info("Sprint J: [3/3] Editor → %s", editor_dir())
-        ensure_editor(target_dir=editor_dir(), force=force, on_progress=on_progress)
+        ok = ensure_editor(target_dir=editor_dir(), force=force, on_progress=on_progress)
+        if not ok:
+            # ensure_editor retorna False em network/HTTP errors (ex: 404).
+            # Não logar "OK" mentirosamente — propagar como falha real.
+            log.error("Sprint J: Editor download falhou (ensure_editor retornou False)")
+            return False
         log.info("Sprint J: [3/3] Editor OK")
     except Exception as e:
         log.error("Sprint J: Editor download falhou: %s", e)

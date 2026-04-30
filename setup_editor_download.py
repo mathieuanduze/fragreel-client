@@ -42,19 +42,59 @@ log = logging.getLogger("fragreel.setup_editor_download")
 # ── Pinned release ────────────────────────────────────────────────────────────
 
 
-# Default version aponta pra release que CI publicou. Pode ser sobrescrito
-# via env var FRAGREEL_EDITOR_VERSION pra dev/staging que apontam pra
-# release diferente. CI build define isso via -X flag durante PyInstaller
-# (Etapa J.4 do Sprint J plan).
-DEFAULT_EDITOR_VERSION = os.environ.get("FRAGREEL_EDITOR_VERSION", "v0.6.0")
+# Default version: usar a MESMA tag que o CI injetou em version.py durante
+# build. Isso garante que o cliente baixa o vendor-editor.zip da SUA OWN
+# release (sem hardcode stale).
+#
+# Histórico do bug que motivou esse fix (30/04, v0.6.3 first-run em PC Mathieu):
+#   - Hardcode antigo era "v0.6.0".
+#   - v0.6.0/0.6.1/0.6.2 buildaram FAILED no CI (7-Zip syntax / escape hell /
+#     UnicodeEncodeError) — nenhum asset publicado nessas tags.
+#   - v0.6.3 publicou asset, mas client baixava de v0.6.0/vendor-editor.zip
+#     → HTTP 404, first-run setup FAILED, UI nem abria.
+#
+# Fallback chain:
+#   1. env var FRAGREEL_EDITOR_VERSION (override pra dev/staging)
+#   2. version.py __version__ (CI-injected tag)
+#   3. "latest" via GitHub API redirect
+def _resolve_default_version() -> str:
+    env = os.environ.get("FRAGREEL_EDITOR_VERSION")
+    if env:
+        return env
+    try:
+        # CI injeta version.py com tag real. Local dev tem fallback "v0.0.0-dev".
+        from version import __version__  # type: ignore
+        if __version__ and __version__.startswith("v") and "dev" not in __version__ and "manual" not in __version__:
+            return __version__
+    except Exception:
+        pass
+    # Last resort: usar "latest" — GitHub redireciona pra última release publicada.
+    return "latest"
 
 
-def _editor_zip_url(version: str) -> str:
-    """URL do vendor-editor.zip asset numa release tag específica."""
+DEFAULT_EDITOR_VERSION = _resolve_default_version()
+
+
+def _editor_zip_url_for_version(version: str) -> str:
+    """URL do vendor-editor.zip asset.
+
+    Pra version=="latest", usa endpoint GitHub que redireciona pra release
+    mais recente. Pra version=="vX.Y.Z", usa download direto.
+    """
+    if version == "latest":
+        return (
+            "https://github.com/mathieuanduze/fragreel-client/releases/latest/"
+            "download/vendor-editor.zip"
+        )
     return (
         f"https://github.com/mathieuanduze/fragreel-client/releases/download/"
         f"{version}/vendor-editor.zip"
     )
+
+
+def _editor_zip_url(version: str) -> str:
+    """URL do vendor-editor.zip asset (delegate pra resolver com latest support)."""
+    return _editor_zip_url_for_version(version)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
