@@ -53,10 +53,23 @@ HLAE_URL = (
 # but doesn't fatal — we trust GitHub's TLS for the download integrity.
 HLAE_SHA256: str | None = None
 
-# ffmpeg release-essentials from gyan.dev — static Windows build, ~96 MB
-# extracted. Includes prores_ks encoder which we need for ProRes 4444.
-FFMPEG_VERSION = "release-essentials"
-FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+# ffmpeg static Windows build from BtbN/FFmpeg-Builds GitHub Releases.
+#
+# Histórico (Sprint J.5, 30/04):
+#   gyan.dev/ffmpeg/builds (URL antiga) entregou a 50KB/s no PC do Mathieu
+#   no first-run de v0.6.4 — ~20min só pro ffmpeg. Inaceitável pra UX.
+#   BtbN/FFmpeg-Builds usa CDN do GitHub Releases (~10-50x mais rápido) +
+#   tem rolling tag "latest" com asset de nome estável.
+#
+# GPL build inclui prores_ks (que precisamos pra ProRes 4444), libx264,
+# libx265, libfdk_aac. Tamanho similar ao gyan (~140MB compactado).
+# Estrutura do zip: ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe — o
+# strip_top_level=True do _extract_zip() handle isso transparente.
+FFMPEG_VERSION = "master-latest-gpl-btbn"
+FFMPEG_URL = (
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
+    "ffmpeg-master-latest-win64-gpl.zip"
+)
 FFMPEG_SHA256: str | None = None
 
 

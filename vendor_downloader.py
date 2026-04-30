@@ -174,42 +174,66 @@ def ensure_vendor_runtime(*, force: bool = False, on_progress: Optional[Progress
         log.info("Sprint J: vendor já completo (warm run, skip downloads)")
         return True
 
-    # 1. HLAE + ffmpeg via setup_vendor.py
-    try:
+    # Sprint J.5 (30/04): downloads paralelos via ThreadPoolExecutor.
+    # Antes era serial — HLAE+ffmpeg → Node → Editor — total ~20min com
+    # gyan.dev a 50KB/s. Agora 3 jobs em paralelo, limitado pela banda
+    # total mas dropa de 20min → ~5-7min em internet decente. Combinado
+    # com troca gyan.dev → BtbN GitHub CDN, esperado 2-3min.
+    #
+    # Threads são seguras aqui porque cada job escreve em path próprio:
+    #   - HLAE + ffmpeg → vendor/hlae/
+    #   - Node          → vendor/node/
+    #   - Editor        → editor/
+    # Sem race em sistema de arquivos. urllib é thread-safe pra reads.
+    import concurrent.futures
+
+    jobs: dict[str, callable] = {}
+
+    # Job 1: HLAE + ffmpeg (esses 2 ainda em série dentro do mesmo job
+    # porque usam a mesma layout/dir e setup_vendor.ensure_vendor já
+    # encadeia ambos. Total ~150MB, o gargalo histórico do first-run).
+    def job_hlae_ffmpeg() -> None:
         from setup_vendor import VendorLayout
         from setup_vendor import ensure_vendor as ensure_hlae_ffmpeg
         hlae_layout = VendorLayout(vendor_root=vendor_root())
-        log.info("Sprint J: [1/3] HLAE + ffmpeg → %s", hlae_layout.vendor_root)
+        log.info("Sprint J: [parallel] HLAE + ffmpeg → %s", hlae_layout.vendor_root)
         ensure_hlae_ffmpeg(layout=hlae_layout, force=force)
-        log.info("Sprint J: [1/3] HLAE + ffmpeg OK")
-    except Exception as e:
-        log.error("Sprint J: HLAE/ffmpeg download falhou: %s", e)
-        return False
+        log.info("Sprint J: [parallel] HLAE + ffmpeg OK")
+    jobs["hlae_ffmpeg"] = job_hlae_ffmpeg
 
-    # 2. Node 20 LTS via setup_node.py
-    try:
+    # Job 2: Node 20 LTS (~30MB).
+    def job_node() -> None:
         from setup_node import NodeLayout, ensure_node
         node_layout = NodeLayout(vendor_root=vendor_root())
-        log.info("Sprint J: [2/3] Node 20 → %s", node_layout.node_dir)
+        log.info("Sprint J: [parallel] Node 20 → %s", node_layout.node_dir)
         ensure_node(layout=node_layout, force=force)
-        log.info("Sprint J: [2/3] Node 20 OK")
-    except Exception as e:
-        log.error("Sprint J: Node download falhou: %s", e)
-        return False
+        log.info("Sprint J: [parallel] Node 20 OK")
+    jobs["node"] = job_node
 
-    # 3. Editor (Remotion + node_modules) via setup_editor_download.py
-    try:
+    # Job 3: Editor zip (~43MB). Returns False em HTTP errors,
+    # propagamos via exception pra cair no except do executor.
+    def job_editor() -> None:
         from setup_editor_download import ensure_editor
-        log.info("Sprint J: [3/3] Editor → %s", editor_dir())
+        log.info("Sprint J: [parallel] Editor → %s", editor_dir())
         ok = ensure_editor(target_dir=editor_dir(), force=force, on_progress=on_progress)
         if not ok:
-            # ensure_editor retorna False em network/HTTP errors (ex: 404).
-            # Não logar "OK" mentirosamente — propagar como falha real.
-            log.error("Sprint J: Editor download falhou (ensure_editor retornou False)")
-            return False
-        log.info("Sprint J: [3/3] Editor OK")
-    except Exception as e:
-        log.error("Sprint J: Editor download falhou: %s", e)
+            raise RuntimeError("ensure_editor retornou False (HTTP error?)")
+        log.info("Sprint J: [parallel] Editor OK")
+    jobs["editor"] = job_editor
+
+    failures: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="vendor-dl") as ex:
+        future_to_name = {ex.submit(fn): name for name, fn in jobs.items()}
+        for future in concurrent.futures.as_completed(future_to_name):
+            name = future_to_name[future]
+            try:
+                future.result()
+            except Exception as e:
+                log.error("Sprint J: [parallel] job %s FAILED: %s", name, e)
+                failures.append(f"{name}: {e}")
+
+    if failures:
+        log.error("Sprint J: %d job(s) falharam: %s", len(failures), failures)
         return False
 
     # Sanity check final pós-downloads
