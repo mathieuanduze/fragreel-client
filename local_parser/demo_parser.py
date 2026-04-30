@@ -655,9 +655,27 @@ def _parse_bomb_events(dp, tickrate: float) -> list[BombEvent]:
 
 
 def _parse_round_winners(dp) -> dict[int, int]:
-    """Return {round_num: winner_team} where winner_team is 2 (T) or 3 (CT)."""
+    """Return {round_num: winner_team} where winner_team is 2 (T) or 3 (CT).
+
+    Round 4d 1.1 BUG FIX (Mathieu 30/04, demo
+    `match730_003817008571351040125_1685601391_201`): user reportou "Defuse não
+    aparece em /match". Investigação: scorer.ts gateia `bomb_action="defuse"`
+    em `state.user_won`. user_won deriva de winner_team. winner_team era OFF-BY-ONE.
+
+    Histórico: parser antigo usava `total_rounds_played` + 1. Demo do Mathieu:
+    R8 row tem `round=8, total_rounds_played=8, winner=CT` (Mathieu defusou
+    → CT venceu). Parser old: `(8) + 1 = 9` → winners[R9] = CT, winners[R8]
+    ficava com R7's CT-killed=T → user_won(R8) = (CT == T) = False → scorer
+    skippa defuse → /match não mostra badge.
+
+    Fix: usar `round` column NATIVO (1-indexed correto, sempre presente em
+    Source 2 demos) em vez de `total_rounds_played + 1`. Fallback pra
+    enumerate-based em demos antigos sem `round` field.
+    """
     winners: dict[int, int] = {}
-    for kwargs in [{"other": ["total_rounds_played"]}, {}]:
+    # Tenta variants pra max compat com demos antigos. `round` column é
+    # nativo em CS2 (Source 2) — sempre presente em demos pós-2023.
+    for kwargs in [{}, {"other": ["total_rounds_played"]}]:
         try:
             df = dp.parse_event("round_end", **kwargs)
             if _df_is_empty(df):
@@ -669,11 +687,24 @@ def _parse_round_winners(dp) -> dict[int, int]:
             if not winner_col:
                 continue
 
+            # Prefer native `round` column (1-indexed, correto). Fallback pra
+            # `total_rounds_played` (legacy CS:GO demos talvez precisem).
+            has_round = "round" in cols
+
             rows = _df_iter_rows(df)
             for i, row in enumerate(rows, start=1):
-                round_raw = row.get("total_rounds_played")
-                # round_end fires AFTER the round, so total_rounds_played is the round that just ended
-                round_num = (int(round_raw) + 1) if round_raw is not None else i
+                if has_round:
+                    round_raw = row.get("round")
+                    round_num = int(round_raw) if round_raw is not None else i
+                else:
+                    # LEGACY fallback (CS:GO demos): total_rounds_played é o
+                    # rounds completados ATÉ ESSE evento (1-indexed pós-evento),
+                    # então é o round atual sem +1. Mas testes em demos
+                    # antigos podem necessitar +1 — manter +1 como legacy
+                    # behavior pra não quebrar quem usava antes.
+                    round_raw = row.get("total_rounds_played")
+                    round_num = (int(round_raw) + 1) if round_raw is not None else i
+
                 winner_raw = row.get(winner_col)
                 if winner_raw is None:
                     continue
