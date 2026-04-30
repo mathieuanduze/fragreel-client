@@ -97,6 +97,54 @@ jobs:
       - name: Verify vendor/editor/ is complete
         run: python setup_editor.py --check
 
+      # Sprint J Etapa J.3 (29/04): cria vendor-editor.zip pra upload como
+      # GitHub Release asset. Cliente final baixa esse zip em runtime via
+      # setup_editor_download.py (Sprint J Etapa J.2) em vez de bundlar no
+      # .exe (que era 80+ MB do total 362 MB do v0.5.0).
+      #
+      # CRÍTICO Bug #13 V2: zip DEVE preservar node_modules/*/dist (esses são
+      # compiled JS de cada pacote npm — Remotion precisa deles em runtime).
+      # Round 4c teve 36 fases pra resolver bug parecido — NÃO regredir.
+      #
+      # Strategy: usar 7z com -x! (não-recursive exclude) pra remover SÓ os
+      # build outputs do top-level editor, preservando tudo dentro de
+      # node_modules/. Validation pós-zip via 7z l + findstr garante.
+      - name: Create vendor-editor.zip pra Sprint J runtime download
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          cd vendor/editor
+          # 7z já disponível no runner Windows
+          # -x!dist (sem recursive) pula `vendor/editor/dist` mas preserva
+          # `vendor/editor/node_modules/@remotion/cli/dist/` etc.
+          7z a -tzip -mx=5 ../../vendor-editor.zip . `
+            -xr!.git -xr!.next -xr!.vercel -xr!.turbo `
+            -x!dist -x!build -x!out
+          cd ../..
+
+          # Bug #13 V2 sanity check: confirma node_modules/@remotion/cli/dist/
+          # está dentro do zip. Falha CI se não.
+          $zipCheck = 7z l vendor-editor.zip | Select-String "@remotion[/\\]cli[/\\]dist[/\\]index"
+          if (-not $zipCheck) {
+              Write-Error "Bug #13 V2 risk: @remotion/cli/dist/index.js NOT found em vendor-editor.zip — zip ignore patterns mutilaram node_modules. Aborting."
+              exit 1
+          }
+          Write-Output "Bug #13 V2 sanity check: @remotion/cli/dist OK"
+          Write-Output ($zipCheck | Out-String)
+
+          # Tamanho final
+          $zip = Get-Item vendor-editor.zip
+          Write-Output "vendor-editor.zip: $([math]::Round($zip.Length / 1MB, 1)) MB"
+
+      - name: Upload vendor-editor.zip artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendor-editor
+          path: vendor-editor.zip
+          if-no-files-found: error
+          retention-days: 30
+
       # Sobrescreve version.py com a tag que disparou o workflow (ou um
       # sentinel pra workflow_dispatch manual). O .exe final sempre carrega
       # a versão que o CI registrou — nunca o fallback de dev. Isso elimina
@@ -134,14 +182,19 @@ jobs:
           }
           $exe = Get-Item dist\FragReel.exe
           $exe | Select-Object Name, Length, LastWriteTime
-          # Sanity check post-bundle:
-          # - Round 4c Fase 1: ~250MB (HLAE 200MB + ffmpeg 50MB)
-          # - Round 4c Fase 2: ~450-500MB (+ Node 30MB + editor 200MB)
-          if ($exe.Length -lt 100MB) {
-            Write-Warning "FragReel.exe is suspiciously small ($($exe.Length) bytes) — vendor/ may not be bundled"
+          # Sanity check post-bundle (Sprint J — 29/04):
+          # - v0.4.x Fase 1: ~250MB (HLAE 200MB + ffmpeg 50MB bundled)
+          # - v0.5.0 Fase 2: ~360MB (+ Node 30MB + editor 80MB bundled)
+          # - v0.6.0 Sprint J: ~5-15MB (vendor downloaded em runtime)
+          $sizeMB = [math]::Round($exe.Length / 1MB, 1)
+          Write-Output "FragReel.exe size: $sizeMB MB"
+
+          if ($exe.Length -gt 50MB) {
+            Write-Warning "FragReel.exe > 50MB — Sprint J esperado ~5-15MB. vendor/ pode estar bundlado erroneamente?"
           }
-          if ($exe.Length -lt 350MB) {
-            Write-Warning "FragReel.exe < 350MB — Node + editor bundle pode estar faltando (Fase 2)"
+          if ($exe.Length -lt 1MB) {
+            Write-Error "FragReel.exe < 1MB — build incompleto"
+            exit 1
           }
 
       - name: Upload unsigned artifact
@@ -186,10 +239,20 @@ jobs:
           name: FragReel-unsigned
           path: ./release
 
+      # Sprint J Etapa J.3: download vendor-editor.zip artifact criado no
+      # build job pra incluir como Release asset. Cliente final em runtime
+      # vai baixar esse asset via setup_editor_download.py.
+      - uses: actions/download-artifact@v4
+        with:
+          name: vendor-editor
+          path: ./release
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: release/FragReel.exe
+          files: |
+            release/FragReel.exe
+            release/vendor-editor.zip
           draft: false
           prerelease: false
           generate_release_notes: true

@@ -240,11 +240,70 @@ def _on_upload_event(event: str, payload: dict) -> None:
         log.error(f"❌ falhou: {Path(payload['path']).name} — {payload.get('error')}")
 
 
+def _run_first_run_setup_if_needed() -> bool:
+    """Sprint J first-run check: baixa componentes vendor se ausentes.
+
+    Idempotente — skip se vendor_complete (warm run boot < 2s). First-run
+    leva 30-60s baixando ~210 MB de fontes oficiais (HLAE, Node, ffmpeg,
+    Editor) pra %APPDATA%/FragReel/.
+
+    UX: log-only progress por enquanto. Splash UI Tkinter pode ser polish
+    futuro (Sprint J doc Etapa J.5 nota: "versão simplificada com log-only").
+
+    Bloqueia client startup até completar — sem vendor não funciona nada.
+
+    Returns:
+        True se vendor está OK ao final. False = client não pode rodar.
+    """
+    try:
+        from vendor_downloader import is_vendor_complete, ensure_vendor_runtime
+    except ImportError as e:
+        log.error("Sprint J: vendor_downloader não disponível: %s", e)
+        return False
+
+    if is_vendor_complete():
+        log.info("Sprint J: vendor já completo (warm run, skip downloads)")
+        return True
+
+    log.info(
+        "Sprint J first-run detectado — baixando HLAE + Node + ffmpeg + Editor (~210 MB)..."
+    )
+
+    last_pct_logged = {}  # type: dict[str, int]
+
+    def progress_log(component: str, downloaded: int, total: int) -> None:
+        """Log progress mas só em mudanças de 10% (não spam log)."""
+        if total <= 0:
+            return
+        pct = int(downloaded / total * 100)
+        bucket = (pct // 10) * 10  # 0, 10, 20, ..., 100
+        if last_pct_logged.get(component) == bucket:
+            return
+        last_pct_logged[component] = bucket
+        mb = downloaded / 1024 / 1024
+        total_mb = total / 1024 / 1024
+        log.info("  %s: %d%% (%.1f/%.1f MB)", component, pct, mb, total_mb)
+
+    success = ensure_vendor_runtime(on_progress=progress_log)
+    if not success:
+        log.error(
+            "Sprint J first-run setup FAILED. Possíveis causas: "
+            "internet offline, antivírus bloqueou download, GitHub/nodejs.org "
+            "down, disco cheio. Verificar log acima."
+        )
+        return False
+
+    log.info("Sprint J first-run setup ✓ — vendor pronto em %%APPDATA%%/FragReel/")
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="FragReel Client")
     parser.add_argument("--demo-dir", help="Pasta única para watch (sobrescreve auto-detect)")
     parser.add_argument("--steamid",  help="SteamID64 (auto-detect se omitido)")
     parser.add_argument("--no-tray",  action="store_true", help="Desabilita ícone do tray")
+    parser.add_argument("--skip-vendor-check",  action="store_true",
+                        help="Pula vendor_downloader check (dev mode com vendor local)")
     args = parser.parse_args()
 
     # Bug 1 + Bug 5 instrumentation (v0.2.12). Evict-stale roda ANTES de
@@ -254,6 +313,20 @@ def main() -> None:
     atexit.register(_log_exit)
     _evict_stale_instance()
     _start_heartbeat()
+
+    # Sprint J (29/04): first-run vendor download. Bloqueia até completar
+    # OR sai com erro se download falhou. dev mode pode skipar via flag.
+    if not args.skip_vendor_check:
+        if not _run_first_run_setup_if_needed():
+            msg = ("FragReel não conseguiu baixar dependências necessárias.\n\n"
+                   "Verifique:\n"
+                   "  1. Conexão com internet\n"
+                   "  2. Antivírus não está bloqueando downloads\n"
+                   "  3. Pelo menos 1 GB livre em %APPDATA%\n\n"
+                   "Detalhes em: %APPDATA%\\FragReel\\fragreel.log")
+            log.error(msg.replace("\n", " "))
+            _show_fatal(msg)
+            sys.exit(1)
 
     # ── Steam ID ────────────────────────────────────────────────────
     steamid = args.steamid

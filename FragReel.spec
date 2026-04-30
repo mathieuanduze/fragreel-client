@@ -42,22 +42,25 @@ def _bundle_tree(source: Path, dest_in_bundle: str) -> list[tuple[str, str]]:
     return out
 
 
-# Vendor (HLAE + ffmpeg + Node + editor) — ~450MB total. Skipped silently
-# se setup scripts ainda não rodaram, dev pode build local sem render.
-vendor_datas = _bundle_tree(VENDOR_DIR, "vendor")
-
-# Round 4c Fase 2 — Node + editor bundle pra escalabilidade user final.
-# vendor/node/ vem de setup_node.py (~30MB Node 20 LTS portable Win x64).
-# vendor/editor/ vem de setup_editor.py (clone fragreel sibling + npm ci
-# editor + copy ~200-300MB com node_modules).
-# hlae_runner._resolve_editor_dir() já tem case _MEIPASS/editor — pra
-# aproveitar isso, copiamos editor no `editor/` direto (sem prefix vendor),
-# mantendo Node em `vendor/node/`.
-NODE_DIR = VENDOR_DIR / "node"
-EDITOR_DIR_VENDOR = VENDOR_DIR / "editor"
-node_datas = _bundle_tree(NODE_DIR, "vendor/node") if NODE_DIR.is_dir() else []
-# Editor vai pra `editor/` (sem prefix vendor/) pra match _resolve_editor_dir.
-editor_datas = _bundle_tree(EDITOR_DIR_VENDOR, "editor") if EDITOR_DIR_VENDOR.is_dir() else []
+# ─────────────────────────────────────────────────────────────────────────────
+# Sprint J (29/04) — Thin client refactor:
+# vendor_datas + node_datas + editor_datas REMOVIDOS do bundle.
+# .exe vai de ~362MB (v0.5.0) → ~5-15MB (v0.6.0+).
+#
+# Em runtime first-run, vendor_downloader.py baixa esses componentes
+# pra %APPDATA%/FragReel/vendor/ + %APPDATA%/FragReel/editor/ via:
+#   - setup_vendor.py (HLAE + ffmpeg)
+#   - setup_node.py (Node 20 LTS)
+#   - setup_editor_download.py (Editor de GitHub Release asset)
+#
+# Por que: AV heurística (Kaspersky PDM:Trojan, Defender) flagava o
+# binário monolítico pelo combo "tamanho > 100MB + self-extracting +
+# process injection + bundled Python interpreter". Thin client + downloads
+# de fontes oficiais (advancedfx, nodejs.org, gyan.dev, GitHub Release)
+# elimina maioria dos triggers heurísticos.
+#
+# Plan completo: [[Sprint J — Thin Client Implementation Plan]] em Obsidian.
+# ─────────────────────────────────────────────────────────────────────────────
 
 # scripts/ holds the .cfg generator imported by hlae_runner.py — needs to
 # travel with the .exe so the bundled Python interpreter can import it.
@@ -79,7 +82,9 @@ a = Analysis(
     ['main.py'],
     pathex=['.'],
     binaries=tcl_tk_binaries,
-    datas=vendor_datas + node_datas + editor_datas + scripts_datas,
+    # Sprint J: SÓ scripts_datas. vendor_datas/node_datas/editor_datas
+    # removidos — vendor_downloader baixa em runtime first-run.
+    datas=scripts_datas,
     hiddenimports=[
         'plyer.platforms.win.notification',
         'pystray._win32',
@@ -105,19 +110,29 @@ a = Analysis(
         'pyarrow',
         'pyarrow.lib',
         'pyarrow.compute',
-        # New in Round 4c: HLAE pipeline modules. PyInstaller usually picks
-        # these up automatically because main.py → local_api.py imports them
+        # HLAE pipeline modules. PyInstaller usually picks these up
+        # automatically because main.py → local_api.py imports them
         # transitively, but listing them defends against import order changes.
         'cs2_launcher',
         'hlae_runner',
         'render_coordinator',
+        # Sprint J first-run downloaders. Reusam setup_vendor + setup_node
+        # existentes (modo runtime) + adicionam setup_editor_download (NEW).
+        'vendor_downloader',
         'setup_vendor',
         'setup_node',
-        'setup_editor',
+        'setup_editor',           # mantido: usado pelo CI build
+        'setup_editor_download',  # NEW Sprint J runtime
+        # Sprint I.5 modules — full migration cliente parseia local + Vercel.
+        'api_client',
+        'local_matches_store',
+        'local_parser',
+        'local_parser.demo_parser',
+        'parser',
+        'parser.scorer',
+        'parser.demo_parser',
         'scripts.capture_script',
-        # v0.2.7: client_config holds output_dir persistence. Imported by
-        # local_api at top level, so a missing bundle would crash the entire
-        # API thread on startup (not just /config endpoints).
+        # v0.2.7: client_config holds output_dir persistence.
         'client_config',
     ],
     hookspath=[],

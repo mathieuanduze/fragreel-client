@@ -93,18 +93,31 @@ _FFMPEG_THREAD_LIMIT = "4"  # cap ffmpeg threads pra deixar PC responsivo
 
 
 def _resolve_bundled_npx() -> str | None:
-    """Round 4c Fase 2 — resolve npx do Node portable bundlado.
+    """Resolve npx do Node portable.
 
-    Frozen mode (.exe), Node 20 LTS Windows x64 vive em
-    `_MEIPASS/vendor/node/npx.cmd`. Source/dev mode, busca
-    `<client>/vendor/node/npx.cmd` (criado por setup_node.py).
+    Sprint J (29/04): Node agora é baixado em runtime pra
+    `%APPDATA%/FragReel/vendor/node/npx.cmd` (vendor_downloader.py
+    Etapa J.1). Antes, era bundlado no _MEIPASS.
+
+    Search order:
+    1. Sprint J runtime location: %APPDATA%/FragReel/vendor/node/ (preferred)
+    2. Frozen _MEIPASS fallback: legacy v0.4.x/v0.5.x ainda funciona
+       se rodar o .exe antigo (compat)
+    3. Source/dev mode: <client>/vendor/node/
 
     Retorna str do path se achado, senão None (caller fallback pra
     `shutil.which("npx")`).
     """
     candidates: list[Path] = []
 
-    # Frozen: PyInstaller _MEIPASS extraction
+    # Sprint J runtime location (preferred)
+    try:
+        from vendor_downloader import npx_path as _vd_npx
+        candidates.append(_vd_npx())
+    except ImportError:
+        pass  # vendor_downloader pode não estar disponível em testes isolados
+
+    # Legacy: PyInstaller _MEIPASS extraction (v0.5.x e anteriores)
     if getattr(sys, "frozen", False):
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:

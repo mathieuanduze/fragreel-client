@@ -1029,18 +1029,30 @@ def _build_render_coordinator() -> Optional[RenderCoordinator]:
         return None
     cs2_install = roots[0]
 
-    # First-run vendor bootstrap. Only attempts download on Windows since
-    # HLAE is a Win32 binary; on other OSes we just check for a pre-staged
-    # vendor (e.g. CI builds on linux for testing the code paths).
+    # Sprint J (29/04): vendor já foi baixado pelo main.py first-run check
+    # (_run_first_run_setup_if_needed) pra %APPDATA%/FragReel/vendor/.
+    # Local_api só precisa resolver o path correto, sem re-download.
+    #
+    # Search order: %APPDATA% (Sprint J runtime) → _MEIPASS legacy → dev local.
     try:
-        from setup_vendor import default_layout, ensure_vendor
-        layout = default_layout()
-        if not layout.is_complete():
-            log.info("vendor incomplete at %s — downloading HLAE + ffmpeg", layout.vendor_root)
-            ensure_vendor(layout=layout)
-        hlae_dir = layout.hlae_dir
+        from vendor_downloader import hlae_dir as _vd_hlae_dir, hook_dll_path
+        candidate_hlae = _vd_hlae_dir()
+        if hook_dll_path().exists():
+            hlae_dir = candidate_hlae
+            log.info("Sprint J: HLAE resolved at %s", hlae_dir)
+        else:
+            # Fallback: setup_vendor default (legacy _MEIPASS or dev local)
+            from setup_vendor import default_layout, ensure_vendor
+            layout = default_layout()
+            if not layout.is_complete():
+                log.info(
+                    "vendor incomplete at %s — downloading HLAE + ffmpeg (legacy fallback)",
+                    layout.vendor_root,
+                )
+                ensure_vendor(layout=layout)
+            hlae_dir = layout.hlae_dir
     except Exception as e:
-        log.warning("setup_vendor failed (%s); render endpoints disabled", e)
+        log.warning("vendor resolution failed (%s); render endpoints disabled", e)
         return None
 
     if not hlae_dir.exists():
@@ -1147,15 +1159,26 @@ def _resolve_editor_dir() -> Path | None:
             p,
         )
 
-    # 2. Frozen .exe (Round 4c Fase 2 bundla editor/ em _MEIPASS via spec)
+    # 2. Sprint J (29/04): editor agora vive em %APPDATA%/FragReel/editor/
+    # baixado pelo vendor_downloader em first-run (em vez de bundlado no _MEIPASS).
+    try:
+        from vendor_downloader import editor_dir as _vd_editor_dir
+        p = _vd_editor_dir()
+        if p.is_dir() and (p / "package.json").exists():
+            log.info("Sprint J: editor_dir from %%APPDATA%%/FragReel/: %s", p)
+            return p
+    except ImportError:
+        pass  # vendor_downloader pode não estar disponível em testes isolados
+
+    # 3. Frozen .exe legacy (v0.5.x e anteriores bundlavam editor/ em _MEIPASS)
     if getattr(sys, "frozen", False):
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
             p = Path(meipass) / "editor"
             if p.is_dir():
-                log.info("editor_dir from _MEIPASS (frozen): %s", p)
+                log.info("editor_dir from _MEIPASS (frozen legacy): %s", p)
                 return p
-            log.debug("_MEIPASS/editor not found yet (Round 4c Fase 2 pending)")
+            log.debug("_MEIPASS/editor not found (Sprint J runtime download esperado)")
 
     # 3. Dev mode: sibling repo conventions — testa nomes comuns. PC test
     # (26/04) revelou layouts variados (e.g. `C:\FragReel\client` +
