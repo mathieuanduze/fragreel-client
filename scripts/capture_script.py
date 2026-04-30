@@ -682,6 +682,20 @@ def _setup_commands(plan: CaptureScriptPlan) -> list[str]:
             "cl_drawhud_nofreezecam 1",           # freeze cam overlay off
             "safezonex 1",
             "safezoney 1",
+            # Round 4d 5.1 (Mathieu 29/04): "Ainda dá pra ver o player do
+            # CS no fragreel final. A captura está ocorrendo capturando o
+            # player da demo". Hipótese: spectator UI elements
+            # sobreviventes a cl_drawhud 0 (player labels, x-ray through
+            # walls, health bars sobre cabeças). Defensive cvars belt-and-
+            # suspenders: blind-shot mas cheap. Se persistir após v0.6.6
+            # PC test, escalar pra investigation com demo concreta.
+            "spec_show_xray 0",                   # x-ray que mostra players através de paredes
+            "cl_spec_show_bindings 0",            # binding tooltips (Q W E etc)
+            "cl_show_observer_crosshair 0",       # já existe acima — redundancy ok
+            "cl_observed_bot_crosshair 0",        # bot crosshair when observing bot
+            "cl_observercrosshair 0",             # generic observer crosshair
+            "spec_replay_others_experience 0",    # multi-player POV bar
+            "cl_drawhud_specguidesalpha 0",       # spectator guides alpha
             # Re-habilita crosshair (que cl_drawhud 0 desliga junto)
             "crosshair 1",
             "r_drawviewmodel 1",
