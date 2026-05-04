@@ -78,25 +78,48 @@ FRAMES_PER_TICK = CAPTURE_FPS / CS2_TICKRATE
 # off mid-segment-0 on PCs that couldn't sustain >300 fps wall-clock.
 CAPTURE_TIMEOUT_SEC = 3600.0
 
-# Disk preflight: 1080p TGA from CS2 ≈ 6.2 MB / frame. Round to 7 MB for
-# safety + filesystem overhead.
+# Disk preflight: TGA bytes per frame depends on capture resolution.
+#
+# Sprint J.6 (03/05): default capture passou de 1080p → 720p (-55% TGA
+# size). hlae_runner usa env FRAGREEL_CAPTURE_HEIGHT (default 720).
+# Preflight precisa calcular consistente — antes hard-coded 7 MB/frame
+# (1080p) sobre-estimava 2.27× pra 720p, fazia user ver "50 GB needed"
+# quando real era ~22 GB. Fix: ler env var igual ao hlae_runner.
+#
+# Math:
+#   1080p (1920×1080×3 RGB): 6.22 MB/frame → round 7 MB
+#    720p (1280× 720×3 RGB): 2.76 MB/frame → round 3 MB
 #
 # Bug #22 (28/04, PC test): preflight subestimava peak real. PC observou
 # 3 takes simultâneos ocupando 51.7 GB (25.78 + 25.27 + 0.67) quando o
 # converter ficou pra trás (ProRes encoding lento OU disco lento). Crash
 # por ENOSPC em 3.5 GB livres mesmo com preflight tendo passado em 57 GB.
 #
-# Fix: usar TOTAL frames (não só max segment) × 1.0 × BYTES_PER_FRAME_TGA
+# Fix Bug #22: usar TOTAL frames (não só max segment) × 1.0 × BYTES_PER_FRAME_TGA
 # como pior caso (todos os segmentos como TGAs simultâneos = converter
 # completamente atrás, qual aconteceu na sessão do PC). Plus DISK_SAFETY
 # elevado pra 5 GB (engine logs, audio.wav, OS swap, browser cache).
-#
-# Caveat: pode ser conservador demais pra users com SSDs rápidos onde
-# converter sempre acompanha. Aceitamos trade-off (false negative = user
-# vê mensagem clara "disco insuficiente" vs ENOSPC mid-render que perde
-# o trabalho).
-BYTES_PER_FRAME_TGA = 7_000_000
-# ProRes 4444 1080p ≈ 105 Mbps = ~110 KB/frame at 120 fps. Round up.
+def _bytes_per_tga_frame() -> int:
+    """Calcula MB/frame TGA baseado em FRAGREEL_CAPTURE_HEIGHT (default 720).
+
+    Mantém em sync com hlae_runner._cs2_launch_args. Round up pra safety
+    + filesystem overhead.
+    """
+    import os
+    try:
+        h = int(os.environ.get("FRAGREEL_CAPTURE_HEIGHT", "720"))
+    except ValueError:
+        h = 720
+    w = int(h * 16 / 9)
+    raw_bytes = w * h * 3
+    # Round up pra próximo MB pra incluir filesystem overhead + safety
+    return ((raw_bytes // 1_000_000) + 1) * 1_000_000
+
+
+BYTES_PER_FRAME_TGA = _bytes_per_tga_frame()
+# ProRes 422 HQ 720p ≈ 60 Mbps = ~62 KB/frame at 120 fps. 1080p ≈ 105 Mbps.
+# Conservador: 200 KB cobre worst case 1080p; 720p sobre-estima ~3× mas é
+# fração desprezível do TGA peak (que domina disk usage).
 BYTES_PER_FRAME_PRORES = 200_000
 DISK_SAFETY_BUFFER_BYTES = 5 * 1024 ** 3  # 5 GB (Bug #22, era 2 GB)
 TGA_PEAK_OVERLAP_FACTOR = 1.5   # mantido pra cálculo otimista (single-take peak)
