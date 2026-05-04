@@ -362,15 +362,35 @@ class HlaeRunner:
         log.info("-------------------------------------")
 
     def _cs2_launch_args(self, plan: RenderPlan) -> list[str]:
-        # Match the user's desktop resolution so Source 2 never has a
-        # reason to switch display modes (the scary "everything became
-        # huge" bug when CS2 was killed mid-transition). Capped at 1920x1080
-        # because bigger captures explode disk usage (6.2 MB/frame at 1080p
-        # = ~9 GB for a 5s segment already).
+        # Round 4d 2.x DISK REDUCTION (Mathieu field test 03/05, amigo
+        # reportou "muito espaço, choque pro usuário"): cap CS2 capture
+        # resolution em 720p (1280×720) em vez de 1080p (1920×1080).
+        # TGA é uncompressed RGB = w×h×3 bytes/frame. Redução:
+        #   1080p: 1920*1080*3 = 6.22 MB/frame
+        #   720p:  1280*720*3  = 2.76 MB/frame  → -55% TGA size
+        # Ex: highlight de 5s @ 60fps = 300 frames:
+        #   1080p: 1.87 GB / take · 1080p multi-take = 6-30 GB / reel
+        #   720p:  828 MB / take · ~3-13 GB / reel
+        # Reel final é mobile vertical (1080×1920) → downsample de 720p
+        # source pra crop+rotate na composition Remotion = qualidade
+        # visual aceitável (mobile feed scale ~50% reduz percepção).
+        # Mathieu spec: 720p default, 1080p como Premium feature futura.
+        # Override env var pra dev/testing alternar: FRAGREEL_CAPTURE_HEIGHT.
+        import os
+        try:
+            target_h = int(os.environ.get("FRAGREEL_CAPTURE_HEIGHT", "720"))
+        except ValueError:
+            target_h = 720
+        target_w = int(target_h * 16 / 9)  # 720→1280, 1080→1920
         desktop_w, desktop_h = get_desktop_resolution()
-        w = min(desktop_w, 1920) if desktop_w > 0 else 1920
-        h = min(desktop_h, 1080) if desktop_h > 0 else 1080
-        log.info("CS2 launch resolution: %dx%d (desktop %dx%d)", w, h, desktop_w, desktop_h)
+        # Cap ao desktop pra Source 2 não trocar display mode. Se desktop
+        # < target, usa desktop (caso laptop low-res raro).
+        w = min(desktop_w, target_w) if desktop_w > 0 else target_w
+        h = min(desktop_h, target_h) if desktop_h > 0 else target_h
+        log.info(
+            "CS2 launch resolution: %dx%d (target %dx%d, desktop %dx%d, ~%.1f MB/frame TGA)",
+            w, h, target_w, target_h, desktop_w, desktop_h, (w * h * 3) / (1024 * 1024),
+        )
 
         # -windowed forces non-exclusive windowed mode (no display mode
         # change even if CS2's saved config had fullscreen).

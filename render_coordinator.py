@@ -140,6 +140,14 @@ class RenderSession:
     error: str | None = None
     started_at: float | None = None
     finished_at: float | None = None
+    # Round 4d field test follow-up (Mathieu 03/05): amigo recebeu reel CRU
+    # (sem música, sem edição, widescreen, com CS demo bar) sem saber que
+    # foi fallback ffmpeg concat. UX armadilha — usuário acha que produto
+    # tá entregando isso. Esses campos surfaceam o estado degradado pra UI
+    # mostrar warning + permite suporte diagnose.
+    degraded: bool = False  # True quando reel saiu via concat fallback (não Remotion)
+    degraded_reason: str | None = None  # 1ª linha do erro Remotion (UI mostra)
+    degraded_log_path: Path | None = None  # path pro stderr completo (suporte)
 
     def to_dict(self) -> dict:
         return {
@@ -156,6 +164,9 @@ class RenderSession:
             "error": self.error,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "degraded": self.degraded,
+            "degraded_reason": self.degraded_reason,
+            "degraded_log_path": str(self.degraded_log_path) if self.degraded_log_path else None,
         }
 
 
@@ -647,6 +658,28 @@ class RenderCoordinator:
             mov_paths: list[Path] = list(converted_movs[k] for k in sorted(converted_movs))
             remotion_succeeded = False
 
+            # Round 4d field follow-up: track WHY Remotion didn't run.
+            # Antes era log.warning + concat silencioso → user achava que reel
+            # cru (widescreen sem música) era output normal. Agora capturamos
+            # full stderr/exception em arquivo dedicado + flag `degraded` na
+            # session pra UI mostrar warning explícito.
+            remotion_error_text: str | None = None
+            remotion_error_log_path: Path | None = None
+
+            if self.editor_dir is None or not self.editor_dir.is_dir():
+                # Editor ausente: não é "Remotion crashou", é "vendor não baixou
+                # ou _resolve_editor_dir não achou". Loga claro.
+                log.error(
+                    "render: editor_dir not available (%s) — pulando Remotion, "
+                    "reel sairá CRU (concat fallback). Sprint J vendor download "
+                    "deve ter populado %%APPDATA%%/FragReel/editor/.",
+                    self.editor_dir,
+                )
+                remotion_error_text = (
+                    f"editor_dir não disponível ({self.editor_dir}). "
+                    "Setup do vendor pode ter falhado — verifique fragreel.log."
+                )
+
             if self.editor_dir is not None and self.editor_dir.is_dir():
                 self._update(state="rendering", stage="composing final MP4 (Remotion)")
                 try:
@@ -663,12 +696,43 @@ class RenderCoordinator:
                     remotion_succeeded = True
                 except Exception as e:
                     # Remotion failures shouldn't lose the .mov files —
-                    # we'll concat them in the fallback below.
-                    log.warning("remotion stage failed, falling back to concat: %s", e)
-                    self._update(stage=f"remotion failed, concatenating instead: {e}")
+                    # we'll concat them in the fallback below. Mas AGORA
+                    # capturamos o erro com detalhe pra suporte + UI warning.
+                    import traceback as _tb
+                    full_trace = _tb.format_exc()
+                    log.error(
+                        "remotion stage failed, falling back to concat (REEL SERÁ CRU). "
+                        "Error: %s\n%s",
+                        e, full_trace,
+                    )
+                    # Persiste stderr completo em arquivo dedicado pra suporte.
+                    try:
+                        log_dir = Path(self.output_dir).parent
+                        log_dir.mkdir(parents=True, exist_ok=True)
+                        remotion_error_log_path = log_dir / f"last_remotion_error_{int(time.time())}.log"
+                        remotion_error_log_path.write_text(
+                            f"Render ID: {self._session.render_id if self._session else '?'}\n"
+                            f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"Editor dir: {self.editor_dir}\n"
+                            f"Exception: {type(e).__name__}: {e}\n\n"
+                            f"--- Full traceback ---\n{full_trace}\n",
+                            encoding="utf-8",
+                        )
+                        log.info("Remotion error log saved to %s", remotion_error_log_path)
+                    except Exception as log_err:
+                        log.warning("could not save remotion error log: %s", log_err)
+                    # Reason: 1ª linha legível do erro pra UI mostrar.
+                    remotion_error_text = str(e).split("\n", 1)[0][:200]
+                    self._update(stage=f"⚠️ Remotion falhou, gerando reel cru: {remotion_error_text}")
 
             if not remotion_succeeded:
-                self._update(state="rendering", stage="encoding final MP4 (ffmpeg concat)")
+                # Stage label deixa CLARO pro user que o reel saiu degraded.
+                # Antes era só "encoding final MP4 (ffmpeg concat)" — user
+                # não distinguia de output normal.
+                self._update(
+                    state="rendering",
+                    stage="⚠️ Remotion indisponível — gerando reel CRU (sem música/edição/orientação)",
+                )
                 try:
                     self._runner.concat_movs_to_mp4(
                         mov_paths=mov_paths,
@@ -682,6 +746,18 @@ class RenderCoordinator:
                             # web doesn't offer "open .mov" buttons that
                             # would 404 on the OS-open call.
                             self._session.output_movs = ()
+                            # Round 4d field follow-up: marca degraded.
+                            self._session.degraded = True
+                            self._session.degraded_reason = (
+                                remotion_error_text or "Remotion não rodou (motivo desconhecido)"
+                            )
+                            self._session.degraded_log_path = remotion_error_log_path
+                            log.warning(
+                                "RENDER DEGRADED: reel saiu via concat fallback. "
+                                "Reason: %s. Log: %s",
+                                self._session.degraded_reason,
+                                self._session.degraded_log_path,
+                            )
                 except Exception as e:
                     log.error("ffmpeg concat fallback failed: %s", e)
                     self._update(stage=f"MOVs ready (concat failed: {e})")
