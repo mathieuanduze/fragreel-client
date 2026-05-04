@@ -685,11 +685,15 @@ def _setup_commands(plan: CaptureScriptPlan) -> list[str]:
             # Round 4d 5.1 (Mathieu 29/04): "Ainda dá pra ver o player do
             # CS no fragreel final. A captura está ocorrendo capturando o
             # player da demo". Hipótese: spectator UI elements
-            # sobreviventes a cl_drawhud 0 (player labels, x-ray through
-            # walls, health bars sobre cabeças). Defensive cvars belt-and-
-            # suspenders: blind-shot mas cheap. Se persistir após v0.6.6
-            # PC test, escalar pra investigation com demo concreta.
-            "spec_show_xray 0",                   # x-ray que mostra players através de paredes
+            # sobreviventes a cl_drawhud 0 (binding tooltips, observer
+            # crosshair variants, spec guides alpha).
+            #
+            # ⚠️ Round 4d 5.1.1 BUG FIX (Mathieu 04/05): NÃO repetir
+            # `spec_show_xray 0` aqui — linha 680 acima já configura via
+            # `plan.show_xray` (toggle do user). CS2 processa cfg em ordem,
+            # última escrita vence. Hardcoded `spec_show_xray 0` aqui
+            # sobrescrevia a escolha do user → toggle nunca funcionava.
+            # X-ray opt-out pertence APENAS ao bloco do user toggle (680).
             "cl_spec_show_bindings 0",            # binding tooltips (Q W E etc)
             "cl_show_observer_crosshair 0",       # já existe acima — redundancy ok
             "cl_observed_bot_crosshair 0",        # bot crosshair when observing bot
