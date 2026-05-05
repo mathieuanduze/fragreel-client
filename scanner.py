@@ -143,28 +143,21 @@ def _parse_demo_summary(path: Path, steamid: str) -> Optional[ScannedMatch]:
             for r in rows
         )
         if not player_in_match:
-            # Diagnóstico: lista os steamids únicos que apareceram na demo.
-            # Útil pra detectar mismatch de formato (steamid64 vs steamid3
-            # vs profileid) — bug silencioso que faria toda demo ser pulada.
-            sample_ids: set[str] = set()
-            for r in rows[:200]:  # 200 events bastam pra cobrir todo time
-                aid = r.get("attacker_steamid")
-                uid = r.get("user_steamid")
-                if aid is not None:
-                    sample_ids.add(str(aid))
-                if uid is not None:
-                    sample_ids.add(str(uid))
-                if len(sample_ids) >= 12:
-                    break
+            # Sprint #7 (05/05) — antes: return None aqui (skipped_reason no cache).
+            # Bug: pro demos (HLTV/CSGOStats download) onde user NÃO é player
+            # ficavam invisíveis em /library. Sprint #7 unified flow precisa
+            # mostrar TODAS demos pra user escolher player no roster picker.
+            # Fix: NÃO skip — segue parseando pra metadata (mapa, rounds), só
+            # marca kills=deaths=0 do user (ele não jogou). Editor decide
+            # via /demo/[sha]/roster qual player renderizar.
             log.info(
-                f"    [parse] {path.name}: usuário ({steamid}) não está na demo. "
-                f"steamids vistos (sample): {sorted(sample_ids)[:12]}"
+                f"    [parse] {path.name}: usuário ({steamid}) NÃO está na demo "
+                f"— Sprint #7 inclui mesmo assim (Pro demo / external)."
             )
-            return None
 
-        # Stats do jogador
-        kills = sum(1 for r in rows if str(r.get("attacker_steamid")) == steamid)
-        deaths = sum(1 for r in rows if str(r.get("user_steamid")) == steamid)
+        # Stats do jogador (quando user na demo). Senão 0 — UI mostra "demo externa".
+        kills = sum(1 for r in rows if str(r.get("attacker_steamid")) == steamid) if player_in_match else 0
+        deaths = sum(1 for r in rows if str(r.get("user_steamid")) == steamid) if player_in_match else 0
 
         # Mapa + rounds
         header = parser.parse_header()
@@ -304,8 +297,20 @@ def scan_all(
                 ))
                 continue
             if cached.get("skipped_reason"):
-                log.info(f"  [{i}/{len(candidates)}] {p.name} — já marcada como skip: {cached.get('skipped_reason')}")
-                continue
+                # Sprint #7 (05/05) — re-parsear demos previamente marcadas como
+                # "not_user_demo" pra elas aparecerem no fluxo unified. Antes
+                # eram skipped permanently; agora incluídas com kills=0.
+                # Outros skipped_reason (parse_failed por demo corrompida, etc)
+                # continuam respeitando o cache.
+                if cached.get("skipped_reason") == "not_user_demo_or_parse_failed":
+                    log.info(
+                        f"  [{i}/{len(candidates)}] {p.name} — Sprint #7 "
+                        f"re-evaluando (era 'not_user_demo')"
+                    )
+                    # Não continue — deixa cair no parse abaixo
+                else:
+                    log.info(f"  [{i}/{len(candidates)}] {p.name} — já marcada como skip: {cached.get('skipped_reason')}")
+                    continue
 
         log.info(f"  [{i}/{len(candidates)}] {p.name} ({round(p.stat().st_size / (1024*1024), 1)} MB) — parseando…")
         t_parse = time.time()
