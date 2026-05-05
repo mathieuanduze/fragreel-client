@@ -299,6 +299,102 @@ def create_app(
             return {"error": "no_such_job"}, 404
         return jsonify(job)
 
+    @app.get("/demos/<sha>/roster")
+    def demo_roster(sha: str):
+        """Sprint #5 — Pro Demo Render Phase A.
+
+        Parseia a demo + retorna roster (10 players) com kills + headshots
+        + steamid + name + team. Web usa pra UI de "render qualquer player"
+        (caso pro demos baixados de HLTV/CSGOStats que não estão na Steam
+        history do user).
+
+        Caching: parse pode levar 5-15s pra demo grande. TODO: cachear no
+        scanner cache em disco se latência incomodar (P2). Hoje cada call
+        re-parseia.
+        """
+        with state_lock:
+            matches = list(state["matches"])
+        match = next((m for m in matches if m["sha1"] == sha), None)
+        if not match:
+            return {"error": "demo_not_found", "sha": sha}, 404
+        path = Path(match["demo_path"])
+        if not path.exists():
+            return {"error": "file_missing", "path": str(path)}, 410
+
+        try:
+            from local_parser.demo_parser import parse as parse_demo
+            parsed = parse_demo(path)
+        except Exception as e:
+            log.error("/demos/%s/roster — parse falhou: %s", sha, e)
+            return {"error": "parse_failed", "detail": str(e)}, 500
+
+        # Aggregate per-player stats from all_kills.
+        # Key: attacker_steamid. Players that 0-killed e só morreram vão
+        # aparecer com kills=0 (queremos eles na lista mesmo — user pode
+        # querer renderizar reel de "perdedor heroico" perspective).
+        from collections import defaultdict
+        stats: dict[str, dict] = defaultdict(lambda: {
+            "steamid": "",
+            "name": None,
+            "team": None,
+            "kills": 0,
+            "headshots": 0,
+            "deaths": 0,
+        })
+
+        # All attackers (incl. team-kills, world, env)
+        for k in parsed.all_kills:
+            sid = getattr(k, "attacker_steamid", "") or ""
+            if not sid or sid in ("0", "None", "world"):
+                continue
+            stats[sid]["steamid"] = sid
+            stats[sid]["kills"] += 1
+            if getattr(k, "headshot", False):
+                stats[sid]["headshots"] += 1
+            if stats[sid]["team"] is None:
+                stats[sid]["team"] = getattr(k, "attacker_team", None)
+
+        # Add victim-only players (e.g. 0-kill players we'd miss otherwise)
+        for k in parsed.all_kills:
+            vsid = getattr(k, "victim_steamid", "") or ""
+            if not vsid or vsid in ("0", "None"):
+                continue
+            stats[vsid]["steamid"] = vsid
+            stats[vsid]["deaths"] += 1
+            if stats[vsid]["team"] is None:
+                stats[vsid]["team"] = getattr(k, "victim_team", None)
+
+        # Resolve in-game name via demoparser2 player_info table.
+        # demo_parser._parse_kills extrai attacker_name nos campos do parser
+        # mas no nosso ParsedDemo só guardamos steamid. Re-query via dp.
+        try:
+            from demoparser2 import DemoParser
+            dp = DemoParser(str(path))
+            pinfo = dp.parse_player_info()
+            # pinfo é DataFrame com 'steamid', 'name' columns
+            for row in pinfo.iterrows() if hasattr(pinfo, "iterrows") else []:
+                _, r = row
+                rsid = str(r.get("steamid", "")).strip()
+                rname = r.get("name", "") or None
+                if rsid in stats and not stats[rsid]["name"]:
+                    stats[rsid]["name"] = rname
+        except Exception as e:
+            log.warning("/demos/%s/roster — name lookup failed (non-fatal): %s", sha, e)
+
+        # Sort by kills desc (top fragger first — usuário comum vai querer
+        # renderizar pro player). Cap at 10 (CS2 5v5).
+        roster = sorted(stats.values(), key=lambda p: -p["kills"])[:12]
+
+        return jsonify({
+            "sha": sha,
+            "match_id": match.get("match_id"),
+            "map_name": parsed.map_name,
+            "ct_score": parsed.ct_score,
+            "t_score": parsed.t_score,
+            "tickrate": parsed.tickrate,
+            "roster": roster,
+        })
+
     # ── Sprint I.5 — local matches endpoints ──────────────────────────────
     # Espelha o que Railway oferecia em /matches/{id}. Web (fragreel.gg)
     # consulta o cliente local primeiro (Sprint I.5 Fase 5: web getMatch
