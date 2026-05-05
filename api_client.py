@@ -106,6 +106,10 @@ class HighlightFromApi:
     kill_timestamps: list[float] = field(default_factory=list)
     kills: list[dict[str, Any]] = field(default_factory=list)
     alive_timeline: list[dict[str, Any]] = field(default_factory=list)
+    bomb_action_tick: Optional[int] = None
+    bomb_action_timestamp: Optional[float] = None
+    # Sprint #6.2.1 — plant tick INDEPENDENTE de quem plantou
+    bomb_planted_timestamp: Optional[float] = None
 
 
 def score_via_api(
@@ -455,6 +459,8 @@ def _build_match_doc(
                 "alive_timeline": h.alive_timeline,
                 "bomb_action_tick": getattr(h, "bomb_action_tick", None),
                 "bomb_action_timestamp": getattr(h, "bomb_action_timestamp", None),
+                # Sprint #6.2.1 — plant tick independente de quem plantou
+                "bomb_planted_timestamp": getattr(h, "bomb_planted_timestamp", None),
             }
             for h in highlights
         ],
@@ -554,6 +560,10 @@ def _parse_highlights(raw: list[dict[str, Any]]) -> list[HighlightFromApi]:
             kill_timestamps=h.get("kill_timestamps", []),
             kills=h.get("kills", []),
             alive_timeline=h.get("alive_timeline", []),
+            bomb_action_tick=h.get("bomb_action_tick"),
+            bomb_action_timestamp=h.get("bomb_action_timestamp"),
+            # Sprint #6.2.1 — plant tick independente
+            bomb_planted_timestamp=h.get("bomb_planted_timestamp"),
         )
         for h in raw
     ]
