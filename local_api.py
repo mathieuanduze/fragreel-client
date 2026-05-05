@@ -299,6 +299,54 @@ def create_app(
             return {"error": "no_such_job"}, 404
         return jsonify(job)
 
+    @app.post("/demos/<sha>/score")
+    def demo_score(sha: str):
+        """Sprint #7 Phase 7.3 (05/05) — score demo arbitrária com target_steamid.
+
+        Body: {"target_steamid": "76561198..."}
+        Retorna: match_doc completo (mesmo schema de /matches/<id>) com
+        highlights ranqueados pra perspectiva do target. Web usa pra mostrar
+        preview cards + render trigger no fluxo unificado.
+
+        Diferença de /matches/<id>:
+          /matches/<id>: assume user da sessão é player. Match_doc derivado
+          de upload prévio do user. Sprint I.5 fluxo.
+          /demos/<sha>/score: target_steamid arbitrário. Útil pra render de
+          pro player demo (HLTV/CSGOStats download).
+
+        Caching: parse + score levam 5-15s. TODO: cachear por (sha,
+        target_steamid) — re-clicar mesmo player não re-parse. Hoje cada
+        call re-roda. Backlog Sprint #7.6.
+        """
+        body = request.get_json(silent=True) or {}
+        target_steamid = str(body.get("target_steamid", "")).strip()
+        if not target_steamid:
+            return {"error": "target_steamid_required"}, 400
+
+        with state_lock:
+            matches = list(state["matches"])
+        match = next((m for m in matches if m["sha1"] == sha), None)
+        if not match:
+            return {"error": "demo_not_found", "sha": sha}, 404
+        path = Path(match["demo_path"])
+        if not path.exists():
+            return {"error": "file_missing", "path": str(path)}, 410
+
+        try:
+            from api_client import parse_and_score_locally  # lazy
+            log.info(
+                "/demos/%s/score — parsing + scoring com target_steamid=%s",
+                sha, target_steamid,
+            )
+            match_doc = parse_and_score_locally(path, target_steamid)
+            return jsonify(match_doc)
+        except FileNotFoundError as e:
+            log.error("/demos/%s/score — file not found: %s", sha, e)
+            return {"error": "file_missing", "detail": str(e)}, 410
+        except Exception as e:
+            log.error("/demos/%s/score — failed: %s", sha, e, exc_info=True)
+            return {"error": "score_failed", "detail": str(e)}, 500
+
     @app.get("/demos/<sha>/roster")
     def demo_roster(sha: str):
         """Sprint #5 — Pro Demo Render Phase A.
