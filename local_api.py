@@ -318,8 +318,15 @@ def create_app(
         target_steamid) — re-clicar mesmo player não re-parse. Hoje cada
         call re-roda. Backlog Sprint #7.6.
         """
-        body = request.get_json(silent=True) or {}
-        target_steamid = str(body.get("target_steamid", "")).strip()
+        # Sprint #7 hotfix (05/05): force=True parseia JSON mesmo se cliente
+        # não setar Content-Type: application/json. Defensive — versão antiga
+        # do scoreDemoForPlayer no web omitia o header → body vazio → 400.
+        # Plus fallback pra query string ?target_steamid= pra compat curl/debug.
+        body = request.get_json(silent=True, force=True) or {}
+        target_steamid = (
+            str(body.get("target_steamid", "")).strip()
+            or request.args.get("target_steamid", "").strip()
+        )
         if not target_steamid:
             return {"error": "target_steamid_required"}, 400
 
