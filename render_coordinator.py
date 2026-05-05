@@ -369,6 +369,26 @@ class RenderCoordinator:
                 assert self._session is not None
                 return self._session
 
+            # 05/05 fix (Mathieu reportou bars 100% imediato no retry pós-CS busy):
+            # quando user clicava render → CS busy → fechava CS → retry, AdModal
+            # da segunda tentativa polls /render/status e via session.state="done"
+            # do render anterior porque self._session NÃO era resetado pra terminal
+            # states. Bars all jumped to 100% instantly.
+            #
+            # Fix: se session está em terminal state (done/error/cancelled) E
+            # thread não está vivo, reset pra None ANTES de qualquer raise futuro.
+            # Isso garante que /render/status entre attempts retorne "idle"
+            # ao invés de stale "done", eliminando race no AdModal.
+            if (
+                self._session is not None
+                and self._session.state in ("done", "error", "cancelled")
+            ):
+                log.debug(
+                    "clearing terminal session %s (state=%s) before new render",
+                    self._session.render_id, self._session.state,
+                )
+                self._session = None
+
             pids = find_running_cs2_pids()
             if pids:
                 if force_kill_cs2:
