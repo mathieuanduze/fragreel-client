@@ -450,6 +450,23 @@ class RenderCoordinator:
             # Stage 1: write capture.cfg
             self._update(state="staging", stage="writing capture.cfg", progress=0.01)
             self._runner.stage_capture_cfg(plan)
+
+            # Stage 1b (05/05 — pro demo fix): garantir que o .dem está em
+            # <CS2>/game/csgo/replays/. CS2 só carrega demo via
+            # `playdemo replays/<basename>`; se file não está lá, CS2
+            # silenciosamente cai no main menu, capture nunca dispara, e o
+            # render trava até no-frames-timeout (5min) abortar.
+            #
+            # Sintoma reportado: pro demos baixadas de HLTV/BLAST caem em
+            # ~/Downloads/. Scanner inclui Downloads/ (steam_detect
+            # find_all_demo_dirs), então user vê a demo na /library, mas
+            # render falha porque demo não está em replays/.
+            #
+            # Fix: stage_demo_to_replays é idempotente (skip se já lá,
+            # hardlink se mesmo volume, copy fallback). ~0s pra demos do
+            # CS2 nativo, ~1-3s copy pra pro demos de Downloads.
+            self._update(stage="preparando demo", progress=0.02)
+            self._runner.stage_demo_to_replays(plan)
             self._update(progress=PROGRESS_STAGING)
 
             if self._cancel_requested.is_set():

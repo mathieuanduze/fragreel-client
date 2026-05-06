@@ -325,6 +325,101 @@ class HlaeRunner:
             show_xray=plan.show_xray,
         )
 
+    # -- stage 1b -----------------------------------------------------------
+
+    def stage_demo_to_replays(self, plan: RenderPlan) -> Path:
+        """Ensure the .dem file lives at <CS2>/game/csgo/replays/<basename>.dem.
+
+        Why this exists (05/05 — pro demo bug, Mathieu reportou Round 4d Fase 6.x
+        "CS abre, parece tentar abrir a demo, mas tela do CS vai pro menu
+        principal"):
+
+        CS2 resolve `playdemo replays/<basename>` relativo ao mod dir ativo
+        (csgo/). Se o .dem NÃO está exatamente em <CS2>/game/csgo/replays/,
+        CS2 silenciosamente aborta o +playdemo e cai no main menu — sem
+        erro no stdout, sem flash de console. Capture nunca dispara, no-frames
+        timeout (5min, v0.6.19+) eventualmente aborta.
+
+        Pro demos baixadas de HLTV/BLAST/CSGOStats caem em ~/Downloads/.
+        Scanner inclui Downloads/ nas pastas escaneadas (steam_detect.py
+        find_all_demo_dirs), então user vê a demo em /library e pode clicar
+        render. Mas hlae_runner._cs2_launch_args sempre usa
+        `+playdemo replays/<basename>` — file-not-found em silêncio.
+
+        Esta função stage o .dem pra replays/ antes do launch.
+
+        Estratégia (best → worst):
+          1. Skip se demo_path já está em replays/ (idempotente em retries
+             e demos que já estavam lá originalmente).
+          2. Skip se já existe replays/<basename>.dem com mesmo size (cheap
+             dedupe; full hash seria 100MB+ read).
+          3. Hardlink (os.link) — instantâneo, zero disco, mesmo volume.
+          4. Copy (shutil.copy2) — fallback cross-volume ou FS sem hardlink.
+
+        rule_fix_both_branches: NÃO trato só "pro demo from Downloads" path.
+        Demos do CS2 nativo já estão em replays/ ou csgo/. Pro demo from
+        Downloads é o trigger, mas a regra "demo precisa estar em replays/
+        pré-launch" é universal — código stage idempotente trata os 2 casos.
+
+        Returns:
+            Path do .dem em replays/. plan.demo_basename já bate com o
+            basename (Path.stem é nome-sem-extensão), então +playdemo args
+            funcionam direto sem mudar o RenderPlan.
+        """
+        replays_dir = self.config.cs2_install / CS2_REPLAYS_REL
+        replays_dir.mkdir(parents=True, exist_ok=True)
+        src = plan.demo_path
+        target = replays_dir / src.name
+
+        if not src.exists():
+            raise FileNotFoundError(f"demo source missing: {src}")
+
+        # Already in place? Compare resolved paths (handles symlinks).
+        try:
+            if target.exists() and target.resolve() == src.resolve():
+                log.info("demo já em replays/ (mesmo arquivo): %s", target)
+                return target
+        except Exception:
+            pass
+
+        # Target exists with same size? Assume same demo, skip re-stage.
+        if target.exists():
+            try:
+                if target.stat().st_size == src.stat().st_size:
+                    log.info(
+                        "demo já em replays/ (size match %.1f MB) — skip stage",
+                        target.stat().st_size / 1024 / 1024,
+                    )
+                    return target
+            except Exception:
+                pass
+            # Size mismatch — user pode ter substituído a demo com mesmo nome.
+            # Remover pra hardlink/copy abaixo não falhar com EEXIST.
+            try:
+                target.unlink()
+                log.info("removeu replays/%s (size mismatch) antes de re-stage", src.name)
+            except Exception as e:
+                log.warning("não conseguiu remover replays/%s: %s", src.name, e)
+
+        # Try hardlink (instant, zero-copy)
+        try:
+            os.link(src, target)
+            log.info("demo hardlinked → %s (zero-copy)", target)
+            return target
+        except OSError as e:
+            log.info("hardlink falhou (%s) — caindo pra copy", e)
+
+        # Fallback: copy
+        size_mb = src.stat().st_size / 1024 / 1024
+        log.info("copiando demo pra replays/ (%.1f MB) — pode levar alguns segundos", size_mb)
+        try:
+            shutil.copy2(src, target)
+            log.info("demo copiado → %s", target)
+            return target
+        except Exception as e:
+            log.error("falha ao copiar demo pra replays/: %s", e)
+            raise
+
     # -- stage 2 ------------------------------------------------------------
 
     def launch_cs2(
