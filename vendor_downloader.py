@@ -128,9 +128,36 @@ ProgressCallback = Callable[[str, int, int], None]
 
 
 def is_vendor_complete() -> bool:
-    """Quick check sem download — todos os marker paths existem?
+    """Quick check sem download — todos os marker paths existem E editor
+    está na versão do client atual?
 
     Usado por main.py pra detectar first-run vs warm-run sem bloquear.
+
+    06/05 BUG FIX (Mathieu reportou: render do reel ZyWoo + Vitality vs
+    GamerLegion mostrou intro ~1.5s e outro ~2.7s — valores PRÉ-v0.6.20.
+    Cliente estava em v0.6.21 mas editor zip continuava sendo o de v0.6.18
+    era):
+
+    Bug original era: `is_vendor_complete()` só checava existência de
+    arquivos (package.json, remotion/cli/dist/index.js, ffmpeg, etc).
+    Quando user atualizava o client (v0.6.18 → v0.6.21), os arquivos do
+    editor antigo continuavam lá → is_vendor_complete=True → ensure_editor
+    NÃO era chamado → version marker nunca verificado → editor stale para
+    sempre.
+
+    O fix de version marker que shippei em v0.6.20 (commit 00fb206) ESTAVA
+    em ensure_editor, mas ensure_editor só roda em first-run. Warm-run
+    (vendor populado) skipava completamente. Resultado: v0.6.20 fix era
+    no-op pra users que já tinham vendor populado.
+
+    Fix definitivo: comparar version marker do editor com client version
+    AQUI no is_vendor_complete. Mismatch → return False → triggers full
+    ensure_vendor_runtime → ensure_editor com force re-download (versão
+    bate, marker é re-escrito).
+
+    rule_fix_both_branches: NÃO trato só "version marker missing" path.
+    Regra universal: editor marker version DEVE bater com client version,
+    senão vendor está stale. 1 check, todos os scenarios cobertos.
     """
     markers = [
         hook_dll_path(),     # HLAE
@@ -146,6 +173,43 @@ def is_vendor_complete() -> bool:
         if not marker.exists():
             log.debug("is_vendor_complete: marker %s missing", marker)
             return False
+
+    # 06/05 — editor version freshness check.
+    version_marker = editor_dir() / ".fragreel-editor-version"
+    if not version_marker.exists():
+        log.info(
+            "is_vendor_complete: editor version marker missing — pode ser "
+            "vendor pré-v0.6.20 sem marker. Forçando re-check pra setup_editor "
+            "decidir."
+        )
+        return False
+
+    try:
+        cached_editor_version = version_marker.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        log.warning("is_vendor_complete: falha lendo version marker (%s) — re-check", e)
+        return False
+
+    # Compara com client version (mesma source-of-truth de
+    # setup_editor_download._resolve_default_version).
+    try:
+        from version import __version__  # type: ignore
+        current_client_version = __version__
+    except Exception:
+        # Sem version.py → assume "latest" (raro, dev mode). Pra warm-run
+        # check é seguro retornar True nesse caso (não temos como
+        # comparar).
+        log.debug("is_vendor_complete: version.py não disponível, skip version check")
+        return True
+
+    if cached_editor_version != current_client_version:
+        log.info(
+            "is_vendor_complete: editor version mismatch (cached=%s, client=%s) — "
+            "marcando vendor como stale pra forçar re-download",
+            cached_editor_version, current_client_version,
+        )
+        return False
+
     return True
 
 
