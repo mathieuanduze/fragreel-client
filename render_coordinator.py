@@ -133,6 +133,15 @@ TGA_WORST_CASE_FACTOR = 1.0     # 100% do total_frames como TGAs ao mesmo tempo
 MID_CAPTURE_DISK_FLOOR_BYTES = 3 * 1024 ** 3  # 3 GB
 MID_CAPTURE_DISK_CHECK_INTERVAL_SEC = 15.0    # checa a cada 15s
 
+# 05/05 (Mathieu PC stuck-at-7% report): hard timeout de "no frames captured".
+# CS2 launch + HLAE warmup tipicamente 30-90s. Pro demos podem ser lentas
+# (loading externo). 5 min é teto MUITO acima do normal — se passou, algo
+# tá genuinamente errado (HLAE injection failed, demo corrupt, spec_player
+# name encoding, etc). Aborta com degraded=true pra UI mostrar "renderização
+# travou — possível issue com demo" em vez de stuck infinito.
+NO_FRAMES_TIMEOUT_SEC = 300.0    # 5 min sem 1 frame capturado → abort
+NO_FRAMES_CHECK_INTERVAL_SEC = 30.0  # checa a cada 30s (não polui log)
+
 
 class InsufficientDiskError(RuntimeError):
     """Not enough free disk on either the CS2 capture drive or the output drive."""
@@ -558,9 +567,59 @@ class RenderCoordinator:
             )
             disk_monitor_thread.start()
 
+            # 05/05 — no-frames timeout monitor. Aborta render se passar
+            # NO_FRAMES_TIMEOUT_SEC sem capturar 1 frame sequer (HLAE injection
+            # failed, demo corrupt, spec_player encoding mismatch, etc).
+            # Sem isso, render fica stuck infinito com CS2 consumindo CPU
+            # sem produzir nada (Mathieu reportou 30+ min stuck).
+            no_frames_stop = threading.Event()
+            no_frames_start = time.time()
+
+            def _no_frames_monitor() -> None:
+                while not no_frames_stop.is_set():
+                    if self._cancel_requested.is_set():
+                        return
+                    if first_frame_seen.is_set():
+                        return  # frame chegou, monitor não precisa mais
+                    elapsed = time.time() - no_frames_start
+                    if elapsed >= NO_FRAMES_TIMEOUT_SEC:
+                        log.error(
+                            "no-frames timeout: %.0fs sem capturar frame algum. "
+                            "Possíveis causas: HLAE injection silenciosamente falhou, "
+                            "demo corrupt/incompatível, spec_player name encoding, "
+                            "antivírus bloqueando. Cancelando render.",
+                            elapsed,
+                        )
+                        with self._lock:
+                            if self._session is not None:
+                                self._session.degraded = True
+                                self._session.degraded_reason = (
+                                    f"Render travou — CS2 não capturou frame algum em "
+                                    f"{int(elapsed)}s. Possível incompatibilidade com "
+                                    f"essa demo ou bloqueio de antivírus. Tente outra demo "
+                                    f"ou reinicie FragReel."
+                                )
+                                self._session.stage = "⚠️ render abortado: timeout sem frames"
+                        self._cancel_requested.set()
+                        return
+                    no_frames_stop.wait(timeout=NO_FRAMES_CHECK_INTERVAL_SEC)
+
+            no_frames_thread = threading.Thread(
+                target=_no_frames_monitor,
+                name="fragreel-no-frames-monitor",
+                daemon=True,
+            )
+            no_frames_thread.start()
+
             def on_progress(now: int, prev: int) -> None:
-                # Bug #15: primeira frame chegou — para heartbeat warmup.
-                if not first_frame_seen.is_set():
+                # Bug #15: primeira frame REAL chegou — para heartbeat warmup.
+                # 05/05 BUG FIX (Mathieu reportou stage congelado em "0s"):
+                # hlae_runner inicializa last_total=-1 e dispara on_progress
+                # toda vez que `current != last`, incluindo a 1ª chamada com
+                # now=0 (0 != -1). Render coordinator interpretava como
+                # "first frame" → parava heartbeat → stage congelava em "0s".
+                # Fix: só set first_frame_seen quando now > 0 (frame real).
+                if now > 0 and not first_frame_seen.is_set():
                     first_frame_seen.set()
                     warmup_stop.set()
                 if self._cancel_requested.is_set():
@@ -662,9 +721,10 @@ class RenderCoordinator:
                 raise
             finally:
                 # Bug #22 (28/04): captura terminou (success/error/cancel)
-                # — para o disk monitor e o warmup heartbeat se ainda ativos.
+                # — para os monitores. Plus 05/05: para no_frames monitor.
                 disk_monitor_stop.set()
                 warmup_stop.set()
+                no_frames_stop.set()
 
             # Backfill mov_paths into the result dataclass.
             result = result.with_movs(converted_movs)
