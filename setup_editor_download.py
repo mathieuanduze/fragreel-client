@@ -135,14 +135,42 @@ def ensure_editor(
     cli_dist_marker = (
         target_dir / "node_modules" / "@remotion" / "cli" / "dist" / "index.js"
     )
+    # 05/05 BUG FIX (Mathieu reportou flash + bomb timer não aparecendo
+    # mesmo após update de v0.6.13 → v0.6.18): editor cache é persistente
+    # em %APPDATA%/FragReel/editor mas client update NÃO disparava re-download.
+    # Resultado: client v0.6.18 com editor zip de v0.6.13 (sem Sprint #6
+    # features). Marker file guarda a versão do client que baixou o editor.
+    # Se diferente da versão atual → força re-download.
+    version_marker = target_dir / ".fragreel-editor-version"
+    cached_version = None
+    if version_marker.exists():
+        try:
+            cached_version = version_marker.read_text(encoding="utf-8").strip()
+        except Exception:
+            cached_version = None
 
-    # Skip se completo + force=False
-    if not force and package_json.exists() and cli_dist_marker.exists():
-        log.info("Editor já presente em %s — skip download", target_dir)
+    # Skip se completo + version match + force=False
+    if (
+        not force
+        and package_json.exists()
+        and cli_dist_marker.exists()
+        and cached_version == version
+    ):
+        log.info("Editor já presente em %s (versão %s) — skip download", target_dir, version)
         return True
+
+    if (package_json.exists() or cli_dist_marker.exists()) and cached_version != version:
+        log.info(
+            "Editor cache stale: cached version=%s, requested version=%s → re-download",
+            cached_version, version,
+        )
 
     if force and target_dir.exists():
         log.info("force=True, removendo %s", target_dir)
+        shutil.rmtree(target_dir, ignore_errors=True)
+    elif (package_json.exists() or cli_dist_marker.exists()):
+        # Stale cache cleanup (sem force flag, mas version mismatch)
+        log.info("removendo editor stale antes de re-download: %s", target_dir)
         shutil.rmtree(target_dir, ignore_errors=True)
 
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -189,9 +217,17 @@ def ensure_editor(
             f"deve preservar node_modules/*/dist (NÃO usar ignore-recursive)."
         )
 
+    # 05/05 — escreve marker pra evitar re-download desnecessário em runs
+    # subsequentes do mesmo client version. Update de client → version
+    # mismatch → force re-download.
+    try:
+        version_marker.write_text(version, encoding="utf-8")
+    except Exception as e:
+        log.warning("Não conseguiu escrever version marker (%s): %s", version_marker, e)
+
     log.info(
-        "Editor instalado em %s (Bug #13 V2 sanity check ✓ — @remotion/cli/dist OK)",
-        target_dir,
+        "Editor instalado em %s versão %s (Bug #13 V2 sanity check ✓)",
+        target_dir, version,
     )
     return True
 

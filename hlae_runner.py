@@ -1385,28 +1385,21 @@ class HlaeRunner:
         cmd += [
             # Round 4c Fase 1.21 — crop bottom 60px pra remover demo playback
             # bar do CS2 Source 2 (faixa preta + scrubber + "[G] ativar
-            # controle..." + "1x" label). Fase 1.19 #7 tentou 6 cvars
-            # defensive Panorama (`spec_show_xray 0`, `cl_show_observer_*`,
-            # etc.) mas PC test confirmou demo bar AINDA visível em t=20s,
-            # 26s, 38s, 50s, 56s, 65s. Esses widgets vivem em sistema
-            # Panorama separado do HUD bag controlado por cl_drawhud, sem
-            # cvar conhecido pra desligar (pesquisa community indecisa).
+            # controle..." + "1x" label). Fase 1.19 #7 tentou cvars defensive
+            # mas demo bar persistia.
             #
-            # Solution determinística: ffmpeg crop. Demo bar fica nos últimos
-            # ~40-60px do bottom. Crop 60px com pad to keep aspect 1080×1920
-            # (senão Remotion OffthreadVideo precisa stretch). pad cor preta
-            # = invisível no fundo escuro do reel + tem o gradient overlay
-            # bottom do FragReel Remotion na cena.
+            # 05/05 BUG FIX (Mathieu): versão antiga `crop=...,pad=ih+60:black`
+            # adicionava 60px black bar bottom pra preservar aspect 1080×1920.
+            # Mas watermark em bottom:56 caía DENTRO do pad → "tarja preta com
+            # watermark abaixo do vídeo". User reportou: "vídeo deve preencher
+            # 100% da tela, watermark sobre o vídeo".
             #
-            # Trade-off: perde 60px de gameplay no bottom (~3% da altura
-            # 1920px). Aceito vs UX broken por demo bar visível. Pad bottom
-            # de 60px preto fica invisível pq Remotion adiciona gradient
-            # overlay bottom (HighlightScene line ~244-249).
-            #
-            # Pro futuro (Fase 2+): tentar HLAE `mirv_streams add world` em
-            # vez de `normal` (captura framebuffer pré-Panorama compositing)
-            # OU SDK Source 2 widget unhide via reverse-engineering.
-            "-vf", "crop=iw:ih-60:0:0,pad=iw:ih+60:0:0:black",
+            # Fix: SÓ crop, sem pad. Source vira 1080×1860. Remotion
+            # OffthreadVideo (objectFit: cover) scaleia pra 1080×1920 da
+            # composition, fazendo crop horizontal mínimo (3.2%) nas
+            # laterais. Net: sem black bar, watermark sobre gameplay,
+            # mínima perda lateral imperceptível.
+            "-vf", "crop=iw:ih-60:0:0",
             "-c:v", "prores_ks",
             # Round 4c Fase 1.9 (PC catched 26/04 03:25): trocar profile 4444
             # → 3 (422 HQ) E pix_fmt yuva444p10le → yuv422p10le.
