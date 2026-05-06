@@ -505,11 +505,22 @@ class HlaeRunner:
             "-novid",
             "-windowed",
             "-noborder",
+            "-sw",  # 06/05 — alternative windowed flag (alguns builds CS2
+                    # respeitam -sw mas não -windowed dependendo do patch).
+                    # Idempotente — se -windowed já tá ativo, -sw é no-op.
             "-x", "-32000",
             "-y", "-32000",
             "-w", str(w),
             "-h", str(h),
             "+mat_fullscreen", "0",
+            # 06/05 — Mathieu reportou 06/05 que CS2 voltou a abrir fullscreen
+            # após ele mudar o CS2 GUI pra fullscreen pra jogo normal. Bug
+            # #14 V2 reforça file pre-write, mas mat_setvideomode é belt-and-
+            # suspenders: força videomode windowed direto no boot, sobrescreve
+            # qualquer config saved que escapou do pre-write.
+            # Sintaxe: mat_setvideomode <width> <height> <windowed?>
+            #   windowed: 1 = windowed, 0 = fullscreen
+            "+mat_setvideomode", str(w), str(h), "1",
             "+fps_max", "0",
             "+mat_queue_mode", "2",
             "+playdemo", f"replays/{plan.demo_basename}",

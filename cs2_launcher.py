@@ -656,12 +656,69 @@ def _cs2video_paths(cs2_exe: Path) -> list[Path]:
     return candidates
 
 
+def _force_windowed_in_content(content: str, file_label: str) -> tuple[str, list[str]]:
+    """06/05 Bug #14 V2 — defensive multi-key fullscreen overwrite.
+
+    Bug #14 V1 (28/04) handled `setting.fullscreen` em cs2_video.txt e
+    `setting.fullscreen_mode` em videosettings.txt como mutuamente
+    exclusivos por file. Mas Mathieu reportou (06/05) regressão: depois
+    de mudar CS2 GUI pra fullscreen e voltar pro fragreel render, CS2
+    abriu fullscreen novamente.
+
+    Hipóteses:
+      A) CS2 escreve AMBAS as chaves em UM dos files (cross-pollination)
+      B) CS2 adicionou nova chave (ex: setting.window_mode) que vence
+      C) Steam Cloud Sync substitui o file pós-pre-write antes do launch
+
+    Fix V2: aplicar TODAS as chaves fullscreen-related em TODOS os files,
+    independente do file (idempotente — no-op se chave ausente). Também
+    nowindowborder=1 em ambas variações.
+
+    Returns (new_content, list_of_changes_for_logging).
+    """
+    changes: list[str] = []
+
+    # All fullscreen-like keys → "0"
+    fullscreen_patterns = [
+        (r'("setting\.fullscreen_mode"\s*)"(\d+)"', "fullscreen_mode"),
+        (r'("setting\.fullscreen"\s*)"(\d+)"', "fullscreen"),
+        (r'("setting\.window_mode"\s*)"(\d+)"', "window_mode"),  # defensivo, futuro CS2
+    ]
+    new_content = content
+    for pattern, name in fullscreen_patterns:
+        def _replacer(m: "re.Match[str]") -> str:
+            old_val = m.group(2)
+            if old_val != "0":
+                changes.append(f"{file_label}: {name} {old_val}→0")
+            return m.group(1) + '"0"'
+        new_content = re.sub(pattern, _replacer, new_content)
+
+    # All nowindowborder-like keys → "1" (sem borda = full canvas pra HLAE capturar)
+    border_patterns = [
+        (r'("setting\.nowindowborder"\s*)"(\d+)"', "nowindowborder"),
+    ]
+    for pattern, name in border_patterns:
+        def _replacer(m: "re.Match[str]") -> str:
+            old_val = m.group(2)
+            if old_val != "1":
+                changes.append(f"{file_label}: {name} {old_val}→1")
+            return m.group(1) + '"1"'
+        new_content = re.sub(pattern, _replacer, new_content)
+
+    return new_content, changes
+
+
 def force_windowed_cs2_video(cs2_exe: Path) -> bool:
     """Bug #14 fix: force setting.fullscreen "0" em cs2_video.txt antes do launch.
 
     Análogo ao force_windowed_videosettings (Bug #12) mas pro arquivo NOVO
     introduzido em alguma versão recente do CS2 que VENCE sobre tudo:
     videosettings.txt + CLI -windowed -noborder + +mat_fullscreen 0.
+
+    06/05 V2 (Mathieu reportou regressão pós-mudar CS2 GUI pra fullscreen):
+    aplica TODAS as chaves fullscreen-related cobertas (setting.fullscreen,
+    setting.fullscreen_mode, setting.window_mode), não só setting.fullscreen.
+    Cobre cross-pollination entre files OU novas chaves CS2 patches.
 
     Returns True se escreveu em algum file, False se nada precisava update.
     Idempotente. Backup automático em <file>.fragreel.bak (uma vez só).
@@ -685,17 +742,23 @@ def force_windowed_cs2_video(cs2_exe: Path) -> bool:
                 except Exception as e:
                     log.warning("Bug #14 fix: falhou backup %s: %s", backup, e)
 
-            # Force setting.fullscreen=0 (windowed)
-            new_content = _CS2VIDEO_FULLSCREEN_RE.sub(r'\1"0"', content)
-            # Garantir nowindowborder=1
-            new_content = _CS2VIDEO_NOWINDOWBORDER_RE.sub(r'\1"1"', new_content)
+            new_content, changes = _force_windowed_in_content(content, "cs2_video")
 
             if new_content != content:
                 path.write_text(new_content, encoding="utf-8")
-                log.info("Bug #14 fix: forcei windowed em %s", path)
+                log.info("Bug #14 V2: forcei windowed em %s — changes=%s", path, changes)
                 wrote = True
             else:
-                log.debug("Bug #14 fix: %s já estava em windowed (no-op)", path)
+                # Log o estado atual de chaves fullscreen pra diagnose se
+                # bug persistir (Mathieu vai mandar log se acontecer de novo).
+                fs_lines = [
+                    line.strip() for line in content.splitlines()
+                    if "fullscreen" in line.lower() or "window" in line.lower()
+                ]
+                log.debug(
+                    "Bug #14 V2: %s já estava em windowed (no-op). Linhas relevantes: %s",
+                    path.name, fs_lines[:8],
+                )
         except Exception as e:
             log.warning("Bug #14 fix: falhou em %s: %s (não-fatal, launch continua)", path, e)
 
@@ -731,17 +794,22 @@ def force_windowed_videosettings(cs2_exe: Path) -> bool:
                 except Exception as e:
                     log.warning("Bug #12 fix: não conseguiu criar backup %s: %s", backup, e)
 
-            # Force fullscreen_mode=0 (windowed)
-            new_content = _VIDEOSETTINGS_FULLSCREEN_RE.sub(r'\1"0"', content)
-            # Garantir nowindowborder=1 (preserva nosso -noborder do launch args)
-            new_content = _VIDEOSETTINGS_NOWINDOWBORDER_RE.sub(r'\1"1"', new_content)
+            # 06/05 V2 — multi-key coverage (mesma helper do Bug #14 V2)
+            new_content, changes = _force_windowed_in_content(content, "videosettings")
 
             if new_content != content:
                 path.write_text(new_content, encoding="utf-8")
-                log.info("Bug #12 fix: forcei windowed mode em %s", path.name)
+                log.info("Bug #12 V2: forcei windowed em %s — changes=%s", path.name, changes)
                 wrote = True
             else:
-                log.debug("Bug #12 fix: %s já estava em windowed (no-op)", path.name)
+                fs_lines = [
+                    line.strip() for line in content.splitlines()
+                    if "fullscreen" in line.lower() or "window" in line.lower()
+                ]
+                log.debug(
+                    "Bug #12 V2: %s já estava em windowed (no-op). Linhas relevantes: %s",
+                    path.name, fs_lines[:8],
+                )
         except Exception as e:
             log.warning("Bug #12 fix: falhou em %s: %s (não-fatal, launch continua)", path, e)
 
