@@ -469,6 +469,48 @@ def find_running_cs2_pids() -> list[int]:
     return pids
 
 
+def cs2_rss_bytes(pid: int) -> int:
+    """RSS (memory working set) do cs2.exe via `tasklist` em bytes.
+
+    Por que existe (06/05 — pro demo "stuck na main menu" diagnose):
+    pro demos com build mismatch (ex: BLAST GOTV demo num CS2 build mais
+    recente) fazem CS2 abrir, mostrar pop-up "versão incompatível" no menu,
+    e ficar parado aguardando dismiss. `+playdemo` nunca executa, capture
+    nunca dispara, no-frames timeout (300s) eventualmente aborta.
+
+    Heuristic pra detectar early: CS2 com demo carregada usa 5-7 GB RAM.
+    CS2 só no main menu (sem demo) usa ~3-4.5 GB. Se após N segundos pós-
+    launch o cs2.exe ainda está abaixo do threshold → demo não carregou →
+    abort com mensagem específica.
+
+    Returns 0 se PID não existe ou parsing falhou (caller deve tratar como
+    "não conseguiu medir, não decidir nada").
+    """
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, check=True, timeout=10,
+            creationflags=_NO_WINDOW,
+        ).stdout
+    except Exception as e:
+        log.warning("tasklist (rss check) failed for pid=%d: %s", pid, e)
+        return 0
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.startswith('"INFO'):
+            continue
+        parts = [p.strip('"') for p in line.split(",")]
+        # Format: "cs2.exe","21236","Console","1","4,124,260 K"
+        if len(parts) >= 5 and parts[0].lower() == "cs2.exe":
+            mem_str = parts[4].replace(",", "").replace(" ", "").rstrip("K").rstrip("k")
+            try:
+                # tasklist reports in KB
+                return int(mem_str) * 1024
+            except ValueError:
+                return 0
+    return 0
+
+
 def kill_running_cs2(*, wait_sec: float = 5.0) -> int:
     """Terminate all running cs2.exe processes. Returns how many were killed."""
     pids = find_running_cs2_pids()

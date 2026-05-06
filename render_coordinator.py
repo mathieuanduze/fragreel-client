@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from cs2_launcher import InjectedProcess, find_running_cs2_pids, kill_running_cs2
+from cs2_launcher import InjectedProcess, cs2_rss_bytes, find_running_cs2_pids, kill_running_cs2
 from hlae_runner import (
     HlaeRunner,
     HlaeRunnerConfig,
@@ -141,6 +141,29 @@ MID_CAPTURE_DISK_CHECK_INTERVAL_SEC = 15.0    # checa a cada 15s
 # travou — possível issue com demo" em vez de stuck infinito.
 NO_FRAMES_TIMEOUT_SEC = 300.0    # 5 min sem 1 frame capturado → abort
 NO_FRAMES_CHECK_INTERVAL_SEC = 30.0  # checa a cada 30s (não polui log)
+
+# CS2 menu-state detector (06/05 — pro demo build mismatch diagnose).
+# Pro demos com build mismatch (ex: BLAST GOTV gravado em build CS2 diferente
+# do instalado no PC) fazem CS2 abrir, mostrar pop-up "versão do jogo é
+# incompatível" no main menu, e ficar parado aguardando dismiss. +playdemo
+# nunca executa, capture nunca dispara, no-frames timeout 5min aborta com
+# mensagem genérica. UX ruim — user espera 5min pra error que era detectável
+# em 60s.
+#
+# Heurística: CS2 com demo carregada usa 5-7 GB RSS. CS2 só no main menu
+# (sem demo) usa 3-4.5 GB. Se após MENU_STATE_GRACE_SEC pós-launch o cs2.exe
+# ainda está abaixo de MENU_STATE_RAM_FLOOR_BYTES → demo provavelmente não
+# carregou (build mismatch, demo corrupt, dialog Steam bloqueando, etc) →
+# abort com reason específico apontando pra "demo incompatível".
+#
+# Threshold é conservador: 4.5 GB. Demos pequenas em CS2 leve podem ficar
+# em 5 GB, demos grandes em 7 GB+. Falso positive (matar render legítimo
+# que está só lento) é pior que falso negativo (esperar até no-frames),
+# então preferimos errar pelo lado conservador. Grace de 90s dá tempo pra
+# CS2 boot + asset preload + demo header parse antes de medir.
+MENU_STATE_GRACE_SEC = 90.0
+MENU_STATE_RAM_FLOOR_BYTES = int(4.5 * 1024 ** 3)  # 4.5 GB
+MENU_STATE_CHECK_INTERVAL_SEC = 15.0
 
 
 class InsufficientDiskError(RuntimeError):
@@ -627,6 +650,90 @@ class RenderCoordinator:
                 daemon=True,
             )
             no_frames_thread.start()
+
+            # 06/05 — CS2 menu-state monitor. Pro demos com build mismatch
+            # (BLAST GOTV em CS2 build diferente) fazem CS2 abrir, mostrar
+            # dialog "versão incompatível", e ficar parado no menu. +playdemo
+            # nunca executa. Sem este monitor, render fica esperando no-frames
+            # timeout 5min com mensagem genérica.
+            #
+            # Heurística: cs2.exe RSS após launch < 4.5 GB sustentado por
+            # 90s+ → demo não carregada. RAM real com demo = 5-7 GB.
+            # Aborta com reason específico que aponta pra "demo incompatível".
+            menu_state_stop = threading.Event()
+            menu_state_start = time.time()
+            cs2_pid = self._launched.pid if hasattr(self, "_launched") and self._launched else None
+            # _launched é setado por HlaeRunner._launch_injected, então via
+            # runner. Mas runner é instanceado em _run, então acesso via runner.
+            try:
+                cs2_pid = self._runner._launched.pid if self._runner and self._runner._launched else None
+            except Exception:
+                cs2_pid = None
+
+            def _menu_state_monitor() -> None:
+                # Grace period — CS2 precisa de 30-60s pra boot inicial
+                # antes de medir RAM. Não acuse stuck antes da hora.
+                while not menu_state_stop.is_set():
+                    if self._cancel_requested.is_set():
+                        return
+                    if first_frame_seen.is_set():
+                        return  # capture iniciou, demo carregou OK
+                    elapsed = time.time() - menu_state_start
+                    if elapsed < MENU_STATE_GRACE_SEC:
+                        menu_state_stop.wait(timeout=MENU_STATE_CHECK_INTERVAL_SEC)
+                        continue
+                    if not cs2_pid:
+                        # Sem PID, monitor cego — log uma vez e exit.
+                        log.info("menu-state monitor: cs2_pid desconhecido, skip check")
+                        return
+                    rss = cs2_rss_bytes(cs2_pid)
+                    if rss == 0:
+                        # cs2.exe sumiu? processo morreu? Deixa no-frames
+                        # timeout cuidar — não nosso escopo.
+                        log.info(
+                            "menu-state monitor: rss=0 pra pid=%d (processo morto?), skip",
+                            cs2_pid,
+                        )
+                        menu_state_stop.wait(timeout=MENU_STATE_CHECK_INTERVAL_SEC)
+                        continue
+                    rss_gb = rss / (1024 ** 3)
+                    if rss < MENU_STATE_RAM_FLOOR_BYTES:
+                        log.error(
+                            "menu-state monitor: cs2.exe pid=%d RSS=%.2f GB após %.0fs "
+                            "(floor=%.1f GB). Demo provavelmente não carregou — possível "
+                            "build mismatch (pro demo gravada em CS2 diferente) ou dialog "
+                            "Steam bloqueando. Abortando render com reason específico.",
+                            cs2_pid, rss_gb, elapsed,
+                            MENU_STATE_RAM_FLOOR_BYTES / (1024 ** 3),
+                        )
+                        with self._lock:
+                            if self._session is not None:
+                                self._session.degraded = True
+                                self._session.degraded_reason = (
+                                    "CS2 abriu mas a demo não carregou — provavelmente "
+                                    "essa demo foi gravada em uma versão diferente do "
+                                    "CS2. Erro comum com pro demos baixadas externamente "
+                                    "(HLTV, BLAST, etc). Tente uma demo do seu próprio "
+                                    "Steam history ou aguarde update do CS2."
+                                )
+                                self._session.stage = (
+                                    "⚠️ render abortado: CS2 não carregou a demo "
+                                    "(possível incompatibilidade de versão)"
+                                )
+                        self._cancel_requested.set()
+                        return
+                    log.info(
+                        "menu-state monitor: cs2.exe RSS=%.2f GB após %.0fs (>= floor) — demo carregada OK",
+                        rss_gb, elapsed,
+                    )
+                    return  # demo loaded, exit monitor
+
+            menu_state_thread = threading.Thread(
+                target=_menu_state_monitor,
+                name="fragreel-menu-state-monitor",
+                daemon=True,
+            )
+            menu_state_thread.start()
 
             def on_progress(now: int, prev: int) -> None:
                 # Bug #15: primeira frame REAL chegou — para heartbeat warmup.
