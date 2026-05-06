@@ -1489,23 +1489,30 @@ class HlaeRunner:
         if take.audio_path is not None:
             cmd += ["-i", str(take.audio_path), "-c:a", "aac", "-b:a", "192k"]
         cmd += [
-            # Round 4c Fase 1.21 — crop bottom 60px pra remover demo playback
-            # bar do CS2 Source 2 (faixa preta + scrubber + "[G] ativar
-            # controle..." + "1x" label). Fase 1.19 #7 tentou cvars defensive
-            # mas demo bar persistia.
+            # Round 4c Fase 1.21 — crop pra remover demo playback bar do CS2
+            # Source 2 (faixa preta + scrubber + "[G] ativar controle..." +
+            # "1x" label). Cvars defensive não funcionam (Fase 1.19 #7).
             #
-            # 05/05 BUG FIX (Mathieu): versão antiga `crop=...,pad=ih+60:black`
-            # adicionava 60px black bar bottom pra preservar aspect 1080×1920.
-            # Mas watermark em bottom:56 caía DENTRO do pad → "tarja preta com
-            # watermark abaixo do vídeo". User reportou: "vídeo deve preencher
-            # 100% da tela, watermark sobre o vídeo".
+            # 05/05 (Mathieu Issue A): removido `pad=ih+60:black` que punha
+            # tarja preta no bottom — watermark caía dentro dela.
+            # 06/05 BUG FIX (Mathieu): "crosshair fica acima do meio da mira
+            # da AWP". Root cause: crop ASSIMÉTRICO (só bottom) deslocava
+            # centro do frame pra cima. CS2 desenha crosshair + AWP scope
+            # em viewport center (game y=360 em 720p). Após crop bottom 60,
+            # frame vira 720→660 mas crosshair fica em y=360, frame center
+            # y=330. Crosshair acaba 30px abaixo do center do frame. Quando
+            # Remotion stretcha pra 1920, fica 87px abaixo do center visual.
+            # User percebe como "AWP scope visual center desalinhado" porque
+            # AWP scope (drawn por CS2 mesmo coords) também shift, mas algum
+            # elemento (provavelmente outer scope ring) ainda parece center
+            # do que era — desalinha.
             #
-            # Fix: SÓ crop, sem pad. Source vira 1080×1860. Remotion
-            # OffthreadVideo (objectFit: cover) scaleia pra 1080×1920 da
-            # composition, fazendo crop horizontal mínimo (3.2%) nas
-            # laterais. Net: sem black bar, watermark sobre gameplay,
-            # mínima perda lateral imperceptível.
-            "-vf", "crop=iw:ih-60:0:0",
+            # Fix V2: crop SIMÉTRICO. Drop 60 do bottom (demo bar) E 60 do top
+            # (sem HUD relevante quando cl_drawhud 0). Frame 1280x720 → 1280x600.
+            # Crosshair em game y=360 → cropped y=300 = NEW CENTER. Aligned.
+            # Aspect 1280/600 = 2.13 (mais wide). Remotion crop horizontal
+            # ligeiramente mais (5.5% vs 3.2% antes) — imperceptível.
+            "-vf", "crop=iw:ih-120:0:60",
             "-c:v", "prores_ks",
             # Round 4c Fase 1.9 (PC catched 26/04 03:25): trocar profile 4444
             # → 3 (422 HQ) E pix_fmt yuva444p10le → yuv422p10le.
