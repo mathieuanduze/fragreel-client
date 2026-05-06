@@ -802,6 +802,14 @@ def create_app(
         "https://github.com/mathieuanduze/fragreel-client/releases/latest/download/FragReel.exe"
     )
 
+    # 06/05 — guard contra duplo-click do botão "Atualizar". Mathieu reportou
+    # "telas pretas tipo terminal abrindo, fecho, abrem novas". Hipótese: user
+    # ou frontend disparou /update múltiplas vezes em sequência → múltiplos
+    # bats em paralelo, cada um tentando matar o outro + fazer swap → race +
+    # múltiplos consoles cmd.exe visíveis (ver fix das flags abaixo). Lock
+    # garante que /update só dispara 1 helper por session do client.
+    _update_in_progress = threading.Lock()
+
     @app.post("/update")
     def trigger_update():
         """Download the latest .exe and spawn a helper that swaps + relaunches.
@@ -809,8 +817,14 @@ def create_app(
         Returns 202 with `{started: true, ...}` on success. The Python
         process exits ~2s later — the frontend should poll `/version`
         until the new version answers (typically 5-15s end-to-end).
+
+        Idempotente em chamadas concorrentes: se já há um update em flight
+        (helper bat spawned + esse processo agendou exit), retorna 409 em
+        vez de spawnar um 2º helper. Evita race condition que causa múltiplos
+        consoles cmd.exe abrindo (06/05 Mathieu field report).
         """
         # Hard guards: only frozen Windows builds can self-update.
+        # (Antes do lock — guards são cheap e não devem segurar o lock.)
         if not getattr(sys, "frozen", False):
             return {
                 "error": "not_frozen",
@@ -821,6 +835,22 @@ def create_app(
                 "error": "unsupported_platform",
                 "detail": f"auto-update is Windows-only (got {sys.platform})",
             }, 501
+
+        # 06/05 — guard contra duplo-click. Lock acquire não-bloqueante:
+        # se outro request já está atualizando, retorna 409 imediato. NÃO
+        # release no success path — o processo exits em 2s, OS limpa o lock.
+        # Release explícito em todos os error paths antes do return.
+        if not _update_in_progress.acquire(blocking=False):
+            log.warning(
+                "auto-update: rejeitando request — update já em andamento"
+            )
+            return {
+                "error": "update_in_progress",
+                "detail": (
+                    "Update já está rodando — aguarde o client reiniciar "
+                    "(~5-15s) antes de tentar de novo."
+                ),
+            }, 409
 
         current_exe = Path(sys.executable)
         current_pid = os.getpid()
@@ -852,6 +882,7 @@ def create_app(
                     new_exe_path.unlink()
             except OSError:
                 pass
+            _update_in_progress.release()  # 06/05 — release lock pra próxima tentativa
             return {"error": "download_failed", "detail": str(e)}, 502
 
         # Sanity check — anything < 5 MB is almost certainly an error page
@@ -863,6 +894,7 @@ def create_app(
                 new_exe_path.unlink()
             except OSError:
                 pass
+            _update_in_progress.release()  # 06/05 — release lock pra próxima tentativa
             return {
                 "error": "download_too_small",
                 "detail": f"downloaded only {size} bytes — likely an error page, not the .exe",
@@ -923,8 +955,13 @@ def create_app(
             f'move /Y "{new_exe_path}" "{current_exe}" >> "%LOGFILE%" 2>&1\r\n'
             f"if not errorlevel 1 goto swap_ok\r\n"
             f'if "%ATTEMPT%"=="3" (\r\n'
-            f'  echo [%date% %time%] swap FAILED after 3 attempts — launching staging copy as fallback >> "%LOGFILE%"\r\n'
-            f'  start "" "{new_exe_path}"\r\n'
+            f'  echo [%date% %time%] swap FAILED after 3 attempts — launching staging copy as fallback (hidden) >> "%LOGFILE%"\r\n'
+            # 06/05 fix — `start "" "exe"` mostrava console window em algumas
+            # máquinas (Mathieu 06/05 reportou "telas pretas tipo terminal").
+            # Substituído por powershell Start-Process que cria processo com
+            # window handle próprio, desacoplado do cmd.exe pai. Mesma técnica
+            # do swap_ok path (linha ~951) já validada em campo.
+            f'  powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath \'{new_exe_path}\'" >> "%LOGFILE%" 2>&1\r\n'
             f"  exit /b 1\r\n"
             f")\r\n"
             f'echo [%date% %time%] attempt %ATTEMPT% failed — retrying in 2s >> "%LOGFILE%"\r\n'
@@ -955,17 +992,29 @@ def create_app(
         bat_path.write_text(bat_content, encoding="utf-8")
         log.info("auto-update: wrote helper bat=%s log=%s", bat_path, bat_log)
 
-        # Spawn detached so the bat survives our exit. CREATE_NO_WINDOW
-        # keeps the cmd console invisible to the user.
-        DETACHED_PROCESS = 0x00000008
+        # 06/05 — flags fix (Mathieu reportou "telas pretas tipo terminal,
+        # quando fecho abrem novas" durante auto-update v0.6.20→v0.6.21).
+        #
+        # Bug histórico: o spawn antes usava DETACHED_PROCESS | CREATE_NO_WINDOW
+        # juntos. Pela doc Microsoft (CreateProcess flags reference), essas
+        # 2 flags são MUTUAMENTE EXCLUSIVAS — comportamento indefinido quando
+        # passadas juntas. Em algumas máquinas Windows (versão / patch level)
+        # o cmd.exe acaba mostrando console window mesmo com CREATE_NO_WINDOW
+        # presente. Regressão de fix anterior (v0.2.x): alguém adicionou
+        # DETACHED_PROCESS depois "pra garantir que bat sobrevive", sem saber
+        # que CREATE_NO_WINDOW + close_fds + stdin/out/err=DEVNULL já dá
+        # o efeito desejado (bat é independente, não morre quando parent sai).
+        #
+        # Fix: usar SOMENTE CREATE_NO_WINDOW. CREATE_NEW_PROCESS_GROUP mantido
+        # pra desacoplar de Ctrl+C handlers do parent (defensivo, não conflita).
+        # subprocess.Popen + DEVNULL handles + close_fds=True garantem que
+        # o bat NÃO depende do parent stdio — sobrevive ao os._exit(0) abaixo.
         CREATE_NEW_PROCESS_GROUP = 0x00000200
         CREATE_NO_WINDOW = 0x08000000
         try:
             subprocess.Popen(
                 ["cmd.exe", "/c", str(bat_path)],
-                creationflags=(
-                    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-                ),
+                creationflags=(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW),
                 close_fds=True,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -973,6 +1022,7 @@ def create_app(
             )
         except Exception as e:
             log.exception("auto-update: failed to spawn helper")
+            _update_in_progress.release()  # 06/05 — release lock pra próxima tentativa
             return {"error": "helper_spawn_failed", "detail": str(e)}, 500
 
         # Schedule our own exit on a daemon thread so the response can flush
