@@ -650,6 +650,35 @@ def create_app(
         if not user_player_name and isinstance(reel_props, dict):
             user_player_name = reel_props.get("playerName")
 
+        # Sprint #6.5 (06/05) — POV vítima cuts. Web envia match.highlights
+        # com kills marcados pov_eligible=True pelo scorer (top 1-2 do reel
+        # por aesthetic_score). Aqui extraímos (kill_tick, victim_name) das
+        # kills selecionadas + filtramos os que estão DENTRO de algum segmento
+        # (segments podem ter sido cluster-merged, kill pode estar fora).
+        # Editor/capture só faz cut se kill cair dentro de segment ativo.
+        pov_cuts: list[tuple[int, str]] = []
+        if isinstance(reel_props, dict):
+            match = reel_props.get("match")
+            if isinstance(match, dict):
+                highlights = match.get("highlights") or []
+                for hl in highlights:
+                    for k in (hl.get("kills") or []):
+                        if not k.get("pov_eligible"):
+                            continue
+                        kt = k.get("kill_tick")
+                        vn = k.get("victim_name")
+                        if kt is None or not vn:
+                            continue
+                        try:
+                            kt_int = int(kt)
+                        except (ValueError, TypeError):
+                            continue
+                        # Filter: kill_tick deve cair em algum segmento
+                        if any(s <= kt_int <= e for s, e in segments):
+                            pov_cuts.append((kt_int, str(vn)))
+        if pov_cuts:
+            log.info("/render — POV cuts: %d", len(pov_cuts))
+
         plan = RenderPlan(
             demo_path=demo,
             segments=tuple(segments),
@@ -659,6 +688,7 @@ def create_app(
             stream_name=body.get("stream_name", "default"),
             # Round 4c Fase 1.21 — x-ray opt-in. Web envia bool no payload.
             show_xray=bool(body.get("show_xray", False)),
+            pov_cuts=tuple(pov_cuts),
         )
 
         render_id = body.get("render_id") or uuid.uuid4().hex[:12]

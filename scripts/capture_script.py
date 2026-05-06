@@ -571,6 +571,14 @@ class CaptureScriptPlan:
     # no match-page → web envia `show_xray` no payload → client
     # converte pra `spec_show_xray 1` (ON) ou `0` (OFF, default).
     show_xray: bool = False
+    # Sprint #6.5 (06/05) — POV vítima cuts. Lista de tuplas
+    # (kill_tick, victim_player_name) pras quais o capture deve fazer
+    # SNAP CUT pra POV da vítima. Janela: [-32 ticks (~0.5s @ 64tps),
+    # +19 ticks (~0.3s @ 64tps)] em volta de kill_tick.
+    # Single-pass — o stream captura attacker até kill_tick-32, daí spec_player
+    # vítima até kill_tick+19, daí volta pra attacker. Sem fade transition
+    # (snap cut style fragmovie). 2-pass + fade fica pra iteração futura.
+    pov_cuts: tuple[tuple[int, str], ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if not self.segments:
@@ -900,6 +908,62 @@ def build_cfg_content(plan: CaptureScriptPlan) -> str:
                     lines.append(_emit_addAtTick(emit_tick, cmd))
                 relock_tick += CAMERA_RELOCK_INTERVAL_TICKS
 
+        # Sprint #6.5 (06/05) — POV vítima snap cuts.
+        # Pra cada kill_tick em plan.pov_cuts que cair DENTRO desse segment,
+        # emite spec_player switch pra vítima na janela [-32 ticks, +19 ticks]
+        # em volta da kill (~0.5s antes, +0.3s depois @ 64tps). Snap cut
+        # estilo fragmovie — sem fade transition (essa fica pra 2-pass
+        # capture iteração futura).
+        #
+        # IMPORTANTE: o re-lock periódico acima vai sobrescrever o
+        # spec_player victim. Por isso emitimos o switch DEPOIS dos re-locks
+        # in this loop iteration order, e usamos ticks específicos do POV
+        # window — quando relock cair fora dessa janela, attacker é
+        # restored automaticamente. Quando cair DENTRO, o último command
+        # no mesmo tick wins (CS2 processa em ordem de adição).
+        # Pra evitar conflict, suprimimos relocks dentro do POV window via
+        # tick comparison: relock_tick em [pov_start, pov_end] é skipped.
+        # (TODO se conflicts in field test: refatorar pra emit relocks
+        # primeiro, dps POV switches — Python emit order = CS2 process
+        # order quando ticks idênticos.)
+        for kill_tick, victim_name in plan.pov_cuts:
+            if not (seg.start_tick <= kill_tick <= seg.end_tick):
+                continue
+            POV_PRE_TICKS = 32   # ~0.5s @ 64 tps
+            POV_POST_TICKS = 19  # ~0.3s @ 64 tps
+            pov_start = max(seg.start_tick + 1, kill_tick - POV_PRE_TICKS)
+            pov_end = min(seg.end_tick - 1, kill_tick + POV_POST_TICKS)
+            if pov_end <= pov_start:
+                continue  # window inviável
+            safe_victim = _quote_player_name(victim_name)
+            if not safe_victim:
+                log.warning(
+                    "POV cut skipped — victim_name vazio pós-sanitize: %r",
+                    victim_name,
+                )
+                continue
+            # Switch pra vítima no início da janela
+            lines.append(_emit_addAtTick(
+                pov_start, f'spec_player "{safe_victim}"'
+            ))
+            lines.append(_emit_addAtTick(
+                pov_start + CAMERA_MODE_DELAY_TICKS, "spec_mode 1"
+            ))
+            lines.append(_emit_addAtTick(
+                pov_start, f'echo "[FragReel] POV cut start tick {kill_tick} → {safe_victim}"'
+            ))
+            # Switch BACK pro atacante no fim da janela (re-emit do
+            # camera_lock_cmds — mesmas linhas que o setup inicial usa)
+            for offset, cmd in enumerate(camera_lock_cmds):
+                emit_tick = min(
+                    pov_end + offset * CAMERA_MODE_DELAY_TICKS,
+                    seg.end_tick - 1,
+                )
+                lines.append(_emit_addAtTick(emit_tick, cmd))
+            lines.append(_emit_addAtTick(
+                pov_end, f'echo "[FragReel] POV cut end tick {kill_tick} → back to attacker"'
+            ))
+
         for c in end_cmds:
             lines.append(_emit_addAtTick(seg.end_tick, c))
 
@@ -964,6 +1028,7 @@ def generate_capture_cfg(
     extra_start_commands: Iterable[str] = (),
     extra_end_commands: Iterable[str] = (),
     show_xray: bool = False,
+    pov_cuts: Iterable[tuple[int, str]] = (),
 ) -> Path:
     """Write a `.cfg` file at `output_path` that captures the given segments.
 
@@ -1010,6 +1075,7 @@ def generate_capture_cfg(
         extra_start_commands=tuple(extra_start_commands),
         extra_end_commands=tuple(extra_end_commands),
         show_xray=show_xray,
+        pov_cuts=tuple(pov_cuts),
     )
 
     target = Path(output_path)

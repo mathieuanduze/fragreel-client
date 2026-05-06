@@ -179,9 +179,22 @@ class RenderPlan:
     # /render. Default False (sem x-ray). Quando True, capture.cfg emite
     # `spec_show_xray 1` em vez de `spec_show_xray 0` (Fase 1.19 #7).
     show_xray: bool = False
+    # Sprint #6.5 (06/05) — POV vítima cuts. Lista de tuplas
+    # (kill_tick, victim_player_name) marcadas pov_eligible pelo scorer
+    # (top 1-2 do reel inteiro por aesthetic_score). capture.cfg emite
+    # spec_player switch durante janela [-32, +19] ticks em volta da kill
+    # (~0.5s antes, +0.3s depois @ 64tps). Snap cut estilo fragmovie.
+    pov_cuts: tuple[tuple[int, str], ...] = field(default_factory=tuple)
 
     @classmethod
     def from_json(cls, payload: dict) -> "RenderPlan":
+        # POV cuts: list of {kill_tick, victim_name} no payload
+        pov_cuts_raw = payload.get("pov_cuts") or []
+        pov_cuts = tuple(
+            (int(c["kill_tick"]), str(c["victim_name"]))
+            for c in pov_cuts_raw
+            if c.get("kill_tick") is not None and c.get("victim_name")
+        )
         return cls(
             demo_path=Path(payload["demo_path"]),
             segments=tuple((int(s["start_tick"]), int(s["end_tick"])) for s in payload["segments"]),
@@ -190,6 +203,7 @@ class RenderPlan:
             record_name=payload.get("record_name", "fragreel"),
             stream_name=payload.get("stream_name", "default"),
             show_xray=bool(payload.get("show_xray", False)),
+            pov_cuts=pov_cuts,
         )
 
     @property
@@ -323,6 +337,7 @@ class HlaeRunner:
             record_name=plan.record_name,
             stream_name=plan.stream_name,
             show_xray=plan.show_xray,
+            pov_cuts=plan.pov_cuts,
         )
 
     # -- stage 1b -----------------------------------------------------------

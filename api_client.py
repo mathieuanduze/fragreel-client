@@ -525,6 +525,11 @@ def _build_request_body(parsed_demo: Any, player_steamid: str) -> dict[str, Any]
             "timestamp": be.timestamp,
         })
 
+    # Sprint #6.5 (06/05) — Roster pra POV cuts. parsed_demo.roster_by_steamid
+    # é dict steamid→name de TODOS players (10 em matchmaking competitivo).
+    # Scorer usa pra resolver victim_name nos KillInfo (capture.cfg precisa).
+    roster = getattr(parsed_demo, "roster_by_steamid", None) or {}
+
     return {
         "schema_version": SCHEMA_VERSION,
         "client_version": CLIENT_VERSION,
@@ -539,6 +544,7 @@ def _build_request_body(parsed_demo: Any, player_steamid: str) -> dict[str, Any]
             "rounds": rounds,
             "bomb_events": bomb_events,
         },
+        "roster": roster,
     }
 
 
