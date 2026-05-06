@@ -490,6 +490,22 @@ class RenderCoordinator:
             # CS2 nativo, ~1-3s copy pra pro demos de Downloads.
             self._update(stage="preparando demo", progress=0.02)
             self._runner.stage_demo_to_replays(plan)
+
+            # Stage 1c (06/05 — Sprint Killfeed Icons) — extrair ícones do
+            # CS2 panorama pro vendor folder. Idempotente: skip se já
+            # populado. Editor usa esses SVGs pra renderizar killfeed
+            # idêntico ao CS2 (vs text-only weapon names atuais). Falha
+            # graceful → editor cai pra fallback text. ~50-200ms primeira
+            # extração, no-op subsequentes.
+            try:
+                from setup_cs2_icons import ensure_cs2_icons
+                from vendor_downloader import cs2_icons_dir
+                ensure_cs2_icons(cs2_icons_dir())
+            except Exception as e:
+                log.warning(
+                    "CS2 icons extraction falhou (não-fatal, killfeed fallback): %s", e,
+                )
+
             self._update(progress=PROGRESS_STAGING)
 
             if self._cancel_requested.is_set():

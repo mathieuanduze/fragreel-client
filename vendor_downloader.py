@@ -120,6 +120,26 @@ def editor_dir() -> Path:
     return appdata_fragreel_dir() / "editor"
 
 
+def cs2_icons_dir() -> Path:
+    """Sprint Killfeed Icons (06/05) — diretório de ícones extraídos do
+    CS2 install do user. Usado pelo editor pra renderizar killfeed com
+    SVGs canônicos do CS2 (vs text-only weapon names atuais).
+
+    Estrutura interna:
+      cs2-icons/
+        equipment/        # weapon icons: ak47.svg, awp.svg, knife.svg, etc
+        death_notice/     # modifiers: headshot.svg, penetrate.svg, etc
+
+    Populado por setup_cs2_icons.py em first-run (após CS2 detect) ou em
+    pre-render check. Idempotente — skip se já existe.
+
+    Distribuição: extraído do install do user (não bundle FragReel) por
+    licensing — user é dono dos assets via ownership do CS2. Plus melhor
+    UX (ícones idênticos à versão CS2 instalada, sem stale com updates).
+    """
+    return appdata_fragreel_dir() / "cs2-icons"
+
+
 # ── Public API: ensure_vendor_runtime ─────────────────────────────────────────
 
 

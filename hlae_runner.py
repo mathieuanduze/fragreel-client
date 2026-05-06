@@ -1244,6 +1244,29 @@ class HlaeRunner:
             # convert_takes_to_prores). Se diferentes, server serve o pai
             # comum + URLs incluem subpath relativo.
             mov_dir = mov_paths_with_take[0][1].parent
+
+            # Sprint Killfeed Icons (06/05) — copia cs2-icons/ pro mov_dir
+            # pra que mesma HTTP server sirva ambos. Editor usa
+            # http://localhost:port/cs2-icons/equipment/<weapon>.svg.
+            # Idempotente — skip se já tem em mov_dir.
+            try:
+                from vendor_downloader import cs2_icons_dir
+                src_icons = cs2_icons_dir()
+                dst_icons = mov_dir / "cs2-icons"
+                if src_icons.exists() and not dst_icons.exists():
+                    import shutil as _sh
+                    _sh.copytree(src_icons, dst_icons)
+                    log.info("cs2-icons copiados pra %s", dst_icons)
+                elif src_icons.exists():
+                    log.debug("cs2-icons já em %s — skip copy", dst_icons)
+                else:
+                    log.info(
+                        "cs2-icons dir vazio em %s — editor usa fallback text",
+                        src_icons,
+                    )
+            except Exception as e:
+                log.warning("cs2-icons copy falhou (não-fatal): %s", e)
+
             handler = partial(
                 _RangeAwareHandler,
                 directory=str(mov_dir),
@@ -1272,6 +1295,12 @@ class HlaeRunner:
                     h["gameplayVideoSrc"] = f"{base_url}/{mov_basename}"
             match["highlights"] = highlights
             merged["match"] = match
+            # Sprint Killfeed Icons (06/05) — base URL pros SVGs canônicos
+            # do CS2 panorama. Editor usa pra resolver weapon icons (ak47,
+            # awp, etc) + modifiers (headshot, penetrate). Se cs2-icons/
+            # vazio em mov_dir (extraction falhou ou CS2 missing), URLs
+            # vão dar 404 e editor cai pra fallback text-only.
+            merged["cs2IconsBaseUrl"] = f"{base_url}/cs2-icons"
 
         # Round 4c Fase 1.7 — props via tempfile (não inline).
         # PC test catched: Windows CreateProcess command line limit (8191
