@@ -787,6 +787,28 @@ def create_app(
             eligible_kill_ticks, first_kill_keys,
         )
 
+        # Round 6 fix (07/05 noite tardia): Mathieu reportou que label
+        # "REPLAY" aparecia em kills SEM switch real (scorer marcou eligible
+        # WIDE / per-highlight, /render selecionou top-2 + dedup, mas editor
+        # mostrava label em TODAS eligible). Fix: sobrescrever pov_eligible
+        # nas kills do reel_props PARA refletir só as 2 selecionadas. Editor
+        # vê só as kills que de fato vão ter spec_player switch no capture.
+        if isinstance(reel_props, dict):
+            match = reel_props.get("match")
+            if isinstance(match, dict):
+                selected_ticks = {kt for kt, _ in pov_cuts}
+                for hl in (match.get("highlights") or []):
+                    for k in (hl.get("kills") or []):
+                        kt = k.get("kill_tick")
+                        if kt is None or k.get("pov_eligible") is not True:
+                            continue
+                        try:
+                            kt_int = int(kt)
+                        except (ValueError, TypeError):
+                            continue
+                        if kt_int not in selected_ticks:
+                            k["pov_eligible"] = False
+
         plan = RenderPlan(
             demo_path=demo,
             segments=tuple(segments),

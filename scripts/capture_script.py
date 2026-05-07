@@ -947,8 +947,14 @@ def build_cfg_content(plan: CaptureScriptPlan) -> str:
         for kill_tick, victim_name in plan.pov_cuts:
             if not (seg.start_tick <= kill_tick <= seg.end_tick):
                 continue
-            POV_PRE_TICKS = 32   # ~0.5s @ 64 tps
-            POV_POST_TICKS = 19  # ~0.3s @ 64 tps
+            # Round 6 spec (Mathieu PC test 07/05 noite): janela 0.8s era
+            # curta demais — POV switching no meio de trocação ficava
+            # confuso (user não via kill inteira do attacker, switch pra
+            # victim já morta, volta sem entender). Dobra pra ~1.6s total
+            # (-1.0s pre, +0.6s post) pra contar mini-história: contexto
+            # da victim viva → ela morre → volta pro attacker.
+            POV_PRE_TICKS = 64   # ~1.0s @ 64 tps (era 32 = 0.5s)
+            POV_POST_TICKS = 38  # ~0.6s @ 64 tps (era 19 = 0.3s)
             pov_start = max(seg.start_tick + 1, kill_tick - POV_PRE_TICKS)
             pov_end = min(seg.end_tick - 1, kill_tick + POV_POST_TICKS)
             if pov_end <= pov_start:
