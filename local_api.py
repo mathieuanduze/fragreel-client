@@ -846,11 +846,24 @@ def create_app(
                     r_end = kt_sel + REPLAY_POST_TICKS
                     replay_segments_for_capture.append((r_start, r_end, str(victim_sel)))
 
+                    # Round 8 — distância pra label (CS2 units → metros).
+                    # Source 2: 1 unit ≈ 1.905 cm, então 1500u ≈ 28.6m.
+                    # Round pra inteiro pro label clean.
+                    parent_distance = parent_kill.get("distance")
+                    distance_label = ""
+                    if parent_distance is not None:
+                        try:
+                            meters = round(float(parent_distance) * 0.01905)
+                            if meters >= 5:
+                                distance_label = f" · {meters}m"
+                        except (ValueError, TypeError):
+                            pass
+
                     # Replay highlight pro editor — herda do parent + marker
                     replay_hl = {
                         "rank": int(parent_hl.get("rank", 0)) + 1000,  # rank artificial alto
                         "round_num": parent_hl.get("round_num"),
-                        "label": f"REPLAY · POV {victim_sel}",
+                        "label": f"REPLAY · POV {victim_sel}{distance_label}",
                         "narrative": f"Reprise da kill do POV de {victim_sel}",
                         "score": 0,
                         "start": (r_start / tickrate_for_replay),
@@ -867,6 +880,7 @@ def create_app(
                         "alive_timeline": [],
                         "is_replay_highlight": True,
                         "replay_victim_name": str(victim_sel),
+                        "replay_distance": parent_distance,
                         # Flags de contexto opcionais
                         "clutch_situation": None,
                         "won_round": parent_hl.get("won_round"),
