@@ -144,6 +144,18 @@ def ensure_cs2_icons(
             except Exception as e:
                 log.warning("Falha ao copiar %s: %s", src_file.name, e)
         log.info("Equipment icons: %d copiados de %s", copied, src_equipment)
+        # 06/05 — verbose logging pra debug filename mismatch (Mathieu reportou
+        # 'svg quebrados como se não existisse o arquivo'). Lista TODOS os
+        # filenames pós-extração pra editor weaponIcons.ts mapping ser ajustado
+        # se necessário.
+        all_svgs = sorted([p.name for p in equipment_target.glob("*.svg")])
+        log.info(
+            "Equipment icons: %d filenames disponíveis. Primeiros 30: %s",
+            len(all_svgs), all_svgs[:30],
+        )
+        if len(all_svgs) > 30:
+            log.info("... e mais %d (full list em DEBUG): %s",
+                     len(all_svgs) - 30, all_svgs[30:60])
     else:
         log.warning("equipment/ dir missing em %s", src_equipment)
 
