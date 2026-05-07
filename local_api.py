@@ -657,27 +657,49 @@ def create_app(
         # (segments podem ter sido cluster-merged, kill pode estar fora).
         # Editor/capture só faz cut se kill cair dentro de segment ativo.
         pov_cuts: list[tuple[int, str]] = []
+        # Diagnostic counters pra Mathieu reportar issues quando POV não sair
+        pov_diag = {
+            "match_in_props": False,
+            "highlights_count": 0,
+            "kills_total": 0,
+            "kills_with_eligible_flag": 0,
+            "kills_with_victim_name": 0,
+            "kills_with_kill_tick": 0,
+            "kills_in_segment": 0,
+        }
         if isinstance(reel_props, dict):
             match = reel_props.get("match")
             if isinstance(match, dict):
+                pov_diag["match_in_props"] = True
                 highlights = match.get("highlights") or []
+                pov_diag["highlights_count"] = len(highlights)
                 for hl in highlights:
                     for k in (hl.get("kills") or []):
+                        pov_diag["kills_total"] += 1
                         if not k.get("pov_eligible"):
                             continue
+                        pov_diag["kills_with_eligible_flag"] += 1
                         kt = k.get("kill_tick")
                         vn = k.get("victim_name")
-                        if kt is None or not vn:
+                        if not vn:
                             continue
+                        pov_diag["kills_with_victim_name"] += 1
+                        if kt is None:
+                            continue
+                        pov_diag["kills_with_kill_tick"] += 1
                         try:
                             kt_int = int(kt)
                         except (ValueError, TypeError):
                             continue
                         # Filter: kill_tick deve cair em algum segmento
                         if any(s <= kt_int <= e for s, e in segments):
+                            pov_diag["kills_in_segment"] += 1
                             pov_cuts.append((kt_int, str(vn)))
-        if pov_cuts:
-            log.info("/render — POV cuts: %d", len(pov_cuts))
+        # SEMPRE loga diag (mesmo quando 0 cuts) pra Mathieu reportar
+        log.info(
+            "/render — POV cuts: %d (diag: %s)",
+            len(pov_cuts), pov_diag,
+        )
 
         plan = RenderPlan(
             demo_path=demo,

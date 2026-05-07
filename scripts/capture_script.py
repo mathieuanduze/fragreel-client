@@ -711,6 +711,37 @@ def _setup_commands(plan: CaptureScriptPlan) -> list[str]:
             # Re-habilita crosshair (que cl_drawhud 0 desliga junto)
             "crosshair 1",
             "r_drawviewmodel 1",
+            # Mathieu spec round 3 (06/05): "a arma do player aparece muito
+            # pouco na tela, isso tem a ver com o zoom que fizemos pra
+            # preencher a tela toda, só que aí, também perdemos visão da
+            # arma, que é importante."
+            #
+            # Análise técnica: capture é 1280x720 (16:9). Render mobile
+            # vertical 1080x1920 (9:16). Após crop simétrico (1280x600) +
+            # objectFit cover, source columns visíveis em target = 471-808
+            # (337px wide). Source viewmodel default está em coluna ~1100
+            # (right-bottom anchor) → FORA do range visível.
+            #
+            # Fix: pull viewmodel pra mais central via cvars CS2:
+            #   viewmodel_offset_x 0    : default 2.5 (right) → 0 (center).
+            #                              Pulls weapon ~80px pra esquerda
+            #                              em 720p, o suficiente pra entrar
+            #                              no range visível 471-808 sem
+            #                              overlap com crosshair (que
+            #                              continua em column 640).
+            #   viewmodel_offset_y 1.0  : default 2.0 (forward). Reduz pra
+            #                              1.0 = weapon mais perto da câmera
+            #                              = visualmente maior (bom pra
+            #                              mobile feed leitura rápida).
+            #   viewmodel_offset_z -1.5 : default -2.0 (down). Reduz pra
+            #                              -1.5 = weapon ligeiramente mais
+            #                              alto = menos cropped pelo bottom.
+            #
+            # Crosshair stays no center (CS2 sempre renderiza em viewport
+            # center), aligned pós-crop simétrico (Issue A V2 fix).
+            "viewmodel_offset_x 0",
+            "viewmodel_offset_y 1",
+            "viewmodel_offset_z -1.5",
         ]
     return cmds
 
