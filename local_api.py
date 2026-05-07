@@ -695,12 +695,20 @@ def create_app(
             "kills_with_kill_tick": 0,
             "kills_in_segment": 0,
         }
+        # 07/05 — log first kill keys recebidas no /render pra cross-check
+        # com api_client log do /api/score. Se /api/score response tem novos
+        # fields mas /render não, problema é downstream (MatchClient strip
+        # OR /render parse). Se nenhum dos 2 tem, problema é scorer/Vercel.
+        first_kill_keys: list[str] = []
         if isinstance(reel_props, dict):
             match = reel_props.get("match")
             if isinstance(match, dict):
                 pov_diag["match_in_props"] = True
                 highlights = match.get("highlights") or []
                 pov_diag["highlights_count"] = len(highlights)
+                # Captura keys do primeiro kill pra log diag
+                if highlights and highlights[0].get("kills"):
+                    first_kill_keys = list(highlights[0]["kills"][0].keys())
                 for hl in highlights:
                     for k in (hl.get("kills") or []):
                         pov_diag["kills_total"] += 1
@@ -725,8 +733,8 @@ def create_app(
                             pov_cuts.append((kt_int, str(vn)))
         # SEMPRE loga diag (mesmo quando 0 cuts) pra Mathieu reportar
         log.info(
-            "/render — POV cuts: %d (diag: %s)",
-            len(pov_cuts), pov_diag,
+            "/render — POV cuts: %d (diag: %s) | first_kill_keys: %s",
+            len(pov_cuts), pov_diag, first_kill_keys,
         )
 
         plan = RenderPlan(

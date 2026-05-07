@@ -169,7 +169,21 @@ def score_via_api(
                     f"server schema {payload.get('schema_version')} != "
                     f"client schema {SCHEMA_VERSION} — please update FragReel"
                 )
-            return _parse_highlights(payload.get("highlights", []))
+            # 07/05 PC diag: log scorer_version + first kill keys pra
+            # detectar Vercel deploy stale OU field mismatch (Sprint #6.5
+            # POV cuts diag mostrou que match_doc.kills[] não tem novos
+            # campos — preciso confirmar se é scorer ou pipeline downstream).
+            scorer_v = payload.get("scorer_version", "<missing>")
+            highlights_raw = payload.get("highlights", [])
+            sample_kill_keys: list[str] = []
+            if highlights_raw and highlights_raw[0].get("kills"):
+                sample_kill_keys = list(highlights_raw[0]["kills"][0].keys())
+            log.info(
+                "/api/score response: scorer=%s | highlights=%d | "
+                "sample kill keys: %s",
+                scorer_v, len(highlights_raw), sample_kill_keys,
+            )
+            return _parse_highlights(highlights_raw)
 
         if resp.status_code == 400:
             # Bad request — payload inválido. Bug no cliente, não retry.
