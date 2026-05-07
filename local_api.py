@@ -176,6 +176,34 @@ def create_app(
     def version():
         return {"version": CLIENT_VERSION}
 
+    @app.get("/install-status")
+    def install_status():
+        """Sprint Install Indicator B (06/05) — endpoint sempre returns
+        ready=True no Flask full (significa setup já terminou — Flask só
+        sobe pós-setup). Banner web detecta isso e some.
+
+        Pré-setup, install_progress_server.py serve o mesmo endpoint com
+        ready=False + progress info. Web polla mesmo URL — recebe diferente
+        payload dependendo da fase, sem precisar saber qual server está
+        atendendo."""
+        try:
+            from install_state import get_state
+            state_data = get_state()
+            # Garantir que ready=True quando Flask full está respondendo
+            state_data["ready"] = True
+            state_data["phase"] = "ready"
+            state_data["phase_label"] = "Pronto"
+            return state_data
+        except Exception:
+            # Fallback se install_state import falhar (dev mode, etc)
+            return {
+                "phase": "ready",
+                "phase_label": "Pronto",
+                "components": {},
+                "elapsed_sec": 0,
+                "ready": True,
+            }
+
     @app.get("/demos")
     def demos():
         refresh = request.args.get("refresh") == "1"

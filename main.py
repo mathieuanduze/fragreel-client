@@ -247,8 +247,10 @@ def _run_first_run_setup_if_needed() -> bool:
     leva 30-60s baixando ~210 MB de fontes oficiais (HLAE, Node, ffmpeg,
     Editor) pra %APPDATA%/FragReel/.
 
-    UX: log-only progress por enquanto. Splash UI Tkinter pode ser polish
-    futuro (Sprint J doc Etapa J.5 nota: "versão simplificada com log-only").
+    Sprint Install Indicator B (06/05) — Mathieu spec: "seria quando o
+    usuário clica no .exe, não no download". Progresso reportado em
+    tempo real via install_state.update_component pra que web detecte
+    cliente rodando + status do setup imediatamente após .exe iniciar.
 
     Bloqueia client startup até completar — sem vendor não funciona nada.
 
@@ -257,6 +259,7 @@ def _run_first_run_setup_if_needed() -> bool:
     """
     try:
         from vendor_downloader import is_vendor_complete, ensure_vendor_runtime
+        from install_state import update_phase, update_component
     except ImportError as e:
         log.error("Sprint J: vendor_downloader não disponível: %s", e)
         return False
@@ -269,14 +272,23 @@ def _run_first_run_setup_if_needed() -> bool:
         "Sprint J first-run detectado — baixando HLAE + Node + ffmpeg + Editor (~210 MB)..."
     )
 
-    last_pct_logged = {}  # type: dict[str, int]
+    # Phase tracking pra install_progress_server expor via /install-status.
+    # Component name ↔ phase string match conhecido pelo vendor_downloader
+    # (HLAE+ffmpeg, Node, Editor são os 3 jobs paralelos).
+    update_phase("downloading_hlae", "Baixando dependências…")
 
-    def progress_log(component: str, downloaded: int, total: int) -> None:
-        """Log progress mas só em mudanças de 10% (não spam log)."""
+    last_pct_logged: dict[str, int] = {}
+
+    def progress_callback(component: str, downloaded: int, total: int) -> None:
+        """Atualiza install_state + log com 10% buckets pra não spammar."""
+        # Always update state — granularity 1% pra UI smooth
+        update_component(component, downloaded, total)
+
+        # Log apenas em mudanças de 10% pra não polluir fragreel.log
         if total <= 0:
             return
         pct = int(downloaded / total * 100)
-        bucket = (pct // 10) * 10  # 0, 10, 20, ..., 100
+        bucket = (pct // 10) * 10
         if last_pct_logged.get(component) == bucket:
             return
         last_pct_logged[component] = bucket
@@ -284,7 +296,7 @@ def _run_first_run_setup_if_needed() -> bool:
         total_mb = total / 1024 / 1024
         log.info("  %s: %d%% (%.1f/%.1f MB)", component, pct, mb, total_mb)
 
-    success = ensure_vendor_runtime(on_progress=progress_log)
+    success = ensure_vendor_runtime(on_progress=progress_callback)
     if not success:
         log.error(
             "Sprint J first-run setup FAILED. Possíveis causas: "
@@ -314,10 +326,34 @@ def main() -> None:
     _evict_stale_instance()
     _start_heartbeat()
 
+    # Sprint Install Indicator B (06/05) — Mathieu spec "primeiro push de
+    # informação do exe que dá pro fragreel a informação que o download
+    # começou". Inicia HTTP server minimal em port 5775 IMEDIATAMENTE
+    # pra web detectar client rodando + ler progresso de setup. Stop
+    # ANTES do Flask full subir (port handoff).
+    install_server = None
+    install_server_thread = None
+    if not args.skip_vendor_check:
+        try:
+            from install_progress_server import start_progress_server
+            install_server, install_server_thread = start_progress_server(port=5775)
+        except Exception as e:
+            log.warning(
+                "install_progress_server falhou (não-fatal, banner web "
+                "fica timing-based): %s", e,
+            )
+
     # Sprint J (29/04): first-run vendor download. Bloqueia até completar
     # OR sai com erro se download falhou. dev mode pode skipar via flag.
     if not args.skip_vendor_check:
         if not _run_first_run_setup_if_needed():
+            # Para o progress server antes do erro pra liberar port
+            if install_server:
+                try:
+                    from install_progress_server import stop_progress_server
+                    stop_progress_server(install_server)
+                except Exception:
+                    pass
             msg = ("FragReel não conseguiu baixar dependências necessárias.\n\n"
                    "Verifique:\n"
                    "  1. Conexão com internet\n"
@@ -327,6 +363,16 @@ def main() -> None:
             log.error(msg.replace("\n", " "))
             _show_fatal(msg)
             sys.exit(1)
+
+    # Setup OK — para progress server pra Flask full assumir port
+    if install_server:
+        try:
+            from install_progress_server import stop_progress_server
+            from install_state import mark_ready
+            mark_ready()
+            stop_progress_server(install_server)
+        except Exception as e:
+            log.warning("install_progress_server stop falhou: %s", e)
 
     # ── Steam ID ────────────────────────────────────────────────────
     steamid = args.steamid
