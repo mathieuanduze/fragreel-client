@@ -44,6 +44,39 @@ from typing import Optional
 log = logging.getLogger("fragreel.setup_cs2_icons")
 
 
+# ── Filename normalization ────────────────────────────────────────────────────
+
+
+# Prefixos comuns que CS2 panorama pode usar ANTES do weapon name canônico.
+# Diferentes versões do CS2 variam — pra garantir que editor/weaponIcons.ts
+# encontre o file independente da convenção, normalizamos TODOS pra
+# `<weapon>.svg` (sem prefix). Se o file já está sem prefix, no-op.
+_FILENAME_PREFIX_STRIP = (
+    "weapon_",
+    "loadout_",
+    "inventory_",
+    "item_",
+)
+
+
+def _normalize_icon_name(filename: str) -> str:
+    """Normaliza filename de panorama icon → weapon name canônico.
+
+    Examples:
+      'weapon_ak47.svg'    → 'ak47.svg'
+      'ak47.svg'           → 'ak47.svg'
+      'loadout_awp.svg'    → 'awp.svg'
+      'inventory_glock.svg' → 'glock.svg'
+
+    Lowercase, strip prefixes. Se nenhum prefix bate, retorna lowercase.
+    """
+    name = filename.lower()
+    for prefix in _FILENAME_PREFIX_STRIP:
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
 # ── CS2 install detection ─────────────────────────────────────────────────────
 
 
@@ -112,15 +145,37 @@ def ensure_cs2_icons(
     equipment_target = target_dir / "equipment"
     death_notice_target = target_dir / "death_notice"
 
-    # Idempotência: se já tem files suficientes, skip
-    if not force and equipment_target.exists():
+    # 06/05 — version marker pra invalidar cache quando lógica de extração
+    # muda. v2 = normalized filenames (strip weapon_/loadout_/etc prefixes).
+    # Users com cache v1 (sem normalização) precisam re-extrair pra editor
+    # weaponIcons.ts encontrar.
+    EXTRACTION_VERSION = "v2-normalized"
+    version_marker = target_dir / ".fragreel-icons-version"
+
+    cached_version = None
+    if version_marker.exists():
+        try:
+            cached_version = version_marker.read_text(encoding="utf-8").strip()
+        except Exception:
+            cached_version = None
+
+    # Idempotência: skip APENAS se cached_version bate + tem files
+    if (not force
+        and equipment_target.exists()
+        and cached_version == EXTRACTION_VERSION):
         existing_svgs = list(equipment_target.glob("*.svg"))
         if len(existing_svgs) >= 10:
             log.info(
-                "CS2 icons já presentes em %s (%d SVGs) — skip extraction",
-                target_dir, len(existing_svgs),
+                "CS2 icons já presentes em %s (%d SVGs, version %s) — skip",
+                target_dir, len(existing_svgs), cached_version,
             )
             return True
+
+    if cached_version != EXTRACTION_VERSION and equipment_target.exists():
+        log.info(
+            "CS2 icons cache version mismatch (cached=%s, current=%s) — re-extract",
+            cached_version, EXTRACTION_VERSION,
+        )
 
     panorama_icons = _find_cs2_panorama_dir(cs2_install)
     if panorama_icons is None:
@@ -133,17 +188,24 @@ def ensure_cs2_icons(
     if src_equipment.exists() and src_equipment.is_dir():
         equipment_target.mkdir(parents=True, exist_ok=True)
         copied = 0
+        # 06/05 (Mathieu): normaliza filenames pra editor weaponIcons.ts
+        # encontrar independente da convenção (weapon_ak47.svg vs ak47.svg).
+        # Plus copia TAMBÉM com o nome original como backup — caso alguma
+        # weapon precise do prefix exato (raro mas defensivo).
         for src_file in src_equipment.glob("*.svg"):
-            dst = equipment_target / src_file.name
-            try:
-                # Skip se already match (mtime check pra não polluir)
-                if dst.exists() and dst.stat().st_mtime >= src_file.stat().st_mtime:
-                    continue
-                shutil.copy2(src_file, dst)
-                copied += 1
-            except Exception as e:
-                log.warning("Falha ao copiar %s: %s", src_file.name, e)
-        log.info("Equipment icons: %d copiados de %s", copied, src_equipment)
+            normalized = _normalize_icon_name(src_file.name)
+            dst_normalized = equipment_target / normalized
+            dst_original = equipment_target / src_file.name.lower()
+            for dst in {dst_normalized, dst_original}:
+                try:
+                    if dst.exists() and dst.stat().st_mtime >= src_file.stat().st_mtime:
+                        continue
+                    shutil.copy2(src_file, dst)
+                    copied += 1
+                except Exception as e:
+                    log.warning("Falha ao copiar %s → %s: %s", src_file.name, dst.name, e)
+        log.info("Equipment icons: %d files (originais + normalizados) copiados de %s",
+                 copied, src_equipment)
         # 06/05 — verbose logging pra debug filename mismatch (Mathieu reportou
         # 'svg quebrados como se não existisse o arquivo'). Lista TODOS os
         # filenames pós-extração pra editor weaponIcons.ts mapping ser ajustado
@@ -164,16 +226,21 @@ def ensure_cs2_icons(
     if src_death.exists() and src_death.is_dir():
         death_notice_target.mkdir(parents=True, exist_ok=True)
         copied = 0
+        # Mesma normalização do equipment — strip prefixes pra garantir que
+        # 'headshot.svg' funciona em qualquer versão do CS2 panorama.
         for src_file in src_death.glob("*.svg"):
-            dst = death_notice_target / src_file.name
-            try:
-                if dst.exists() and dst.stat().st_mtime >= src_file.stat().st_mtime:
-                    continue
-                shutil.copy2(src_file, dst)
-                copied += 1
-            except Exception as e:
-                log.warning("Falha ao copiar %s: %s", src_file.name, e)
-        log.info("Death notice icons: %d copiados de %s", copied, src_death)
+            normalized = _normalize_icon_name(src_file.name)
+            dst_normalized = death_notice_target / normalized
+            dst_original = death_notice_target / src_file.name.lower()
+            for dst in {dst_normalized, dst_original}:
+                try:
+                    if dst.exists() and dst.stat().st_mtime >= src_file.stat().st_mtime:
+                        continue
+                    shutil.copy2(src_file, dst)
+                    copied += 1
+                except Exception as e:
+                    log.warning("Falha ao copiar %s → %s: %s", src_file.name, dst.name, e)
+        log.info("Death notice icons: %d files copiados de %s", copied, src_death)
     else:
         log.info("death_notice/ dir missing em %s — modifiers serão fallback",
                  src_death)
@@ -184,8 +251,15 @@ def ensure_cs2_icons(
         log.warning("Nenhum equipment icon copiado — editor caindo pra fallback")
         return False
 
+    # Persiste version marker pra próximo run skip se já normalizado
+    try:
+        version_marker.write_text(EXTRACTION_VERSION, encoding="utf-8")
+    except Exception as e:
+        log.warning("Não conseguiu gravar version marker: %s", e)
+
     log.info(
-        "CS2 icons extracted: %d equipment + %d death_notice em %s",
+        "CS2 icons extracted (%s): %d equipment + %d death_notice em %s",
+        EXTRACTION_VERSION,
         final_count,
         len(list(death_notice_target.glob("*.svg"))) if death_notice_target.exists() else 0,
         target_dir,
