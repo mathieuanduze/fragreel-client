@@ -92,6 +92,15 @@ class ParsedDemo:
     # Valores possíveis: "premier" | "competitive" | "wingman" | "casual"
     #                    | "deathmatch" | "scrimmage" | "workshop" | None
     game_mode: Optional[str] = None
+    # Sprint #6.5 (07/05) — Roster steamid → in-game name pra POV cuts.
+    # api_client.py serializa esse dict pro /api/score → scorer.ts resolve
+    # victim_name nos KillInfo → capture_script emite spec_player switches.
+    # Bug A diag round 2 (07/05) achou que esse field era REFERENCIADO
+    # (api_client linha 545) mas NUNCA SETADO aqui — getattr fallback `or {}`
+    # mascarava: roster sempre vinha {} → victim_name sempre null →
+    # allCandidates vazio → pov_eligible nunca true. Fix: popular via
+    # parse_player_info() no parse() abaixo.
+    roster_by_steamid: dict[str, str] = field(default_factory=dict)
 
 
 # ── DataFrame compat helpers (Polars 0.x and 1.x) ────────────────────────────
@@ -339,6 +348,33 @@ def parse(demo_path: Path, player_steamid: Optional[str] = None) -> ParsedDemo:
         except Exception as e:
             log.warning(f"Player name lookup failed (non-fatal): {e}")
 
+    # Sprint #6.5 (07/05) — Roster completo steamid → name pra POV cuts.
+    # Reusa parse_player_info já chamado acima; popula dict de TODOS players
+    # da partida (10 em 5v5). api_client.py serializa pro /api/score → scorer
+    # resolve victim_name → capture_script emite spec_player. Sem isso,
+    # pov_eligible nunca vira true (allCandidates vazio).
+    roster_by_steamid: dict[str, str] = {}
+    try:
+        info_df2 = dp.parse_player_info()
+        if not _df_is_empty(info_df2):
+            for r in _df_iter_rows(info_df2):
+                rsid = str(r.get("steamid", "")).strip()
+                rname = str(r.get("name", "")).strip()
+                if rsid and rname:
+                    roster_by_steamid[rsid] = rname
+        # Fallback parse_ticks se parse_player_info vazio (broadcast caps)
+        if not roster_by_steamid:
+            tick_df2 = dp.parse_ticks(["name", "steamid"])
+            if not _df_is_empty(tick_df2):
+                for r in _df_iter_rows(tick_df2):
+                    rsid = str(r.get("steamid", "")).strip()
+                    rname = str(r.get("name", "")).strip()
+                    if rsid and rname and rsid not in roster_by_steamid:
+                        roster_by_steamid[rsid] = rname
+        log.info(f"Roster resolved: {len(roster_by_steamid)} players")
+    except Exception as e:
+        log.warning(f"Roster lookup failed (non-fatal — POV cuts disabled): {e}")
+
     return ParsedDemo(
         map_name=map_name,
         tickrate=tickrate,
@@ -352,6 +388,7 @@ def parse(demo_path: Path, player_steamid: Optional[str] = None) -> ParsedDemo:
         round_states=round_states,
         player_name=player_name,
         game_mode=game_mode,
+        roster_by_steamid=roster_by_steamid,
     )
 
 
