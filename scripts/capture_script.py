@@ -520,11 +520,23 @@ class CaptureSegment:
 
     start_tick: int
     end_tick: int
+    # Round 7 (07/05 noite tardia) — POV vítima como SEGMENT separado
+    # appended após o highlight original, em vez de switch no meio
+    # (Mathieu spec: "replay do POV vir depois do round"). Quando
+    # is_replay=True, capture usa replay_player_name como spec target em
+    # vez de user_player_name. Editor renderiza esse segment como scene
+    # separada com label "REPLAY" + efeitos visuais durante toda a scene.
+    is_replay: bool = False
+    replay_player_name: str | None = None
 
     def __post_init__(self) -> None:
         if self.start_tick < 0 or self.end_tick <= self.start_tick:
             raise ValueError(
                 f"invalid tick range: start={self.start_tick} end={self.end_tick}"
+            )
+        if self.is_replay and not self.replay_player_name:
+            raise ValueError(
+                "replay segment requires replay_player_name"
             )
 
 
@@ -599,8 +611,15 @@ class CaptureScriptPlan:
                 raise ValueError(
                     f"user_player_name is empty after sanitization: {self.user_player_name!r}"
                 )
+        # Round 7: replay segments podem rewind pra ticks anteriores
+        # (demo_gototick antes do segment). Validação overlap só pra segments
+        # NORMAIS — replay segments processed independently com gototick.
         prev_end = -1
         for seg in self.segments:
+            if seg.is_replay:
+                # Replay segments fazem rewind explícito via demo_gototick
+                # antes de cada bloco — overlap é esperado.
+                continue
             if seg.start_tick < prev_end:
                 raise ValueError(
                     f"segments overlap: {seg.start_tick} starts before previous end {prev_end}"
@@ -855,26 +874,32 @@ def build_cfg_content(plan: CaptureScriptPlan) -> str:
     lines.append("")
 
     for i, seg in enumerate(plan.segments):
-        lines.append(f"// segment {i}: ticks {seg.start_tick} .. {seg.end_tick}")
+        # Round 7 — replay segment usa victim como spec target em vez de user
+        if seg.is_replay and seg.replay_player_name:
+            seg_camera_lock = [
+                f'spec_player "{_quote_player_name(seg.replay_player_name)}"',
+                "spec_mode 1",
+            ]
+            seg_target_label = f'REPLAY POV="{seg.replay_player_name}"'
+        else:
+            seg_camera_lock = camera_lock_cmds
+            seg_target_label = (
+                f'spec_player="{plan.user_player_name}"'
+                if plan.user_player_name
+                else (f"acct={plan.user_account_id}" if plan.user_account_id else "no-target")
+            )
 
-        # Diagnostic marker — first thing emitted in the segment. Lets the
-        # user (or us, with their console.log) verify we entered the segment
-        # logic and which player we're trying to lock to.
-        target_label = (
-            f'spec_player="{plan.user_player_name}"'
-            if plan.user_player_name
-            else (f"acct={plan.user_account_id}" if plan.user_account_id else "no-target")
-        )
+        lines.append(f"// segment {i}: ticks {seg.start_tick} .. {seg.end_tick}{' (REPLAY)' if seg.is_replay else ''}")
+
         lines.append(_emit_addAtTick(
             seg.start_tick,
-            f'echo "[FragReel] seg {i} start tick={seg.start_tick} target={target_label}"',
+            f'echo "[FragReel] seg {i} start tick={seg.start_tick} target={seg_target_label}"',
         ))
 
         # Stagger camera-lock commands across ticks so spec_player settles
         # before spec_mode 1 fires (Source 2 race condition — see
-        # CAMERA_MODE_DELAY_TICKS). When there's no player name, only one
-        # command is in the list (spec_mode 1), so the stagger is a no-op.
-        for offset, cmd in enumerate(camera_lock_cmds):
+        # CAMERA_MODE_DELAY_TICKS).
+        for offset, cmd in enumerate(seg_camera_lock):
             emit_tick = seg.start_tick + offset * CAMERA_MODE_DELAY_TICKS
             lines.append(_emit_addAtTick(emit_tick, cmd))
 
@@ -892,16 +917,11 @@ def build_cfg_content(plan: CaptureScriptPlan) -> str:
             lines.append(_emit_addAtTick(freeze_tick, c))
 
         # v0.2.11 insurance: re-assert the spec lock right after record
-        # start. The original lock was emitted before host_timescale 0;
-        # if the entity wasn't yet known to the spec subsystem, the lock
-        # silently fell back to free-cam. Re-emitting once more after the
-        # demo has progressed a few engine frames catches that race.
-        # (CS2 keeps running its own internal tick even with timescale=0;
-        # mirv_cmd's addAtTick is keyed off the demo tick, not wall-clock,
-        # so this still fires reliably.)
-        if camera_lock_cmds:
+        # start. (Round 7: usa seg_camera_lock pra suportar replay segments
+        # com victim target.)
+        if seg_camera_lock:
             reassert_base = freeze_tick + POST_RECORD_REASSERT_DELAY_TICKS
-            for offset, cmd in enumerate(camera_lock_cmds):
+            for offset, cmd in enumerate(seg_camera_lock):
                 emit_tick = min(
                     reassert_base + offset * CAMERA_MODE_DELAY_TICKS,
                     seg.end_tick - 1,
@@ -918,75 +938,22 @@ def build_cfg_content(plan: CaptureScriptPlan) -> str:
         # CAMERA_RELOCK_INTERVAL_TICKS we re-issue the whole lock block;
         # spec_player is a no-op when we're already on that player, so
         # this is effectively free.
-        if camera_lock_cmds:
+        # Round 7: usa seg_camera_lock pra suportar replay segments.
+        if seg_camera_lock:
             relock_tick = seg.start_tick + CAMERA_RELOCK_INTERVAL_TICKS
             while relock_tick < seg.end_tick:
-                for offset, cmd in enumerate(camera_lock_cmds):
+                for offset, cmd in enumerate(seg_camera_lock):
                     emit_tick = min(relock_tick + offset * CAMERA_MODE_DELAY_TICKS, seg.end_tick - 1)
                     lines.append(_emit_addAtTick(emit_tick, cmd))
                 relock_tick += CAMERA_RELOCK_INTERVAL_TICKS
 
-        # Sprint #6.5 (06/05) — POV vítima snap cuts.
-        # Pra cada kill_tick em plan.pov_cuts que cair DENTRO desse segment,
-        # emite spec_player switch pra vítima na janela [-32 ticks, +19 ticks]
-        # em volta da kill (~0.5s antes, +0.3s depois @ 64tps). Snap cut
-        # estilo fragmovie — sem fade transition (essa fica pra 2-pass
-        # capture iteração futura).
-        #
-        # IMPORTANTE: o re-lock periódico acima vai sobrescrever o
-        # spec_player victim. Por isso emitimos o switch DEPOIS dos re-locks
-        # in this loop iteration order, e usamos ticks específicos do POV
-        # window — quando relock cair fora dessa janela, attacker é
-        # restored automaticamente. Quando cair DENTRO, o último command
-        # no mesmo tick wins (CS2 processa em ordem de adição).
-        # Pra evitar conflict, suprimimos relocks dentro do POV window via
-        # tick comparison: relock_tick em [pov_start, pov_end] é skipped.
-        # (TODO se conflicts in field test: refatorar pra emit relocks
-        # primeiro, dps POV switches — Python emit order = CS2 process
-        # order quando ticks idênticos.)
-        for kill_tick, victim_name in plan.pov_cuts:
-            if not (seg.start_tick <= kill_tick <= seg.end_tick):
-                continue
-            # Round 6 spec (Mathieu PC test 07/05 noite): janela 0.8s era
-            # curta demais — POV switching no meio de trocação ficava
-            # confuso (user não via kill inteira do attacker, switch pra
-            # victim já morta, volta sem entender). Dobra pra ~1.6s total
-            # (-1.0s pre, +0.6s post) pra contar mini-história: contexto
-            # da victim viva → ela morre → volta pro attacker.
-            POV_PRE_TICKS = 64   # ~1.0s @ 64 tps (era 32 = 0.5s)
-            POV_POST_TICKS = 38  # ~0.6s @ 64 tps (era 19 = 0.3s)
-            pov_start = max(seg.start_tick + 1, kill_tick - POV_PRE_TICKS)
-            pov_end = min(seg.end_tick - 1, kill_tick + POV_POST_TICKS)
-            if pov_end <= pov_start:
-                continue  # window inviável
-            safe_victim = _quote_player_name(victim_name)
-            if not safe_victim:
-                log.warning(
-                    "POV cut skipped — victim_name vazio pós-sanitize: %r",
-                    victim_name,
-                )
-                continue
-            # Switch pra vítima no início da janela
-            lines.append(_emit_addAtTick(
-                pov_start, f'spec_player "{safe_victim}"'
-            ))
-            lines.append(_emit_addAtTick(
-                pov_start + CAMERA_MODE_DELAY_TICKS, "spec_mode 1"
-            ))
-            lines.append(_emit_addAtTick(
-                pov_start, f'echo "[FragReel] POV cut start tick {kill_tick} → {safe_victim}"'
-            ))
-            # Switch BACK pro atacante no fim da janela (re-emit do
-            # camera_lock_cmds — mesmas linhas que o setup inicial usa)
-            for offset, cmd in enumerate(camera_lock_cmds):
-                emit_tick = min(
-                    pov_end + offset * CAMERA_MODE_DELAY_TICKS,
-                    seg.end_tick - 1,
-                )
-                lines.append(_emit_addAtTick(emit_tick, cmd))
-            lines.append(_emit_addAtTick(
-                pov_end, f'echo "[FragReel] POV cut end tick {kill_tick} → back to attacker"'
-            ))
+        # Round 7 (07/05 noite tardia) — POV switching MID-SEGMENT desativado.
+        # Mathieu spec: "replay POV vir DEPOIS do round" → POV agora vira
+        # SEGMENT separado (CaptureSegment.is_replay=True) com victim como
+        # spec target durante toda a janela. plan.pov_cuts mantido como
+        # fallback pra clients antigos mas /render envia replay segments
+        # diretamente em plan.segments.
+        # (Removido bloco de switching `for kill_tick, victim_name in plan.pov_cuts`)
 
         for c in end_cmds:
             lines.append(_emit_addAtTick(seg.end_tick, c))
@@ -996,12 +963,16 @@ def build_cfg_content(plan: CaptureScriptPlan) -> str:
         # of the next segment — no frames captured but full wall-clock time
         # elapses (1 round ≈ 115s of real-time demo playback). With a seek
         # we skip straight to just before the next segment.
+        # Round 7: replay segments fazem REWIND (start_tick < seg.end_tick) —
+        # nesses casos demo_gototick é OBRIGATÓRIO independente de gap.
         if i + 1 < len(plan.segments):
-            next_start = plan.segments[i + 1].start_tick
+            next_seg = plan.segments[i + 1]
+            next_start = next_seg.start_tick
             gap_ticks = next_start - seg.end_tick
-            # Only worth seeking if gap > ~1.5s of demo time. Tiny gaps stay
-            # linear (seek has its own ~200-500ms overhead in CS2).
-            if gap_ticks > INTER_SEGMENT_SEEK_MIN_GAP:
+            needs_rewind = next_seg.is_replay and next_start < seg.end_tick
+            # Only worth seeking if gap > ~1.5s of demo time OR if next
+            # segment requires rewind (replay segment).
+            if needs_rewind or gap_ticks > INTER_SEGMENT_SEEK_MIN_GAP:
                 seek_target = next_start - INTER_SEGMENT_SEEK_LEAD_TICKS
                 lines.append(
                     f"// skip {gap_ticks} ticks of silent playback to next segment"

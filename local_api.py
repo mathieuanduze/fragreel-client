@@ -787,16 +787,22 @@ def create_app(
             eligible_kill_ticks, first_kill_keys,
         )
 
-        # Round 6 fix (07/05 noite tardia): Mathieu reportou que label
-        # "REPLAY" aparecia em kills SEM switch real (scorer marcou eligible
-        # WIDE / per-highlight, /render selecionou top-2 + dedup, mas editor
-        # mostrava label em TODAS eligible). Fix: sobrescrever pov_eligible
-        # nas kills do reel_props PARA refletir só as 2 selecionadas. Editor
-        # vê só as kills que de fato vão ter spec_player switch no capture.
+        # Round 7 (07/05 noite tardia) — POV vítima como SEGMENT separado.
+        # Mathieu spec: "replay POV vir DEPOIS do round". Em vez de switch
+        # mid-segment confuso, criar replay segment dedicado pra cada
+        # pov_cut: rewind pra ~3.5s antes da kill, captura victim POV até
+        # ~1s depois. Editor recebe replay highlight com flag is_replay.
+        REPLAY_PRE_TICKS = 224   # ~3.5s @ 64tps — contexto da victim viva + ângulo dela
+        REPLAY_POST_TICKS = 64   # ~1.0s @ 64tps — reação pós-morte
+        replay_segments_for_capture: list[tuple[int, int, str]] = []
+        replay_highlights_for_editor: list[dict] = []
+
         if isinstance(reel_props, dict):
             match = reel_props.get("match")
             if isinstance(match, dict):
-                selected_ticks = {kt for kt, _ in pov_cuts}
+                selected_ticks_set = {kt for kt, _ in pov_cuts}
+                # Suprimir pov_eligible nas kills NÃO selecionadas (label
+                # REPLAY só onde tem replay segment real)
                 for hl in (match.get("highlights") or []):
                     for k in (hl.get("kills") or []):
                         kt = k.get("kill_tick")
@@ -806,8 +812,91 @@ def create_app(
                             kt_int = int(kt)
                         except (ValueError, TypeError):
                             continue
-                        if kt_int not in selected_ticks:
+                        if kt_int not in selected_ticks_set:
                             k["pov_eligible"] = False
+
+                # Construir replay segments + highlights por kill selecionada
+                tickrate_for_replay = 64.0
+                # Procurar a tickrate real do match doc (passa pelo demo_meta)
+                # Fallback 64 é matchmaking padrão — mais comum.
+                # Pra cada kill_tick selecionada, computar replay window
+                for kt_sel, victim_sel in pov_cuts:
+                    # Achar o highlight original que contém essa kill
+                    parent_hl = None
+                    parent_kill = None
+                    for hl in (match.get("highlights") or []):
+                        for k in (hl.get("kills") or []):
+                            kt_k = k.get("kill_tick")
+                            if kt_k is None:
+                                continue
+                            try:
+                                if int(kt_k) == kt_sel:
+                                    parent_hl = hl
+                                    parent_kill = k
+                                    break
+                            except (ValueError, TypeError):
+                                continue
+                        if parent_hl is not None:
+                            break
+                    if parent_hl is None or parent_kill is None:
+                        continue
+
+                    # Replay tick window (rewind + post-kill)
+                    r_start = max(0, kt_sel - REPLAY_PRE_TICKS)
+                    r_end = kt_sel + REPLAY_POST_TICKS
+                    replay_segments_for_capture.append((r_start, r_end, str(victim_sel)))
+
+                    # Replay highlight pro editor — herda do parent + marker
+                    replay_hl = {
+                        "rank": int(parent_hl.get("rank", 0)) + 1000,  # rank artificial alto
+                        "round_num": parent_hl.get("round_num"),
+                        "label": f"REPLAY · POV {victim_sel}",
+                        "narrative": f"Reprise da kill do POV de {victim_sel}",
+                        "score": 0,
+                        "start": (r_start / tickrate_for_replay),
+                        "end": (r_end / tickrate_for_replay),
+                        "kills": [
+                            {
+                                **parent_kill,
+                                "is_replay": True,
+                                "replay_victim_name": str(victim_sel),
+                                # Garante que editor renderize com ênfase
+                                "pov_eligible": True,
+                            }
+                        ],
+                        "alive_timeline": [],
+                        "is_replay_highlight": True,
+                        "replay_victim_name": str(victim_sel),
+                        # Flags de contexto opcionais
+                        "clutch_situation": None,
+                        "won_round": parent_hl.get("won_round"),
+                        "bomb_action": None,
+                        "is_round_winning_kill": False,
+                        "kill_ticks": [kt_sel],
+                        "kill_timestamps": [kt_sel / tickrate_for_replay],
+                        "bomb_action_tick": None,
+                        "bomb_action_timestamp": None,
+                        "bomb_planted_timestamp": None,
+                    }
+                    replay_highlights_for_editor.append(replay_hl)
+
+                # Inserir replay highlights no match.highlights logo APÓS o
+                # parent original (mantém ordering por rank)
+                if replay_highlights_for_editor:
+                    new_highlights: list[dict] = []
+                    for hl in (match.get("highlights") or []):
+                        new_highlights.append(hl)
+                        # Append replays cujo round_num bate
+                        for r_hl in replay_highlights_for_editor:
+                            if r_hl.get("round_num") == hl.get("round_num"):
+                                new_highlights.append(r_hl)
+                    match["highlights"] = new_highlights
+
+        log.info(
+            "/render — POV round 7: pov_cuts=%d, replay_segments=%d, replay_highlights=%d",
+            len(pov_cuts), len(replay_segments_for_capture),
+            len(replay_highlights_for_editor),
+        )
 
         plan = RenderPlan(
             demo_path=demo,
@@ -818,7 +907,8 @@ def create_app(
             stream_name=body.get("stream_name", "default"),
             # Round 4c Fase 1.21 — x-ray opt-in. Web envia bool no payload.
             show_xray=bool(body.get("show_xray", False)),
-            pov_cuts=tuple(pov_cuts),
+            pov_cuts=(),  # Round 7: replay agora via replay_segments
+            replay_segments=tuple(replay_segments_for_capture),
         )
 
         render_id = body.get("render_id") or uuid.uuid4().hex[:12]

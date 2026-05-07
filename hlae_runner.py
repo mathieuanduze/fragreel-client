@@ -185,6 +185,12 @@ class RenderPlan:
     # spec_player switch durante janela [-32, +19] ticks em volta da kill
     # (~0.5s antes, +0.3s depois @ 64tps). Snap cut estilo fragmovie.
     pov_cuts: tuple[tuple[int, str], ...] = field(default_factory=tuple)
+    # Round 7 (07/05 noite tardia) — POV vítima como SEGMENT separado em
+    # vez de switch mid-segment. Cada item: (start_tick, end_tick, victim_name).
+    # capture_cfg merge esses como CaptureSegment(is_replay=True,
+    # replay_player_name=victim_name) appendados aos segments principais.
+    # Editor reconhece pelo metadata em reel_props.match.highlights[N].is_replay.
+    replay_segments: tuple[tuple[int, int, str], ...] = field(default_factory=tuple)
 
     @classmethod
     def from_json(cls, payload: dict) -> "RenderPlan":
@@ -195,6 +201,14 @@ class RenderPlan:
             for c in pov_cuts_raw
             if c.get("kill_tick") is not None and c.get("victim_name")
         )
+        replay_raw = payload.get("replay_segments") or []
+        replay_segments = tuple(
+            (int(r["start_tick"]), int(r["end_tick"]), str(r["victim_name"]))
+            for r in replay_raw
+            if r.get("start_tick") is not None
+            and r.get("end_tick") is not None
+            and r.get("victim_name")
+        )
         return cls(
             demo_path=Path(payload["demo_path"]),
             segments=tuple((int(s["start_tick"]), int(s["end_tick"])) for s in payload["segments"]),
@@ -204,6 +218,7 @@ class RenderPlan:
             stream_name=payload.get("stream_name", "default"),
             show_xray=bool(payload.get("show_xray", False)),
             pov_cuts=pov_cuts,
+            replay_segments=replay_segments,
         )
 
     @property
@@ -329,15 +344,28 @@ class HlaeRunner:
 
     def stage_capture_cfg(self, plan: RenderPlan) -> Path:
         """Write the capture .cfg under <CS2>/game/csgo/cfg/fragreel/."""
+        # Round 7: merge replay segments com segments normais. Replay
+        # vai depois (CS2 cfg processa em order — replay highlights
+        # aparecem no reel após o highlight original).
+        merged_segments: list = list(plan.segments)
+        for r_start, r_end, r_victim in plan.replay_segments:
+            merged_segments.append(
+                CaptureSegment(
+                    start_tick=r_start,
+                    end_tick=r_end,
+                    is_replay=True,
+                    replay_player_name=r_victim,
+                )
+            )
         return generate_capture_cfg(
             self.config.cfg_target,
-            plan.segments,
+            merged_segments,
             user_steamid64=plan.user_steamid64,
             user_player_name=plan.user_player_name,
             record_name=plan.record_name,
             stream_name=plan.stream_name,
             show_xray=plan.show_xray,
-            pov_cuts=plan.pov_cuts,
+            pov_cuts=(),  # Round 7 deactivated — replay agora via CaptureSegment
         )
 
     # -- stage 1b -----------------------------------------------------------
