@@ -678,14 +678,22 @@ def create_app(
         if not user_player_name and isinstance(reel_props, dict):
             user_player_name = reel_props.get("playerName")
 
-        # Sprint #6.5 (06/05) — POV vítima cuts. Web envia match.highlights
-        # com kills marcados pov_eligible=True pelo scorer (top 1-2 do reel
-        # por aesthetic_score). Aqui extraímos (kill_tick, victim_name) das
-        # kills selecionadas + filtramos os que estão DENTRO de algum segmento
-        # (segments podem ter sido cluster-merged, kill pode estar fora).
-        # Editor/capture só faz cut se kill cair dentro de segment ativo.
-        pov_cuts: list[tuple[int, str]] = []
-        # Diagnostic counters pra Mathieu reportar issues quando POV não sair
+        # Sprint #6.5 (07/05 round 4) — POV vítima cuts WIDE-MARKING +
+        # SERVER-SIDE TOP-2 SELECTION.
+        #
+        # Round 1-3: scorer marcava cap 2 kills do reel inteiro globalmente.
+        # Bug em campo: kills marcadas em highlights NÃO selecionados pelo
+        # user → kills_in_segment=0 → 0 POV cuts. Mathieu PC test round 3
+        # confirmou.
+        #
+        # Round 4 fix: scorer agora marca pov_eligible em TODAS kills com
+        # aesthetic_style != null OU score >= 20 (sem cap). /render faz a
+        # seleção FINAL: top 2 entre eligible que caem nos segments
+        # selecionados, dedupe por victim_steamid. Garante POV cuts
+        # independente do que user seleciona.
+        POV_MAX_CUTS_PER_REEL = 2
+
+        candidates: list[dict] = []
         pov_diag = {
             "match_in_props": False,
             "highlights_count": 0,
@@ -694,11 +702,9 @@ def create_app(
             "kills_with_victim_name": 0,
             "kills_with_kill_tick": 0,
             "kills_in_segment": 0,
+            "candidates_collected": 0,
+            "pov_cuts_selected": 0,
         }
-        # 07/05 — log first kill keys recebidas no /render pra cross-check
-        # com api_client log do /api/score. Se /api/score response tem novos
-        # fields mas /render não, problema é downstream (MatchClient strip
-        # OR /render parse). Se nenhum dos 2 tem, problema é scorer/Vercel.
         first_kill_keys: list[str] = []
         if isinstance(reel_props, dict):
             match = reel_props.get("match")
@@ -706,7 +712,6 @@ def create_app(
                 pov_diag["match_in_props"] = True
                 highlights = match.get("highlights") or []
                 pov_diag["highlights_count"] = len(highlights)
-                # Captura keys do primeiro kill pra log diag
                 if highlights and highlights[0].get("kills"):
                     first_kill_keys = list(highlights[0]["kills"][0].keys())
                 for hl in highlights:
@@ -717,6 +722,7 @@ def create_app(
                         pov_diag["kills_with_eligible_flag"] += 1
                         kt = k.get("kill_tick")
                         vn = k.get("victim_name")
+                        vsid = k.get("victim_steamid")
                         if not vn:
                             continue
                         pov_diag["kills_with_victim_name"] += 1
@@ -727,11 +733,39 @@ def create_app(
                             kt_int = int(kt)
                         except (ValueError, TypeError):
                             continue
-                        # Filter: kill_tick deve cair em algum segmento
-                        if any(s <= kt_int <= e for s, e in segments):
-                            pov_diag["kills_in_segment"] += 1
-                            pov_cuts.append((kt_int, str(vn)))
-        # SEMPRE loga diag (mesmo quando 0 cuts) pra Mathieu reportar
+                        # Filter: kill_tick precisa cair em algum segment
+                        # selecionado pelo user (senão capture não cobre)
+                        if not any(s <= kt_int <= e for s, e in segments):
+                            continue
+                        pov_diag["kills_in_segment"] += 1
+                        candidates.append({
+                            "kill_tick": kt_int,
+                            "victim_name": str(vn),
+                            "victim_steamid": str(vsid) if vsid else "",
+                            "aesthetic_score": float(k.get("aesthetic_score") or 0),
+                            "has_style": k.get("aesthetic_style") is not None,
+                        })
+
+        # Top 2 selection: prioriza kills com aesthetic_style (tier 1),
+        # depois por aesthetic_score puro (tier 2). Dedupe por victim_steamid
+        # pra evitar 2 POV cuts pra mesma vítima (UX redundante).
+        candidates.sort(
+            key=lambda c: (0 if c["has_style"] else 1, -c["aesthetic_score"])
+        )
+        pov_diag["candidates_collected"] = len(candidates)
+        seen_victims: set[str] = set()
+        pov_cuts: list[tuple[int, str]] = []
+        for c in candidates:
+            if len(pov_cuts) >= POV_MAX_CUTS_PER_REEL:
+                break
+            vsid = c["victim_steamid"]
+            if vsid and vsid in seen_victims:
+                continue
+            pov_cuts.append((c["kill_tick"], c["victim_name"]))
+            if vsid:
+                seen_victims.add(vsid)
+        pov_diag["pov_cuts_selected"] = len(pov_cuts)
+
         log.info(
             "/render — POV cuts: %d (diag: %s) | first_kill_keys: %s",
             len(pov_cuts), pov_diag, first_kill_keys,
