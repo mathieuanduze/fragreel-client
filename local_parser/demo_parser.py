@@ -371,7 +371,15 @@ def parse(demo_path: Path, player_steamid: Optional[str] = None) -> ParsedDemo:
                     rname = str(r.get("name", "")).strip()
                     if rsid and rname and rsid not in roster_by_steamid:
                         roster_by_steamid[rsid] = rname
-        log.info(f"Roster resolved: {len(roster_by_steamid)} players")
+        # Sample dos 3 primeiros pra diag (Mathieu PC test 07/05 noite
+        # reportou POV não saiu em v0.6.39 — sem este log não dá pra
+        # distinguir "demo_parser não populou" vs "demo específica não tem
+        # players visíveis em parse_player_info").
+        sample_pairs = list(roster_by_steamid.items())[:3]
+        log.info(
+            "Roster resolved: %d players (sample: %s)",
+            len(roster_by_steamid), sample_pairs,
+        )
     except Exception as e:
         log.warning(f"Roster lookup failed (non-fatal — POV cuts disabled): {e}")
 

@@ -542,7 +542,19 @@ def _build_request_body(parsed_demo: Any, player_steamid: str) -> dict[str, Any]
     # Sprint #6.5 (06/05) — Roster pra POV cuts. parsed_demo.roster_by_steamid
     # é dict steamid→name de TODOS players (10 em matchmaking competitivo).
     # Scorer usa pra resolver victim_name nos KillInfo (capture.cfg precisa).
+    # Bug A round 2 fix (07/05): field foi adicionado em ParsedDemo +
+    # populado via dp.parse_player_info() em demo_parser.parse(). Pre-fix
+    # field não existia → getattr fallback `or {}` engolia silencioso.
     roster = getattr(parsed_demo, "roster_by_steamid", None) or {}
+    # Diag log v0.6.40 (07/05 noite): Mathieu reportou v0.6.39 sem POV em
+    # field test. Sem ver tamanho do roster aqui não dá pra isolar entre
+    # "fix demo_parser não shipou" vs "parse_player_info vazio nessa demo"
+    # vs "scorer/capture downstream issue".
+    roster_sample = list(roster.items())[:3] if roster else []
+    log.info(
+        "/api/score request — roster: %d entries, sample: %s",
+        len(roster), roster_sample,
+    )
 
     return {
         "schema_version": SCHEMA_VERSION,
