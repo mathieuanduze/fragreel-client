@@ -694,6 +694,11 @@ def create_app(
         POV_MAX_CUTS_PER_REEL = 2
 
         candidates: list[dict] = []
+        # Round 5 diag (07/05 noite tardia): PC test confirmou H4
+        # (kills_in_segment=0/3). Pra distinguir entre causas (eligible kills
+        # em rounds não selecionados vs tick encoding mismatch), capturar
+        # ranges concretos nos logs.
+        eligible_kill_ticks: list[int] = []
         pov_diag = {
             "match_in_props": False,
             "highlights_count": 0,
@@ -733,6 +738,11 @@ def create_app(
                             kt_int = int(kt)
                         except (ValueError, TypeError):
                             continue
+                        # Captura todos eligible kill_ticks pra diag (mesmo
+                        # os que ficam fora dos segments — Mathieu PC test
+                        # round 5 pediu pra distinguir tick mismatch vs
+                        # rounds não selecionados)
+                        eligible_kill_ticks.append(kt_int)
                         # Filter: kill_tick precisa cair em algum segment
                         # selecionado pelo user (senão capture não cobre)
                         if not any(s <= kt_int <= e for s, e in segments):
@@ -766,9 +776,15 @@ def create_app(
                 seen_victims.add(vsid)
         pov_diag["pov_cuts_selected"] = len(pov_cuts)
 
+        # Round 5 diag (07/05 noite tardia): segments compact + eligible_kill_ticks
+        # pra cross-check tick alignment (eligible em range dos segments?
+        # se não → kills em rounds não selecionados OU tick encoding mismatch).
+        segments_compact = [(s, e) for s, e in segments[:5]]  # primeiros 5 pra log curto
         log.info(
-            "/render — POV cuts: %d (diag: %s) | first_kill_keys: %s",
-            len(pov_cuts), pov_diag, first_kill_keys,
+            "/render — POV cuts: %d (diag: %s) | segments[:5]=%s (total=%d) | "
+            "eligible_kill_ticks=%s | first_kill_keys: %s",
+            len(pov_cuts), pov_diag, segments_compact, len(segments),
+            eligible_kill_ticks, first_kill_keys,
         )
 
         plan = RenderPlan(
