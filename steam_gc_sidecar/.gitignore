@@ -1,0 +1,9 @@
+# Sprint DEMO-3 — Node sidecar deps são instalados no CI build (npm install)
+# pra ficar bundled no PyInstaller. Evitar commitar 80+ MB de node_modules.
+node_modules/
+package-lock.json
+
+# Bundled node binary é injetado via PyInstaller (Windows release CI),
+# não commitado. Em dev (Mac), usa node global do sistema.
+node.exe
+node

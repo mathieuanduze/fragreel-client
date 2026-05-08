@@ -176,6 +176,51 @@ def create_app(
     def version():
         return {"version": CLIENT_VERSION}
 
+    # ── Sprint DEMO-3 (08/05/2026) — Steam GC sidecar endpoints ─────────────
+    # Auto match history + sharecode resolution sem abrir CS2. Web app chama
+    # esses endpoints pra puxar match history do user via Steam GC bot
+    # rodando dentro do FragReel.exe (Node sidecar).
+    #
+    # Sprint 1 MVP shipa apenas /api/steam/status (foundation). Sprint 2
+    # implementa /auth-code, /match-history, /match/<sharecode>/demo-url.
+
+    @app.get("/api/steam/status")
+    def steam_gc_status():
+        """Returns snapshot do estado do Steam GC sidecar.
+
+        Sprint 1 MVP: foundation funcional. Web pode pollar pra detectar
+        se sidecar tá vivo + GC connection ativa. Pra Sprint 2 expandir
+        com fields: needs_auth_code (bool), last_match_history_sync, etc.
+        """
+        try:
+            from steam_gc import get_sidecar, SteamGCError, SteamGCNotRunning
+        except ImportError as e:
+            log.warning("/api/steam/status — steam_gc module import failed: %s", e)
+            return {
+                "available": False,
+                "error": "steam_gc_module_unavailable",
+                "detail": str(e),
+            }, 503
+
+        try:
+            gc = get_sidecar()
+            data = gc.request("status", timeout=3.0)
+            return {
+                "available": True,
+                "running": gc.is_running(),
+                **data,
+            }
+        except (SteamGCError, SteamGCNotRunning) as e:
+            log.warning("/api/steam/status — sidecar error: %s", e)
+            return {
+                "available": False,
+                "running": False,
+                "error": str(e),
+            }, 503
+        except Exception as e:
+            log.error("/api/steam/status — unexpected error: %s", e, exc_info=True)
+            return {"available": False, "error": "internal_error"}, 500
+
     @app.get("/install-status")
     def install_status():
         """Sprint Install Indicator B (06/05) — endpoint sempre returns

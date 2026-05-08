@@ -1,0 +1,18 @@
+{
+  "name": "fragreel-steam-gc-sidecar",
+  "version": "0.1.0",
+  "description": "Steam Game Coordinator sidecar bot for FragReel — runs inside FragReel.exe, handles match history + sharecode resolution. Spawned as child process of Python parent via IPC stdin/stdout JSON-line protocol. Uses node-steam-user + node-globaloffensive (DoctorMcKay libs, mar/2026 last release with CS2 support).",
+  "private": true,
+  "main": "steam_gc.js",
+  "scripts": {
+    "start": "node steam_gc.js",
+    "test:ping": "echo '{\"id\":\"test1\",\"action\":\"ping\"}' | node steam_gc.js"
+  },
+  "dependencies": {
+    "globaloffensive": "^3.3.0",
+    "steam-user": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
