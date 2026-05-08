@@ -342,8 +342,24 @@ class SteamGCSidecar:
             )
             self._ready_event.set()
         elif event == "steam_guard_required":
-            log.info("steam_gc: Steam Guard code requerido (domain=%s)", msg.get("domain"))
-            # TODO Sprint 2: propagar pra parent via callback OR signal Flask endpoint
+            log.info(
+                "steam_gc: Steam Guard code requerido (domain=%s, last_wrong=%s)",
+                msg.get("domain"), msg.get("last_code_wrong"),
+            )
+        elif event == "refresh_token_obtained":
+            # Auto-save refresh_token + steamid64 no encrypted store.
+            # Token vem após login fresh com credentials. Próximo login
+            # (auto-login) usa esse token sem precisar credentials again.
+            try:
+                import steam_token_store
+                token = msg.get("token")
+                if token:
+                    steam_token_store.update(refresh_token=token)
+                    log.info("refresh_token saved (encrypted, len=%d)", len(token))
+            except Exception as e:
+                log.warning("falhou salvar refresh_token: %s", e)
+        elif event == "gc_disconnected":
+            log.warning("steam_gc: GC disconnected (reason=%s)", msg.get("reason"))
         else:
             log.debug("steam_gc event %s: %s", event, msg)
 

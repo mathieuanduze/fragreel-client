@@ -186,21 +186,25 @@ def create_app(
 
     @app.get("/api/steam/status")
     def steam_gc_status():
-        """Returns snapshot do estado do Steam GC sidecar.
+        """Returns snapshot do estado do Steam GC sidecar + auth state.
 
-        Sprint 1 MVP: foundation funcional. Web pode pollar pra detectar
-        se sidecar tá vivo + GC connection ativa. Pra Sprint 2 expandir
-        com fields: needs_auth_code (bool), last_match_history_sync, etc.
+        Web polla pra detectar se user precisa fazer login (saved=false)
+        OU re-fornecer credentials (refresh_token expirou).
         """
         try:
             from steam_gc import get_sidecar, SteamGCError, SteamGCNotRunning
+            import steam_token_store
         except ImportError as e:
-            log.warning("/api/steam/status — steam_gc module import failed: %s", e)
+            log.warning("/api/steam/status — module import failed: %s", e)
             return {
                 "available": False,
                 "error": "steam_gc_module_unavailable",
                 "detail": str(e),
             }, 503
+
+        # Auth state: tem token salvo?
+        saved = steam_token_store.load()
+        has_token = saved is not None and saved.get("refresh_token")
 
         try:
             gc = get_sidecar()
@@ -208,6 +212,9 @@ def create_app(
             return {
                 "available": True,
                 "running": gc.is_running(),
+                "has_saved_token": bool(has_token),
+                "saved_steamid64": saved.get("steamid64") if saved else None,
+                "has_match_sharing_code": bool(saved and saved.get("match_sharing_auth_code")),
                 **data,
             }
         except (SteamGCError, SteamGCNotRunning) as e:
@@ -215,11 +222,163 @@ def create_app(
             return {
                 "available": False,
                 "running": False,
+                "has_saved_token": bool(has_token),
                 "error": str(e),
             }, 503
         except Exception as e:
             log.error("/api/steam/status — unexpected error: %s", e, exc_info=True)
             return {"available": False, "error": "internal_error"}, 500
+
+    @app.post("/api/steam/login")
+    def steam_login():
+        """Login Steam com credentials (primeiro login) OU refresh_token (auto).
+
+        Body JSON:
+          - Auto-login (subsequente): {} ou {use_saved: true} → usa refresh_token salvo
+          - First login: {account_name, password, two_factor_code?, auth_code?}
+
+        Resposta sucesso: {steamid64, gc_connected: true}
+        Resposta erro:
+          - 401 invalid_password
+          - 428 two_factor_required (precisa Steam Mobile Authenticator code)
+          - 428 account_logon_denied_email (precisa Steam Guard email code)
+          - 429 rate_limit_exceeded
+          - 503 sidecar_unavailable
+        """
+        try:
+            from steam_gc import get_sidecar, SteamGCError
+            import steam_token_store
+        except ImportError as e:
+            return {"error": "module_unavailable", "detail": str(e)}, 503
+
+        body = request.get_json(silent=True, force=True) or {}
+        use_saved = body.get("use_saved", False) or not body.get("account_name")
+
+        login_params = {}
+        if use_saved:
+            saved = steam_token_store.load()
+            if not saved or not saved.get("refresh_token"):
+                return {"error": "no_saved_token"}, 401
+            login_params["refresh_token"] = saved["refresh_token"]
+        else:
+            if not body.get("account_name") or not body.get("password"):
+                return {"error": "missing_credentials"}, 400
+            login_params["account_name"] = body["account_name"]
+            login_params["password"] = body["password"]
+            if body.get("two_factor_code"):
+                login_params["two_factor_code"] = body["two_factor_code"]
+            if body.get("auth_code"):
+                login_params["auth_code"] = body["auth_code"]
+
+        gc = get_sidecar()
+        try:
+            data = gc.request("login", login_params, timeout=35.0)
+        except SteamGCError as e:
+            err_msg = str(e)
+            # Map error code → HTTP status
+            if "invalid_password" in err_msg:
+                return {"error": "invalid_password"}, 401
+            if "two_factor_required" in err_msg or "two_factor_invalid" in err_msg:
+                return {"error": "two_factor_required"}, 428
+            if "account_logon_denied_email" in err_msg or "steam_guard_required" in err_msg:
+                return {"error": "steam_guard_required"}, 428
+            if "rate_limit_exceeded" in err_msg:
+                return {"error": "rate_limit_exceeded"}, 429
+            return {"error": err_msg}, 502
+        except Exception as e:
+            log.error("/api/steam/login — unexpected: %s", e, exc_info=True)
+            return {"error": "internal_error", "detail": str(e)}, 500
+
+        # Login sucesso — TODO capturar refresh_token via event listener
+        # (steam-user emite "refreshToken" event). Sprint 3 implementa
+        # capture + save. MVP atual: just return GC status.
+        return {
+            "ok": True,
+            "steamid64": data.get("steamid64"),
+            "gc_connected": data.get("gc_connected", False),
+        }
+
+    @app.post("/api/steam/logout")
+    def steam_logout():
+        """Encerra sessão Steam + apaga tokens salvos."""
+        try:
+            from steam_gc import get_sidecar
+            import steam_token_store
+        except ImportError as e:
+            return {"error": "module_unavailable", "detail": str(e)}, 503
+
+        gc = get_sidecar()
+        try:
+            gc.request("logout", timeout=5.0)
+        except Exception as e:
+            log.debug("logout sidecar request: %s", e)
+
+        deleted = steam_token_store.delete()
+        return {"ok": True, "token_deleted": deleted}
+
+    @app.post("/api/steam/auth-code")
+    def steam_set_auth_code():
+        """Salva match sharing auth_code (4-char Steam page code).
+
+        Body: {auth_code: "ABC1"}
+        Persisted encrypted pra reuso em próximas sessões.
+        """
+        try:
+            import steam_token_store
+        except ImportError as e:
+            return {"error": "module_unavailable", "detail": str(e)}, 503
+
+        body = request.get_json(silent=True, force=True) or {}
+        auth_code = (body.get("auth_code") or "").strip().upper()
+        if not auth_code or len(auth_code) > 16:
+            return {"error": "invalid_auth_code"}, 400
+
+        saved = steam_token_store.update(match_sharing_auth_code=auth_code)
+        return {
+            "ok": True,
+            "has_match_sharing_code": True,
+            "preview": auth_code[:2] + "**",
+        }
+
+    @app.get("/api/steam/match-history")
+    def steam_match_history():
+        """Puxa últimas matches do user via Steam GC.
+
+        Requer login + auth_code salvos. MVP retorna últimas ~8 (recent_matches).
+        Sprint 3 implementa paginação completa.
+        """
+        try:
+            from steam_gc import get_sidecar, SteamGCError
+            import steam_token_store
+        except ImportError as e:
+            return {"error": "module_unavailable", "detail": str(e)}, 503
+
+        saved = steam_token_store.load() or {}
+        steamid64 = saved.get("steamid64")
+        if not steamid64:
+            return {"error": "not_logged_in"}, 401
+
+        gc = get_sidecar()
+        try:
+            data = gc.request(
+                "recent_matches",
+                {"steamid64": steamid64},
+                timeout=20.0,
+            )
+        except SteamGCError as e:
+            err_msg = str(e)
+            if "not_logged_in_to_gc" in err_msg:
+                return {"error": "not_logged_in_to_gc"}, 401
+            return {"error": err_msg}, 502
+        except Exception as e:
+            log.error("/api/steam/match-history — unexpected: %s", e, exc_info=True)
+            return {"error": "internal_error"}, 500
+
+        return {
+            "ok": True,
+            "matches": data.get("matches", []),
+            "count": data.get("count", 0),
+        }
 
     @app.get("/install-status")
     def install_status():
