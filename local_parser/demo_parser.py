@@ -703,8 +703,16 @@ def _parse_bomb_events(dp, tickrate: float) -> list[BombEvent]:
             try:
                 raw_user = row.get(user_col) if user_col else None
                 player_steamid = str(raw_user or "").strip()
-                if not player_steamid or player_steamid in ("0", "None", "nan", ""):
-                    continue
+                # Sprint v5.7.10 (Mathieu PC diag 08/05): NÃO skip bomb
+                # events com steamid vazio. Antes esse check droppava
+                # 11/14 plants em de_mirage (demoparser2 às vezes não
+                # extrai user_steamid corretamente, retorna "0"/"None").
+                # Bomb timer no editor PRECISA do tick/timestamp pra
+                # mostrar a barra — independente do steamid. Scorer.ts
+                # tem fallback agora pra match por (round, action) sem
+                # exigir steamid match.
+                if player_steamid in ("0", "None", "nan", ""):
+                    player_steamid = ""  # normalize → empty string
 
                 tick = int(row.get("tick") or 0)
                 round_raw = row.get("total_rounds_played")
