@@ -14,8 +14,25 @@ Lifecycle:
   - Cleanup automático: matches > 30 dias old são removidos no boot do cliente
     (mantém disco limpo, retém histórico curto-prazo pra UX)
 
-Schema do match_doc: ver `api_client.parse_and_score_locally()` docstring.
-Espelha o que Railway retornava em `/matches/{id}`.
+Schema versioning (Sprint v5.7.12, 08/05/2026 Mathieu spec):
+  Match docs salvos antes de adicionarmos campos novos (ex: victim_name na
+  v0.6.52, bomb_action_timestamp fallback na v0.7.0) viram STALE — o reel
+  gerado a partir deles vai ter dados faltando ("INIMIGO", sem bomb timer).
+
+  Solução: campo `_schema_version` no match_doc. Quando bumpamos a
+  constante MATCH_DOC_SCHEMA_VERSION abaixo, todos os match_docs antigos
+  no disco automaticamente viram cache miss → load_match retorna None
+  → fluxo re-score automaticamente (web detecta 404 no /matches/{id} →
+  cai pro AutoReanalyze → /api/score com client v0.6.53+ → match_doc
+  novo com campos populados).
+
+  Bump version checklist:
+    1. Mudou shape do match_doc (campo novo, rename, struct change) → bump
+    2. Mudou semântica de campo existente (ex: timestamp em sec → ms) → bump
+    3. NÃO precisa bumpar pra: bug fix em scoring que mantém shape
+       (ex: bomb_action_timestamp fix retorna número onde antes null —
+       aceitável usar dado antigo, só vai ter mais nulls)
+       Mas em DÚVIDA bumpa — re-score local é barato (~5-15s).
 
 Sync com Railway: cliente continua mandando match_doc pro Railway via
 `/demo/analyze` POST quando flag `FRAGREEL_RAILWAY_BACKUP=1` está setada
@@ -32,6 +49,19 @@ from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger("fragreel.local_matches_store")
+
+# Sprint v5.7.12 (08/05/2026 Mathieu spec): "Schema versioning em
+# match_doc pra auto-invalidate cache cross-version (PC diag suggestion)".
+#
+# History de bumps:
+#   v1 (initial): match_doc Sprint I.5 — id, map, date, score, highlights[]
+#   v2 (07/05): + Sprint #6.5 (POV cuts, victim_steamid/name, kill_tick,
+#               aesthetic_score/style, bomb_planted_timestamp)
+#   v3 (08/05): + v0.6.52 client victim_name event-row capture (kill.victim_name
+#               agora populated diretamente, não só via roster lookup);
+#               + v0.7.0 scorer bomb_action_timestamp 2-tier fallback
+#               (campo agora populated em rounds com bomb_event sem steamid)
+MATCH_DOC_SCHEMA_VERSION = "v3"
 
 
 # ── Storage path ──────────────────────────────────────────────────────────────
@@ -73,9 +103,11 @@ def save_match(match_id: str, match_doc: dict) -> Path:
     target = _matches_dir() / f"{match_id}.json"
     tmp = target.with_suffix(".json.tmp")
 
-    # Add metadata pra debugging + cleanup
+    # Add metadata pra debugging + cleanup + schema versioning
+    # (Sprint v5.7.12 — auto-invalidate caches cross-version)
     match_doc_with_meta = {
         **match_doc,
+        "_schema_version": MATCH_DOC_SCHEMA_VERSION,
         "_local_saved_at": time.time(),
         "_local_saved_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -91,9 +123,16 @@ def save_match(match_id: str, match_doc: dict) -> Path:
 
 
 def load_match(match_id: str) -> Optional[dict]:
-    """Carrega match_doc pelo id. Returns None se não existe/corrompido.
+    """Carrega match_doc pelo id. Returns None se não existe/corrompido/STALE.
 
-    NÃO inclui as chaves `_local_saved_at*` no output (são metadata interna).
+    Sprint v5.7.12 (Mathieu spec): valida `_schema_version` contra
+    MATCH_DOC_SCHEMA_VERSION. Se mismatch (cache foi gravado com schema
+    antigo, antes de adicionarmos campos novos), retorna None pra
+    forçar re-score com scorer atual. Web então cai no fluxo
+    AutoReanalyze que dispara /api/score fresh.
+
+    NÃO inclui as chaves `_schema_version` / `_local_saved_at*` no output
+    (são metadata interna).
     """
     if not match_id:
         return None
@@ -102,8 +141,19 @@ def load_match(match_id: str) -> Optional[dict]:
         return None
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
+        # Schema validation — invalida automaticamente caches stale
+        cached_version = data.get("_schema_version")
+        if cached_version != MATCH_DOC_SCHEMA_VERSION:
+            log.info(
+                "load_match %s: schema mismatch (cached=%s, expected=%s) — "
+                "invalidating, will trigger re-score",
+                match_id, cached_version, MATCH_DOC_SCHEMA_VERSION,
+            )
+            # Não deleta automaticamente — Mathieu pode preferir investigar
+            # docs antigos. Cleanup viria por cleanup_old_matches() em 30d.
+            return None
         # Strip metadata interna
-        return {k: v for k, v in data.items() if not k.startswith("_local_")}
+        return {k: v for k, v in data.items() if not k.startswith("_")}
     except (json.JSONDecodeError, OSError) as e:
         log.warning("load_match %s: %s", match_id, e)
         return None
@@ -113,8 +163,13 @@ def list_matches() -> list[dict]:
     """Lista summary de todos os matches locais (sorted por data desc).
 
     Cada entry: chaves de "list view" (id, map, date, score, highlights_count,
-    top_play, rating, kd, status, _local_saved_at). NÃO inclui highlights[]
-    pra response ser leve.
+    top_play, rating, kd, status, _local_saved_at, is_stale). NÃO inclui
+    highlights[] pra response ser leve.
+
+    Sprint v5.7.12: `is_stale` indica que o match_doc foi gravado com
+    schema antigo. UI pode mostrar badge "Re-score required" se quiser —
+    quando user clica, load_match retorna None automaticamente e flow
+    AutoReanalyze re-scora.
     """
     summaries: list[dict] = []
     for path in sorted(
@@ -124,6 +179,8 @@ def list_matches() -> list[dict]:
     ):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            cached_version = data.get("_schema_version")
+            is_stale = cached_version != MATCH_DOC_SCHEMA_VERSION
             summaries.append({
                 "id": data.get("id"),
                 "map": data.get("map", "unknown"),
@@ -137,6 +194,8 @@ def list_matches() -> list[dict]:
                 "kd": data.get("kd", "—"),
                 "scoring_source": data.get("scoring_source"),
                 "_local_saved_at": data.get("_local_saved_at"),
+                "is_stale": is_stale,
+                "schema_version": cached_version or "v0",
             })
         except (json.JSONDecodeError, OSError) as e:
             log.warning("list_matches: skipping corrupted %s: %s", path.name, e)
