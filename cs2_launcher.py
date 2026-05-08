@@ -816,6 +816,70 @@ def force_windowed_videosettings(cs2_exe: Path) -> bool:
     return wrote
 
 
+def restore_user_video_settings(cs2_exe: Path) -> bool:
+    """Round 13 (07/05 noite tardia) — restore CS2 fullscreen settings ao
+    estado ORIGINAL pós-render.
+
+    Mathieu reportou: "toda vez que gero um fragreel, na próxima que abro
+    o CS de novo, ele tá em modo janela. User não vai gostar."
+
+    Causa: force_windowed_cs2_video + force_windowed_videosettings escrevem
+    "0" nas chaves fullscreen pra que o capture HLAE rode em windowed
+    (necessário pra HLAE injection funcionar). Mas a escrita PERSISTE no
+    config — próxima vez que user abre CS2 manualmente, vem em windowed.
+
+    Fix: backup já era criado em <file>.fragreel.bak ANTES da modificação.
+    Esta função RESTAURA o backup pós-render, devolvendo ao estado original
+    (fullscreen se era fullscreen).
+
+    Idempotente: se backup não existe (já restaurado OU nunca foi modificado),
+    é no-op. Não-fatal: erros são logados mas não propagam.
+
+    Returns: True se algum file foi restaurado, False se todos no-op.
+    """
+    paths = _cs2video_paths(cs2_exe) + _videosettings_paths(cs2_exe)
+    if not paths:
+        return False
+
+    restored = False
+    for path in paths:
+        backup = path.with_suffix(".txt.fragreel.bak")
+        if not backup.exists():
+            continue
+        try:
+            backup_content = backup.read_text(encoding="utf-8")
+            current_content = path.read_text(encoding="utf-8") if path.exists() else ""
+            if current_content == backup_content:
+                # Já está no estado original — só remove o backup pra
+                # evitar restore acidental futuro
+                try:
+                    backup.unlink()
+                except Exception:
+                    pass
+                continue
+            # Restore: escreve o conteúdo do backup de volta
+            path.write_text(backup_content, encoding="utf-8")
+            log.info(
+                "Round 13 fix: restaurado %s ao estado original (backup %s)",
+                path.name, backup.name,
+            )
+            # Remove backup pós-restore — capture script novo vai criar
+            # backup novo se rodar (idempotente)
+            try:
+                backup.unlink()
+            except Exception as e:
+                log.debug("Round 13: falhou unlink backup %s: %s (non-fatal)", backup, e)
+            restored = True
+        except Exception as e:
+            log.warning(
+                "Round 13: falhou restore %s: %s (não-fatal — user pode "
+                "restaurar manual via Settings → Video → Display Mode)",
+                path, e,
+            )
+
+    return restored
+
+
 def launch_cs2_injected(
     cs2_exe: Path,
     hook_dll: Path,

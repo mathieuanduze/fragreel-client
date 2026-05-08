@@ -1070,6 +1070,19 @@ class RenderCoordinator:
             # do user enchia (PC reportou 57 GB → 3.5 GB em 1 sessão).
             self._cleanup_scratch_dirs(reason="crash")
 
+            # Round 13 (07/05 noite tardia) — restore CS2 video settings
+            # MESMO em crash path. Mathieu reportou: "toda vez que gero um
+            # fragreel, na próxima que abro o CS de novo, ele tá em modo
+            # janela". Capture forçava windowed, mas restore não acontecia
+            # → user via CS2 windowed forever até trocar manual em Settings.
+            # Idempotente — no-op se backup ausente.
+            try:
+                from cs2_launcher import restore_user_video_settings
+                if self.config.cs2_exe.exists():
+                    restore_user_video_settings(self.config.cs2_exe)
+            except Exception as e:
+                log.warning("Round 13: restore_user_video_settings falhou (non-fatal): %s", e)
+
     # -- helpers ------------------------------------------------------------
 
     def _estimate_frames(self, plan: RenderPlan) -> int:
@@ -1101,6 +1114,17 @@ class RenderCoordinator:
             self._session.stage = "complete"
             self._session.progress = 1.0
             self._session.finished_at = time.time()
+        # Round 13 (07/05 noite tardia) — restore CS2 video settings ao
+        # estado original. Mathieu reportou "toda vez que gero um fragreel,
+        # na próxima que abro o CS de novo, ele tá em modo janela".
+        # Idempotente — no-op se backup ausente. Fora do lock pra não
+        # bloquear status polling durante I/O.
+        try:
+            from cs2_launcher import restore_user_video_settings
+            if self.config.cs2_exe.exists():
+                restore_user_video_settings(self.config.cs2_exe)
+        except Exception as e:
+            log.warning("Round 13 (success path): restore falhou (non-fatal): %s", e)
 
     def _mark_done_partial(self, take_dir: Path | None) -> None:
         """End state when capture succeeded but ffmpeg/Remotion couldn't run."""
@@ -1110,6 +1134,13 @@ class RenderCoordinator:
             self._session.state = "done"
             self._session.progress = 0.85
             self._session.finished_at = time.time()
+        # Round 13 — restore CS2 settings também no partial path
+        try:
+            from cs2_launcher import restore_user_video_settings
+            if self.config.cs2_exe.exists():
+                restore_user_video_settings(self.config.cs2_exe)
+        except Exception as e:
+            log.warning("Round 13 (partial path): restore falhou (non-fatal): %s", e)
 
     def cleanup_legacy_orphans(self, *, max_age_min: int = 5) -> tuple[int, int]:
         """Bug #21 V2 (28/04, Mathieu pediu): cleanup retroativo de TGA
