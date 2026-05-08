@@ -66,6 +66,33 @@ def _bundle_tree(source: Path, dest_in_bundle: str) -> list[tuple[str, str]]:
 # travel with the .exe so the bundled Python interpreter can import it.
 scripts_datas = _bundle_tree(SCRIPTS_DIR, "scripts")
 
+# Sprint DEMO-3 Sprint 3 (08/05/2026) — bundle steam_gc_sidecar/.
+#
+# Inclui:
+#   steam_gc_sidecar/steam_gc.js (entry node)
+#   steam_gc_sidecar/package.json (metadata)
+#   steam_gc_sidecar/node_modules/ (deps node-steam-user, node-globaloffensive)
+#   steam_gc_sidecar/node.exe (Windows binary, baixado pelo CI release.yml)
+#
+# CI workflow (.github/workflows/release.yml) faz `npm install` em
+# steam_gc_sidecar/ + baixa node.exe Windows binary BEFORE PyInstaller run.
+# Em dev (Mac), node global é usado via _resolve_node_executable().
+SIDECAR_DIR = Path("steam_gc_sidecar").resolve()
+sidecar_datas = []
+if SIDECAR_DIR.exists():
+    # Bundle todos files (incluindo node_modules + node.exe se present)
+    for item in SIDECAR_DIR.rglob("*"):
+        if item.is_file():
+            # Skip dev artifacts
+            if any(p in item.parts for p in (".git", "__pycache__", ".cache")):
+                continue
+            rel = item.relative_to(SIDECAR_DIR)
+            target_dir = (Path("steam_gc_sidecar") / rel.parent).as_posix()
+            sidecar_datas.append((str(item), target_dir))
+    print(f"[FragReel.spec] steam_gc_sidecar: {len(sidecar_datas)} files bundled")
+else:
+    print("[FragReel.spec] steam_gc_sidecar/ não encontrado — DEMO-3 disabled neste build")
+
 
 # Bug #18 (28/04, descoberto em v0.4.3 PC test): PyInstaller Splash() exige
 # Tcl/Tk DLLs (tcl86t.dll, tk86t.dll) bundled, mas eles NÃO são auto-coletados
@@ -84,7 +111,8 @@ a = Analysis(
     binaries=tcl_tk_binaries,
     # Sprint J: SÓ scripts_datas. vendor_datas/node_datas/editor_datas
     # removidos — vendor_downloader baixa em runtime first-run.
-    datas=scripts_datas,
+    # Sprint DEMO-3 Sprint 3: + sidecar_datas (steam_gc_sidecar bundle).
+    datas=scripts_datas + sidecar_datas,
     hiddenimports=[
         'plyer.platforms.win.notification',
         'pystray._win32',
@@ -134,6 +162,16 @@ a = Analysis(
         'scripts.capture_script',
         # v0.2.7: client_config holds output_dir persistence.
         'client_config',
+        # Sprint DEMO-3 Sprint 3 (08/05/2026) — Steam GC client-side bot.
+        'steam_gc',
+        'steam_token_store',
+        # Token store deps:
+        'cryptography',
+        'cryptography.fernet',
+        # Windows-only: pywin32 pra DPAPI. Em CI Windows-built, esse
+        # import succeeds. Em dev Mac/Linux, falha graciosamente
+        # (steam_token_store usa Fernet fallback).
+        'win32crypt',
     ],
     hookspath=[],
     hooksconfig={},

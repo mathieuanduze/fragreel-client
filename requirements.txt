@@ -13,3 +13,10 @@ demoparser2>=0.41.0
 polars>=0.20.0
 pyarrow>=15.0.0
 pyinstaller>=6.0.0
+
+# Sprint DEMO-3 (08/05/2026) — Steam GC client-side bot.
+# steam_token_store.py usa cryptography Fernet (Mac/Linux fallback) E
+# DPAPI via pywin32 (Windows production). Ambos listados pra CI Windows
+# ter pywin32, e dev Mac/Linux pra ter cryptography pelo menos.
+cryptography>=42.0.0
+pywin32>=306; sys_platform == 'win32'

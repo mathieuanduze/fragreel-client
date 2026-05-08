@@ -91,6 +91,44 @@ jobs:
         working-directory: fragreel-sibling/editor
         run: npm ci
 
+      # Sprint DEMO-3 Sprint 3 (08/05/2026) — npm install no steam_gc_sidecar
+      # pra popular node_modules antes do PyInstaller bundle.
+      - name: npm install steam_gc_sidecar (Steam GC client-side bot)
+        working-directory: steam_gc_sidecar
+        shell: pwsh
+        run: |
+          npm install --omit=dev
+          # Sanity check: node-steam-user e node-globaloffensive devem existir
+          if (-not (Test-Path "node_modules/steam-user")) {
+            Write-Error "steam-user lib não foi instalada"
+            exit 1
+          }
+          if (-not (Test-Path "node_modules/globaloffensive")) {
+            Write-Error "globaloffensive lib não foi instalada"
+            exit 1
+          }
+          Write-Host "✅ steam_gc_sidecar/node_modules populated ($(Get-ChildItem node_modules | Measure-Object).Count packages)"
+
+      # Sprint DEMO-3 Sprint 3 — baixa node.exe Windows binary standalone.
+      # PyInstaller bundle inclui node.exe pra rodar steam_gc.js sem
+      # exigir que user tenha node instalado. node-v20.x.x-win-x64.zip da
+      # nodejs.org tem só node.exe + dlls (~30MB).
+      - name: Download node.exe Windows standalone (pra bundle PyInstaller)
+        shell: pwsh
+        run: |
+          $nodeVersion = "v20.18.1"  # LTS stable
+          $url = "https://nodejs.org/dist/$nodeVersion/node-$nodeVersion-win-x64.zip"
+          Write-Host "Baixando $url"
+          Invoke-WebRequest -Uri $url -OutFile "node-win.zip"
+          Expand-Archive -Path "node-win.zip" -DestinationPath "node-win-extracted" -Force
+          # Move só o node.exe pro sidecar dir (DLLs vem com PyInstaller VC redist)
+          $extractedDir = Get-ChildItem -Path "node-win-extracted" -Directory | Select-Object -First 1
+          Copy-Item -Path "$($extractedDir.FullName)/node.exe" -Destination "steam_gc_sidecar/node.exe" -Force
+          Write-Host "✅ node.exe copiado pra steam_gc_sidecar/ ($((Get-Item steam_gc_sidecar/node.exe).Length / 1MB) MB)"
+          # Cleanup
+          Remove-Item "node-win.zip" -Force
+          Remove-Item "node-win-extracted" -Recurse -Force
+
       - name: Copy editor → vendor/editor/ pra bundling
         run: python setup_editor.py --source fragreel-sibling/editor --force
 
