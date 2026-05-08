@@ -43,6 +43,12 @@ class Kill:
     attackerinair: bool = False           # jumping kill
     distance: Optional[float] = None      # distância attacker→victim em units CS2
     attacker_health: Optional[int] = None # HP do attacker no tick da kill (low-HP heroico)
+    # Sprint v5.7.4 (Mathieu 08/05): names diretos do event row pra
+    # bypassar dependency em roster_by_steamid (que pode falhar em demos
+    # com player_info empty). demoparser2 expõe user_name (victim) +
+    # attacker_name no player_death event quando disponível.
+    attacker_name: Optional[str] = None
+    victim_name: Optional[str] = None
 
 
 @dataclass
@@ -502,6 +508,23 @@ def _parse_kills(dp, tickrate: float) -> list[Kill]:
             attacker_health_raw = row.get("attacker_health") or row.get("attacker_hp")
             attacker_health = int(attacker_health_raw) if attacker_health_raw is not None else None
 
+            # Sprint v5.7.4 (Mathieu): captura nomes diretos do event row.
+            # demoparser2 player_death typically expõe `user_name` (victim,
+            # CSGO event convention) + `attacker_name`. Bypassa roster
+            # lookup que pode estar vazio em demos sem player_info parsing.
+            raw_attacker_name = row.get("attacker_name")
+            raw_victim_name = row.get("user_name") or row.get("victim_name")
+            attacker_name_str: Optional[str] = (
+                str(raw_attacker_name).strip()
+                if raw_attacker_name and str(raw_attacker_name).strip() not in ("None", "nan", "")
+                else None
+            )
+            victim_name_str: Optional[str] = (
+                str(raw_victim_name).strip()
+                if raw_victim_name and str(raw_victim_name).strip() not in ("None", "nan", "")
+                else None
+            )
+
             kills.append(Kill(
                 tick=tick,
                 timestamp=round(tick / tickrate, 3),
@@ -512,6 +535,8 @@ def _parse_kills(dp, tickrate: float) -> list[Kill]:
                 victim_steamid=victim,
                 attacker_team=attacker_team,
                 victim_team=victim_team,
+                attacker_name=attacker_name_str,
+                victim_name=victim_name_str,
                 noscope=noscope,
                 thrusmoke=thrusmoke,
                 penetrated=penetrated,

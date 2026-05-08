@@ -518,10 +518,13 @@ def _build_request_body(parsed_demo: Any, player_steamid: str) -> dict[str, Any]
             "penetrated": getattr(k, "penetrated", 0),
             "attackerblind": getattr(k, "attackerblind", False),
             # Round 8 (07/05) — distância attacker→victim em units CS2.
-            # Scorer usa pra filtro pov_eligible (long-distance kills =
-            # mais cinematográficas pra POV vítima). demoparser2 emite
-            # diretamente em "distance" do player_death event.
             "distance": getattr(k, "distance", None),
+            # Sprint v5.7.4 (Mathieu 08/05): names diretos do event row
+            # pra bypassar dependency em roster_by_steamid quando esse
+            # vier vazio. Killfeed do editor usa victim_name pra mostrar
+            # nome do jogador morto em vez de "INIMIGO" fallback.
+            "attacker_name": getattr(k, "attacker_name", None),
+            "victim_name": getattr(k, "victim_name", None),
         })
 
     rounds = []
