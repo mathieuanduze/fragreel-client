@@ -578,6 +578,40 @@ def create_app(
                 sha, target_steamid,
             )
             match_doc = parse_and_score_locally(path, target_steamid)
+
+            # Sprint v5.7.12 BUG FIX (Mathieu 09/05/2026): "Pro demo
+            # Demo não encontrada — segue acontecendo".
+            # Root cause: scoreDemoForPlayer retornava match_doc com
+            # match_id NOVO mas NUNCA salvava em local_matches_store.
+            # Web depois tentava GET /matches/<match_id> → load_match
+            # returned None → 404 → AutoReanalyze → tentava achar demo
+            # por match_id → loop "demo não encontrada".
+            #
+            # Fix: persiste match_doc imediatamente. Próximo /matches/<id>
+            # serve normalmente. Bug existia desde Sprint #7 Phase 7.3.
+            try:
+                from local_matches_store import save_match
+                match_id = match_doc.get("id")
+                if match_id:
+                    save_match(match_id, match_doc)
+                    log.info(
+                        "/demos/%s/score — saved match_doc (id=%s) pra /matches/<id> lookup",
+                        sha, match_id,
+                    )
+                else:
+                    log.warning(
+                        "/demos/%s/score — match_doc sem 'id', skipping save",
+                        sha,
+                    )
+            except Exception as save_err:
+                # Save fail é non-fatal: response ainda funciona, só
+                # /matches/<id> ficaria 404 (cai no AutoReanalyze flow
+                # que re-scora). Logamos pra investigar.
+                log.error(
+                    "/demos/%s/score — save_match failed (non-fatal): %s",
+                    sha, save_err,
+                )
+
             return jsonify(match_doc)
         except FileNotFoundError as e:
             log.error("/demos/%s/score — file not found: %s", sha, e)
