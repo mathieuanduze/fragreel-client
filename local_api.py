@@ -741,6 +741,17 @@ def create_app(
             "deaths": 0,
         })
 
+        # Sprint v5.7.14 (Mathieu 09/05/2026): "6v4 roster bug — um dos
+        # players foi pro lado errado". Causa: `if team is None: set`
+        # capturava só a PRIMEIRA kill cronologicamente. Em competitivo
+        # CS2 halftime troca lados (CT↔T após round 12). Players cuja
+        # 1ª kill foi pré-halftime ficavam fixed num side, pós-halftime
+        # no outro → 6v4 ao invés de 5v5.
+        # Fix: trackear team por _last_team_tick (overwrite com kill
+        # mais recente). all_kills é cronológico, último wins.
+        # Edge: player que só morreu (0 kills) → team via victim_team
+        # do last death. Funciona consistente.
+
         # All attackers (incl. team-kills, world, env)
         for k in parsed.all_kills:
             sid = getattr(k, "attacker_steamid", "") or ""
@@ -750,8 +761,10 @@ def create_app(
             stats[sid]["kills"] += 1
             if getattr(k, "headshot", False):
                 stats[sid]["headshots"] += 1
-            if stats[sid]["team"] is None:
-                stats[sid]["team"] = getattr(k, "attacker_team", None)
+            # Sempre overwrite team — last kill wins (post-halftime)
+            attacker_team = getattr(k, "attacker_team", None)
+            if attacker_team is not None:
+                stats[sid]["team"] = attacker_team
 
         # Add victim-only players (e.g. 0-kill players we'd miss otherwise)
         for k in parsed.all_kills:
@@ -760,6 +773,10 @@ def create_app(
                 continue
             stats[vsid]["steamid"] = vsid
             stats[vsid]["deaths"] += 1
+            # Player que só morreu: team via victim_team. Pra players
+            # que JÁ tem team via attacker loop, NÃO sobrescreve (attacker
+            # team é mais confiável — kills tipicamente cobrem ambos lados
+            # pós-halftime).
             if stats[vsid]["team"] is None:
                 stats[vsid]["team"] = getattr(k, "victim_team", None)
 
