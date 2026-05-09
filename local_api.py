@@ -1373,6 +1373,44 @@ def create_app(
             return {"opened": False, "path": str(parent_dir), "kind": None,
                     "reason": f"could not open folder: {e}"}, 500
 
+    @app.get("/render/preview")
+    def render_preview():
+        """Sprint v5.7.17 (Mathieu 09/05/2026): "vamos fazer uma tela
+        extra quando o vídeo fica pronto... popup com o video embedado".
+
+        Stream MP4 do último render direto pro <video> tag do browser.
+        Usado por AdModal "Ready" screen pra preview embedado +
+        download via browser native.
+
+        Retorna o MP4 file com Content-Type video/mp4 + Range support
+        (HTTP 206 partial content) pra seek funcionar no <video>.
+
+        Behavior:
+          - 200 OK + binary stream: render OK, MP4 disponível
+          - 404: nenhum render ainda OR MP4 não existe ainda
+          - 503: render_coordinator não configurado
+        """
+        if render_coordinator is None:
+            return {"error": "render_not_configured"}, 503
+        current = render_coordinator.current()
+        if current is None or not getattr(current, "output_mp4", None):
+            return {"error": "no_render_output"}, 404
+
+        from flask import send_file
+        mp4_path = Path(current.output_mp4)
+        if not mp4_path.exists():
+            return {"error": "file_missing", "path": str(mp4_path)}, 404
+
+        # send_file handles Range headers automaticamente (HTTP 206 partial).
+        # download_name evita "render.mp4" generic nome quando user save-as.
+        return send_file(
+            str(mp4_path),
+            mimetype="video/mp4",
+            as_attachment=False,
+            download_name=mp4_path.name,
+            conditional=True,  # enable range requests
+        )
+
     # ── Auto-update (v0.2.11+) ─────────────────────────────────────────
     #
     # User pediu no v0.2.10 testing: "Não daria pra fazer isto
