@@ -797,6 +797,37 @@ def create_app(
         except Exception as e:
             log.warning("/demos/%s/roster — name lookup failed (non-fatal): %s", sha, e)
 
+        # Sprint v5.7.18 (Mathieu 09/05/2026 round 3, 2ª reportagem 6v4):
+        # "veja que ainda está 6v4, não mudou no print". Fix v5.7.14 (last
+        # kill wins) só funcionava se TODOS players matavam pós-halftime.
+        # Para HLTV pro demos onde 1+ players têm 0 kills no 2º half,
+        # team ficava no 1º half side → 6v4 ao invés de 5v5.
+        #
+        # Ground truth fix: query parse_ticks(["team_num"]) num tick TARDE
+        # da demo (último round). team_num lá reflete side ATUAL (post-
+        # halftime), independente de quem matou quem. Override stats[sid].team
+        # com isso quando disponível.
+        try:
+            from demoparser2 import DemoParser as _DP
+            dp2 = _DP(str(path))
+            # Pega último tick conhecido — usa max kill tick como proxy do
+            # endgame (último round). Round structure não é garantido em
+            # demoparser2 sem helper, mas all_kills é cronológico.
+            last_tick = max((getattr(k, "tick", 0) or 0) for k in parsed.all_kills) if parsed.all_kills else 0
+            if last_tick > 0:
+                team_df = dp2.parse_ticks(["team_num"], ticks=[last_tick])
+                rows = team_df.iterrows() if hasattr(team_df, "iterrows") else []
+                for _, r in rows:
+                    rsid = str(r.get("steamid", "")).strip()
+                    tnum = r.get("team_num", None)
+                    if rsid in stats and tnum in (2, 3):
+                        # Override — ground truth wins sobre kill-derived
+                        stats[rsid]["team"] = int(tnum)
+                log.info("/demos/%s/roster — team_num override aplicado @ tick=%d", sha, last_tick)
+        except Exception as e:
+            # Non-fatal — fallback fica no kill-derived team.
+            log.warning("/demos/%s/roster — team_num override falhou (non-fatal): %s", sha, e)
+
         # Sort by kills desc (top fragger first — usuário comum vai querer
         # renderizar pro player). Cap at 10 (CS2 5v5).
         roster = sorted(stats.values(), key=lambda p: -p["kills"])[:12]

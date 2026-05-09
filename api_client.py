@@ -533,6 +533,15 @@ def _build_request_body(parsed_demo: Any, player_steamid: str) -> dict[str, Any]
             "round_num": round_num,
             "user_won": bool(getattr(state, "user_won", False)),
             "user_team": getattr(state, "user_team", None),
+            # Sprint v5.7.18 (Mathieu 09/05/2026 round 3 "hud fica 7x0 o
+            # tempo todo ainda"): scorer score_ct_at_round / score_t_at_round
+            # estava caindo num fallback ruim post-halftime porque winner_team
+            # NUNCA chegava na wire format — só user_won + user_team.
+            # Fallback assumia "user_won false ⇒ outro team venceu" mas pra
+            # rounds onde user não participou (Pro Demo Player Picker), user_team
+            # vem null e user_won false sem refletir realidade. Solução:
+            # mandar winner_team direto do parser. Scorer prefere essa fonte.
+            "winner_team": getattr(state, "winner_team", None),
             "bomb_planted_by": getattr(state, "bomb_planted_by", None),
             "bomb_defused_by": getattr(state, "bomb_defused_by", None),
         })

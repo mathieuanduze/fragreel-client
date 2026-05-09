@@ -71,7 +71,13 @@ log = logging.getLogger("fragreel.local_matches_store")
 #               highlight (computed acumulado pré-round). Editor HUD
 #               agora mostra placar correto AT THAT round em vez de
 #               match.score final repetido em todos.
-MATCH_DOC_SCHEMA_VERSION = "v5"
+#   v6 (09/05): + v5.7.18 — winner_team agora chega na wire format
+#               (api_client.rounds[].winner_team). Match docs v5 escoraram
+#               com winner_team=undefined → score_ct_at_round caía no
+#               fallback "user_won false ⇒ outro time venceu" que falha
+#               pra rounds sem user kill (Pro Demo Picker). Re-score com
+#               v6 popula score_ct_at_round CORRETO em todos rounds.
+MATCH_DOC_SCHEMA_VERSION = "v6"
 
 
 # ── Storage path ──────────────────────────────────────────────────────────────

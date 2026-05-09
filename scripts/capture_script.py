@@ -235,15 +235,26 @@ parser não expõe inventário do CT defusando. Com kit a animação dura 5s
 — sobre-captura no caso com kit é OK (5s extras de 'antes do botão D')."""
 
 V2_DEFUSE_PRE_BUFFER_S = 1.0
-V2_DEFUSE_POST_BUFFER_S = 9.0
-"""Sprint v5.7.15 (Mathieu 09/05/2026 4ª reportagem): "o defuse não foi
-até o final, segue cortando". Bumped 5.0 → 9.0s.
-Anterior: 2.5 (Fase 1.34) → 5.0 (Fase 1.34) → 9.0 (v5.7.15).
-Coordenado com editor REACTION_PAD_DEFUSE_SEC = 8.5s. Source CAPTURE
-deve ser >= scene render duration, senão cluster .mov termina antes
-do scene end → freeze frame final.
-9.0s source > 8.5s scene = 0.5s safety. Cobre defuse completion
-+ "Bomba defusada" notif (~3s) + safety drift cluster timing."""
+V2_DEFUSE_POST_BUFFER_S = 13.0
+"""Sprint v5.7.18 (Mathieu 09/05/2026 5ª reportagem): "fiz defuse SEM
+defuser, dura mais do que quando vc defusa com o defuser". Anterior 9s
+não cobria defuse-no-kit (10s anim) + "Bomba defusada" notif (~3s).
+Bumped 9.0 → 13.0s.
+
+História:
+  Anterior: 2.5 (Fase 1.34) → 5.0 (Fase 1.34) → 9.0 (v5.7.15) → 13.0 (v5.7.18)
+
+Cálculo v5.7.18:
+  - Defuse no-kit anim: 10s (worst case, V2_DEFUSE_ANIM_NOKIT_S)
+  - "Bomba defusada" notif red bar: ~3s readable
+  - Action timestamp = quando D apertado, então buffer começa no início da anim
+  - Total: ~13s pra terminar anim + notif sem corte
+  - Coordenado com editor REACTION_PAD_DEFUSE_SEC = 12.0s
+  - 13.0s source > 12.0s scene = 1s safety pra drift de timing cluster
+
+Tradeoff: defuse-com-kit (5s anim) sobre-captura 8s "extras" mas fica
+em freeze frame curto no fim — preferível a corte no defuse no-kit
+(que é o caso reportado pelo Mathieu)."""
 
 V2_BOMB_KILL_MERGE_GAP_S = 5.0
 """Se a janela do cluster termina dentro deste gap do início da janela do
