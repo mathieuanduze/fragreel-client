@@ -261,7 +261,33 @@ schema sem coordinated bump:
 | 2026-05-08 v5.7 | REACTION_PAD_DEFUSE 6.0s | (mantido 5.0s) | — | — | "defuse cortado" round 2 |
 | 2026-05-08 v5.7.13 | REACTION_PAD_DEFUSE 8.5s | (mantido 5.0s) | v0.7.1 orphan attribution | v4 | "defuse cortado" round 3 |
 | 2026-05-09 v5.7.15 | REACTION_PAD_DEFUSE 8.5s | **V2_DEFUSE_POST_BUFFER 9.0s** | v0.7.2 score_at_round | v5 | "defuse cortado" round 4 + score 7x0 + qualidade |
+| 2026-05-09 v5.7.18 | **REACTION_PAD_DEFUSE 12.0s** + **Remotion CRF 23 + slow** | **V2_DEFUSE_POST_BUFFER 13.0s** | (winner_team na wire format) | v6 | defuse no-kit (5ª iteração) + roster 6v4 (3ª) + 7x0 (2ª) + 200MB |
 
 **Lição da tabela**: bump SÓ um lado é band-aid. Bump COORDINATED resolve.
 Quando Mathieu reportar mesmo bug N vezes, suspeita de coordenação não
 aplicada.
+
+---
+
+### 8. Filesize 200MB+ (gastei 4 versões fixando o lado errado)
+
+**Sintomas**: reels saindo 70-90-200MB. Eu fiz tweaks repetidos em
+`hlae_runner.py concat_movs_to_mp4` (CRF 23 → 22 + preset slow + 128k
+audio) acreditando que era o encode final. Bug persistiu até v0.6.62.
+
+**Root cause** (v5.7.18 descoberto): pipeline tem 2 caminhos:
+  - `render_remotion()` → output_mp4 = FINAL no caminho normal
+  - `concat_movs_to_mp4()` → output_mp4 só roda no fallback degraded
+    (Remotion failure)
+
+Eu estava ajustando o fallback. O encode normal vinha do
+`remotion.config.ts setCrf(18)` (~quase lossless = 11 Mbps avg = 200MB).
+
+**Fix**: bumpar Remotion CRF 18 → 23 + setX264Preset("slow") em
+`editor/remotion.config.ts`. Settings em hlae_runner viram only-degraded.
+
+**Aprendizado** (escala rule_fix_both_branches em direção paralela):
+ANTES de tweakar setting de encoding, **trace o caller chain do
+output_mp4 path**. `grep "output_mp4" caller.py | head` em 30 segundos
+teria evitado 4 tags de release. Heurística: quando bug "já fixei mas
+ainda existe" → suspeita que fix não foi no caminho ativo.
