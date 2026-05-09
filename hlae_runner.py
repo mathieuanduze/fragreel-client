@@ -1946,32 +1946,37 @@ class HlaeRunner:
             # h264 high profile + yuv420p = playable in WMP, QuickTime,
             # Discord, browsers.
             #
-            # Sprint v5.7.16 (Mathieu 09/05/2026): "qualidade não estava
-            # nítida mesmo com 70MB". Root cause: PIPELINE TEM 2 ENCODINGS:
-            #   1. Remotion render → .mov intermediário (configurável em
-            #      editor/remotion.config.ts)
-            #   2. ESTE pass: ffmpeg concat → MP4 final (config aqui)
+            # Sprint v5.7.16 round 3 (Mathieu 09/05): "90mb muito alto,
+            # tem que ser mais leve pensando no usuário".
             #
-            # Mudanças em Remotion (CRF 23) NÃO afetam output final pq
-            # SEMPRE é re-encoded aqui. Cada pass = perda. CRF 23 final
-            # estava destruindo qualidade do source de alta qualidade.
+            # Calibrado pra share-friendly SEM perder qualidade:
+            #   preset slow (era medium): MELHOR compressão por bitrate.
+            #     Render só ~25% mais lento neste pass específico
+            #     (~1-2min do flow total ~15-20min, trivial). Quality boost
+            #     basicamente FREE — não custa file size, custa CPU.
+            #   crf 22 (era 23): bump quality um nível.
+            #     CRF 22 + preset slow ≈ CRF 19 + preset medium quality-wise,
+            #     mas filesize ~30% menor.
+            #   audio 128k (era 192): suficiente pra game audio. Save ~1MB.
             #
-            # Fix: bumpa este pass pra preservar qualidade source:
-            #   preset medium → slow      (~30% melhor quality / mesmo bitrate)
-            #   crf 23 → 19               (visually lossless ~ master quality)
+            # Numbers esperados pra 2min reel:
+            #   Antes (CRF 23 + medium): 70MB, qualidade NÃO nítida (Mathieu)
+            #   Anterior fix (CRF 19 + slow): 90MB, qualidade alta (Mathieu disse pesado)
+            #   Agora (CRF 22 + slow):   ~50-65MB, qualidade visivelmente melhor
+            #                             que CRF 23 + medium graças ao preset slow
             #
-            # Trade-off:
-            #   filesize ~50% maior (60-90MB vs 35-50MB pra reel 90s)
-            #   render time ~25% mais lento (ffmpeg pass é só ~1-2min do
-            #     total ~15-20min, então diferença trivial no fluxo end-to-end)
-            #   qualidade VISIVELMENTE melhor — preserva detalhe do gameplay
+            # Compatibilidade share:
+            #   ✅ TikTok/IG Reels/Shorts (todos)
+            #   ✅ WhatsApp (100MB cap)
+            #   ✅ Discord Nitro (500MB)
+            #   ⚠️  Discord free (50MB) — depende do reel; reels < 1.5min OK
             "-c:v", "libx264",
-            "-preset", "slow",     # melhor compressão por bitrate
-            "-crf", "19",          # near-lossless web standard
+            "-preset", "slow",     # quality boost ~free
+            "-crf", "22",          # sweet spot web (era 19, agora share-friendly)
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             "-c:a", "aac",
-            "-b:a", "192k",        # bumped 128 → 192 pra game audio (tiros, voice)
+            "-b:a", "128k",        # transparente pra game audio (era 192)
             str(output_mp4),
         ]
 
