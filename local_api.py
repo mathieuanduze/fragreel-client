@@ -620,6 +620,84 @@ def create_app(
             log.error("/demos/%s/score — failed: %s", sha, e, exc_info=True)
             return {"error": "score_failed", "detail": str(e)}, 500
 
+    @app.post("/demos/import")
+    def demos_import():
+        """Sprint v5.7.13 (Mathieu 09/05/2026 — "tento importar demo
+        nova - network_error"). Web /upload modal POSTa multipart/form-data
+        com o .dem aqui. Endpoint salva em pasta demo_dirs[0] (primary
+        scan dir) pra que aparecer automático em /demos no próximo scan.
+
+        Antes (v0.6.55-): endpoint não existia → web XHR retornava
+        404 / network_error → user ficava sem ação clara.
+
+        Body: multipart/form-data com field "file" (.dem)
+        Returns: {ok, filename, path, size_bytes, target_dir}
+        """
+        if "file" not in request.files:
+            return {"error": "missing_file_field"}, 400
+        file = request.files["file"]
+        if not file or not file.filename:
+            return {"error": "empty_file"}, 400
+
+        # Validate extension
+        if not file.filename.lower().endswith(".dem"):
+            return {
+                "error": "invalid_extension",
+                "detail": "Only .dem files accepted",
+            }, 415
+
+        # Pasta target = primeiro demo_dir scaneado (geralmente
+        # csgo/replays/). Demo importada vai aparecer junto das
+        # demos próprias. Se demo_dirs vazio (raro), cria fallback
+        # em %APPDATA%/FragReel/inbox/
+        if demo_dirs:
+            target_dir = demo_dirs[0]
+        else:
+            from local_matches_store import _matches_dir
+            target_dir = _matches_dir().parent / "inbox"
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # Sanitize filename — strip path components
+        safe_name = Path(file.filename).name
+        # Avoid clobber: se já existe, adicionar timestamp suffix
+        target = target_dir / safe_name
+        if target.exists():
+            stem = target.stem
+            suffix = target.suffix
+            ts = int(time.time())
+            target = target_dir / f"{stem}_imported_{ts}{suffix}"
+
+        try:
+            file.save(str(target))
+            size = target.stat().st_size
+            log.info(
+                "/demos/import — saved %s (%d bytes) to %s",
+                safe_name, size, target,
+            )
+        except Exception as e:
+            log.error("/demos/import — save failed: %s", e, exc_info=True)
+            return {"error": "save_failed", "detail": str(e)}, 500
+
+        # Trigger scan ASAP — user vai re-checar /demos logo
+        # após o upload pra ver o card aparecer.
+        try:
+            from scanner import scan_all
+            new_matches = scan_all(demo_dirs, steamid)
+            with state_lock:
+                state["matches"] = new_matches
+                state["scan_done"] = True
+            log.info("/demos/import — re-scanned, %d matches", len(new_matches))
+        except Exception as e:
+            log.warning("/demos/import — re-scan failed (non-fatal): %s", e)
+
+        return jsonify({
+            "ok": True,
+            "filename": target.name,
+            "path": str(target),
+            "size_bytes": size,
+            "target_dir": str(target_dir),
+        })
+
     @app.get("/demos/<sha>/roster")
     def demo_roster(sha: str):
         """Sprint #5 — Pro Demo Render Phase A.
