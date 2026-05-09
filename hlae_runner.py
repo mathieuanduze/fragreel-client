@@ -1945,19 +1945,33 @@ class HlaeRunner:
             "-i", str(list_file),
             # h264 high profile + yuv420p = playable in WMP, QuickTime,
             # Discord, browsers.
-            # Fase 1.11 (Mathieu reportou MP4 final 180MB): CRF 18 + preset fast
-            # produzia bitrate ~16Mbps em 1080p → 180MB pra reel de 90s. Reels/
-            # TikTok comprimem agressivamente upload → CRF 23 + preset medium
-            # gera ~3Mbps (~35MB pra 90s) sem perda visual perceptível depois
-            # do re-encode da plataforma. Sweet spot entre tamanho compartilhável
-            # (Discord 25MB free / 50MB Nitro / WhatsApp 100MB) e qualidade.
+            #
+            # Sprint v5.7.16 (Mathieu 09/05/2026): "qualidade não estava
+            # nítida mesmo com 70MB". Root cause: PIPELINE TEM 2 ENCODINGS:
+            #   1. Remotion render → .mov intermediário (configurável em
+            #      editor/remotion.config.ts)
+            #   2. ESTE pass: ffmpeg concat → MP4 final (config aqui)
+            #
+            # Mudanças em Remotion (CRF 23) NÃO afetam output final pq
+            # SEMPRE é re-encoded aqui. Cada pass = perda. CRF 23 final
+            # estava destruindo qualidade do source de alta qualidade.
+            #
+            # Fix: bumpa este pass pra preservar qualidade source:
+            #   preset medium → slow      (~30% melhor quality / mesmo bitrate)
+            #   crf 23 → 19               (visually lossless ~ master quality)
+            #
+            # Trade-off:
+            #   filesize ~50% maior (60-90MB vs 35-50MB pra reel 90s)
+            #   render time ~25% mais lento (ffmpeg pass é só ~1-2min do
+            #     total ~15-20min, então diferença trivial no fluxo end-to-end)
+            #   qualidade VISIVELMENTE melhor — preserva detalhe do gameplay
             "-c:v", "libx264",
-            "-preset", "medium",   # era "fast" — medium dá ~30% melhor compressão
-            "-crf", "23",          # era 18 — 23 é "high quality" web standard
+            "-preset", "slow",     # melhor compressão por bitrate
+            "-crf", "19",          # near-lossless web standard
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             "-c:a", "aac",
-            "-b:a", "128k",        # era 192k — 128k AAC é transparente pra game audio
+            "-b:a", "192k",        # bumped 128 → 192 pra game audio (tiros, voice)
             str(output_mp4),
         ]
 
