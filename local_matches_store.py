@@ -67,7 +67,11 @@ log = logging.getLogger("fragreel.local_matches_store")
 #               v3 podem ter bomb_action=null em rounds onde user defusou
 #               mas parser falhou attribution — re-score com v0.7.1 vai
 #               populate corretamente.
-MATCH_DOC_SCHEMA_VERSION = "v4"
+#   v5 (09/05): + v0.7.2 scorer score_ct_at_round / score_t_at_round per
+#               highlight (computed acumulado pré-round). Editor HUD
+#               agora mostra placar correto AT THAT round em vez de
+#               match.score final repetido em todos.
+MATCH_DOC_SCHEMA_VERSION = "v5"
 
 
 # ── Storage path ──────────────────────────────────────────────────────────────

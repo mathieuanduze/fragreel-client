@@ -235,11 +235,15 @@ parser não expõe inventário do CT defusando. Com kit a animação dura 5s
 — sobre-captura no caso com kit é OK (5s extras de 'antes do botão D')."""
 
 V2_DEFUSE_PRE_BUFFER_S = 1.0
-V2_DEFUSE_POST_BUFFER_S = 5.0
-"""Round 4c Fase 1.34 — bumped 2.5 → 5.0s. Mathieu reportou: "Defuse animation
-começa mas NÃO termina, 'Bomba defusada' notification não aparece". 2.5s
-era curto pra cobrir defuse completion + "Bomba defusada" red→green
-notification (~3s readable). 5s dá margem confortável."""
+V2_DEFUSE_POST_BUFFER_S = 9.0
+"""Sprint v5.7.15 (Mathieu 09/05/2026 4ª reportagem): "o defuse não foi
+até o final, segue cortando". Bumped 5.0 → 9.0s.
+Anterior: 2.5 (Fase 1.34) → 5.0 (Fase 1.34) → 9.0 (v5.7.15).
+Coordenado com editor REACTION_PAD_DEFUSE_SEC = 8.5s. Source CAPTURE
+deve ser >= scene render duration, senão cluster .mov termina antes
+do scene end → freeze frame final.
+9.0s source > 8.5s scene = 0.5s safety. Cobre defuse completion
++ "Bomba defusada" notif (~3s) + safety drift cluster timing."""
 
 V2_BOMB_KILL_MERGE_GAP_S = 5.0
 """Se a janela do cluster termina dentro deste gap do início da janela do
