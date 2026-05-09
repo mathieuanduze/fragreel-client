@@ -61,7 +61,13 @@ log = logging.getLogger("fragreel.local_matches_store")
 #               agora populated diretamente, não só via roster lookup);
 #               + v0.7.0 scorer bomb_action_timestamp 2-tier fallback
 #               (campo agora populated em rounds com bomb_event sem steamid)
-MATCH_DOC_SCHEMA_VERSION = "v3"
+#   v4 (09/05): + v0.7.1 scorer orphan bomb attribution heuristic
+#               (defuse/plant_won detection quando state.bomb_*_by vazio,
+#               via fallback "user side + won + orphan event"). Match docs
+#               v3 podem ter bomb_action=null em rounds onde user defusou
+#               mas parser falhou attribution — re-score com v0.7.1 vai
+#               populate corretamente.
+MATCH_DOC_SCHEMA_VERSION = "v4"
 
 
 # ── Storage path ──────────────────────────────────────────────────────────────
