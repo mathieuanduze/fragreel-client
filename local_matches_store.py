@@ -77,7 +77,14 @@ log = logging.getLogger("fragreel.local_matches_store")
 #               fallback "user_won false ⇒ outro time venceu" que falha
 #               pra rounds sem user kill (Pro Demo Picker). Re-score com
 #               v6 popula score_ct_at_round CORRETO em todos rounds.
-MATCH_DOC_SCHEMA_VERSION = "v6"
+#   v7 (10/05): + v5.7.18 round 4 (Mathieu 6ª iteração defuse + 3ª 7×0):
+#               v6 ainda deixava 7×0 stuck pra HLTV pro demos onde
+#               _parse_round_winners falhava em metade dos round_end
+#               events (winner=null pra rounds T-side). Scorer agora
+#               deriva winner_team_inferred de last-kill por round +
+#               bomb_events fallback (cobre ~95% rounds mesmo se parser
+#               não conseguir). Force re-score via schema bump.
+MATCH_DOC_SCHEMA_VERSION = "v7"
 
 
 # ── Storage path ──────────────────────────────────────────────────────────────
