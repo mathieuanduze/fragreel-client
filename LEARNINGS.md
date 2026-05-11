@@ -262,6 +262,7 @@ schema sem coordinated bump:
 | 2026-05-08 v5.7.13 | REACTION_PAD_DEFUSE 8.5s | (mantido 5.0s) | v0.7.1 orphan attribution | v4 | "defuse cortado" round 3 |
 | 2026-05-09 v5.7.15 | REACTION_PAD_DEFUSE 8.5s | **V2_DEFUSE_POST_BUFFER 9.0s** | v0.7.2 score_at_round | v5 | "defuse cortado" round 4 + score 7x0 + qualidade |
 | 2026-05-09 v5.7.18 | **REACTION_PAD_DEFUSE 12.0s** + **Remotion CRF 23 + slow** | **V2_DEFUSE_POST_BUFFER 13.0s** | (winner_team na wire format) | v6 | defuse no-kit (5ª iteração) + roster 6v4 (3ª) + 7x0 (2ª) + 200MB |
+| 2026-05-11 v5.7.18 r7 | (revert REACTION 12.0) | (revert 13.0) + **V2_BOMB_KILL_MERGE_GAP 30.0s** | v0.7.4-event-based-bomb-action | v10 | defuse 9ª iter (cluster split) + HUD score 9ª iter (dataclass field missing) |
 
 **Lição da tabela**: bump SÓ um lado é band-aid. Bump COORDINATED resolve.
 Quando Mathieu reportar mesmo bug N vezes, suspeita de coordenação não
@@ -291,3 +292,72 @@ ANTES de tweakar setting de encoding, **trace o caller chain do
 output_mp4 path**. `grep "output_mp4" caller.py | head` em 30 segundos
 teria evitado 4 tags de release. Heurística: quando bug "já fixei mas
 ainda existe" → suspeita que fix não foi no caminho ativo.
+
+---
+
+### 9. Dataclass field missing — silently strips JSON data (HUD score 9 iterações)
+
+**Sintomas**: Server scorer retornava `score_ct_at_round`/`score_t_at_round`
+nos highlights desde v0.7.2. Editor HUD mostrava 7×0 stuck. 7 iterações
+fixaram lados errados (scorer fallbacks, schema bumps, wire format).
+
+**Root cause** (descoberto via `/debug/diagnose-defuse-score` endpoint):
+`api_client._build_match_doc` chamava `getattr(h, "score_ct_at_round", None)`
+mas `h: HighlightFromApi` dataclass **não tinha esses atributos definidos**.
+`_parse_highlights` criava `HighlightFromApi(rank=..., ...)` ignorando
+campos unknown do JSON (Python dataclass default behavior). Resultado:
+- JSON do scorer: `score_ct_at_round: 5` ✓
+- Após `_parse_highlights`: atributo não existe no objeto Python
+- `getattr(h, "X", None)` → None silently
+- match_doc salvo com null → editor fallback pro match.score final
+- User vê "7×0 stuck" em todos highlights
+
+**Fix** (3 pontos sincronizados):
+1. `HighlightFromApi` dataclass — adiciona `score_ct_at_round: Optional[int] = None`
+2. `_parse_highlights` — extrai `h.get("score_ct_at_round")` no construtor
+3. `_build_match_doc` — `getattr` funciona agora (atributo existe)
+
+**Aprendizado** (anti-pattern repetido 3× na mesma sessão):
+Quando `getattr(obj, "field", None)` ou `obj.get("field")` retorna None
+**consistentemente** apesar de você "ter certeza" que field tá no source:
+1. ANTES de fix outro lugar: `print(type(obj))` + `print(dir(obj))` em 1 linha
+2. Dataclass + JSON parsing + Python dynamic attrs = combo clássico de silent strip
+3. JSON `**dict` pode parecer que passa tudo, mas dataclass `cls(**kwargs)`
+   só aceita parâmetros declarados. `dataclass(frozen=False)` silently ignora extra kwargs
+4. Diagnostic endpoint que dumpa AS-SAVED bytes vale mais que 7 iterações de speculation
+
+---
+
+### 10. Cluster v2 MERGE_GAP muito apertado (defuse cut 9 iterações)
+
+**Sintomas**: Defuse anim "cortando no meio" apesar de capture buffer
++ editor reaction pad já estarem em 13s/12s. 6 iterações bumpando
+valores não resolveram.
+
+**Root cause** (descoberto via diag mostrando `last_kill=2019.67` vs
+`bomb_complete=2051.47` = gap 18s):
+
+Cluster v2 algorithm em `capture_script.py` decide entre MERGE (1 take
+contínuo) vs SEPARATE (2 takes concatenados pós-capture) baseado em
+`V2_BOMB_KILL_MERGE_GAP_S`. Default era 5s. Mathieu's spec original:
+"kill 'logo antes' do defuse → merge". Interpretation original tomou
+"logo antes" literalmente como < 5s.
+
+Mas em real gameplay: player kills enemy → walks to bomb site → starts
+defuse. Walk pode levar 10-20s. Kill aos 0:20 + defuse complete 0:50
+ainda é "logo antes" do POV do user.
+
+Com 5s gap: 2 .movs separados → concat 34s mas representa 52s de demo
+time → editor calc desync (assume tempo contíguo) → freeze frame OU
+HUD overlay errado OU defuse parece "cortar".
+
+**Fix**: `V2_BOMB_KILL_MERGE_GAP_S 5 → 30s`. Cluster merge em janela
+contínua. Editor calc bate sourceDur (real .mov) = demo time relativa
+(scene end).
+
+**Aprendizado** (re-interpretation de spec):
+User spec literal ≠ user intent. Quando bug persiste em edge case que
+parece "raro mas válido", revisita o threshold original com **dados de
+campo concreto** (não imagined scenario). Bump conservador (5→30) é OK
+quando trade-off é "capturar 20s extras de walk" vs "defuse não renderiza
+corretamente".
