@@ -84,7 +84,15 @@ log = logging.getLogger("fragreel.local_matches_store")
 #               deriva winner_team_inferred de last-kill por round +
 #               bomb_events fallback (cobre ~95% rounds mesmo se parser
 #               não conseguir). Force re-score via schema bump.
-MATCH_DOC_SCHEMA_VERSION = "v7"
+#   v8 (11/05): + v5.7.18 round 5 (Mathieu 7ª iteração defuse):
+#               bomb_action ficava null para Pro Demo Player Picker
+#               quando picked player não foi o defuser (state.bomb_defused_by
+#               estava vazio OU outro player) → editor caía pro 2s default
+#               reaction pad → defuse cortava 2s pós-completion. Scorer
+#               agora deriva bomb_action por EVENT (any bomb_defused in
+#               round → "defuse"), não por player attribution. Tag oficial
+#               disso é v0.7.4-event-based-bomb-action no scorer.
+MATCH_DOC_SCHEMA_VERSION = "v8"
 
 
 # ── Storage path ──────────────────────────────────────────────────────────────

@@ -235,25 +235,22 @@ parser não expõe inventário do CT defusando. Com kit a animação dura 5s
 — sobre-captura no caso com kit é OK (5s extras de 'antes do botão D')."""
 
 V2_DEFUSE_PRE_BUFFER_S = 1.0
-V2_DEFUSE_POST_BUFFER_S = 15.0
-"""Sprint v5.7.18 round 4 (Mathieu 10/05/2026 6ª reportagem): "seguimos
-sem bomb defuse completo". 13s não foi suficiente (talvez bomb_action_tick
-não bate exatamente com defuse_complete, ou notif "Bomba defusada"
-fica readable >3s). Bumped 13 → 15s.
+V2_DEFUSE_POST_BUFFER_S = 13.0
+"""Sprint v5.7.18 round 5 (Mathieu 11/05): revert 15→13s. Round 4 (10/05)
+tinha bumped 13→15s achando que precisa mais cobertura, mas root cause
+real era bomb_action vindo null no Pro Demo Picker → editor usava 2s
+default reaction. Fixed no scorer (v0.7.4-event-based-bomb-action) —
+agora 13s capture > 12s scene = 1s safety é suficiente.
 
 História completa:
-  2.5 (Fase 1.34) → 5.0 (Fase 1.34) → 9.0 (v5.7.15) → 13.0 (v5.7.18) → 15.0 (round 4)
+  2.5 → 5.0 → 9.0 → 13.0 (v5.7.18 round 3) → 15.0 (round 4 band-aid) → 13.0 (round 5 revert)
 
-Cálculo:
+Cálculo certo:
   - 10s anim no-kit (worst case)
-  - 4s notif "Bomba defusada" (CS2 red bar dura mais do que parecia)
-  - 1s safety pra drift de timing entre bomb_event tick e visual completion
-  - Total: 15s
-  - Coordenado com editor REACTION_PAD_DEFUSE_SEC = 14.0s (1s safety)
-
-Tradeoff: defuse-com-kit (5s anim) sobre-captura 10s "extras" mas
-fica em freeze frame curto. Mathieu pediu repetidamente — defuse
-COMPLETO é hard rule (rule_user_feedback_is_universal_spec)."""
+  - 2s notif "Bomba defusada"  (readable + pequena cauda)
+  - 1s safety
+  - Total: 13s capture
+  - Editor scene termina 12s pós-completion → 1s buffer extra OK"""
 
 V2_BOMB_KILL_MERGE_GAP_S = 5.0
 """Se a janela do cluster termina dentro deste gap do início da janela do
