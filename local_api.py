@@ -866,6 +866,84 @@ def create_app(
             return {"error": "not_found", "match_id": match_id}, 404
         return jsonify(match_doc)
 
+    @app.get("/debug/diagnose-defuse-score")
+    def debug_diagnose():
+        """Sprint v5.7.18 round 6 (Mathieu 11/05): iteração 7+ defuse cortado +
+        score 7×0 stuck. Stop guessing — endpoint diagnóstico dumpa os campos
+        EXATOS pra Mathieu copiar+colar no chat e Claude ver o que tá errado.
+
+        Returns JSON com:
+          - schema_version do cache
+          - per-highlight: round_num, bomb_action, bomb_action_timestamp,
+            score_ct_at_round, score_t_at_round, kills count
+          - resumo de rounds: count com winner_team set, count null,
+            count com bomb_defused event, count com bomb_planted
+
+        Usage:
+          GET http://127.0.0.1:5775/debug/diagnose-defuse-score?match_id=XXX
+          OU sem match_id → usa o mais recente
+        """
+        import os as _os
+        try:
+            from local_matches_store import load_match, list_matches, MATCH_DOC_SCHEMA_VERSION, _matches_dir
+        except ImportError:
+            return {"error": "local_matches_store_unavailable"}, 500
+
+        match_id = request.args.get("match_id", "").strip()
+        if not match_id:
+            # Pega o mais recente
+            try:
+                summaries = list_matches()
+                if not summaries:
+                    return {"error": "no_matches_local"}, 404
+                match_id = summaries[0].get("id", "")
+            except Exception as e:
+                return {"error": "list_matches_failed", "detail": str(e)}, 500
+
+        # Lê RAW do disco sem validation pra ver schema também em mismatch
+        match_path = _matches_dir() / f"{match_id}.json"
+        if not match_path.exists():
+            return {"error": "match_not_found", "match_id": match_id}, 404
+
+        try:
+            import json as _json
+            raw_doc = _json.loads(match_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            return {"error": "read_failed", "detail": str(e)}, 500
+
+        cached_schema = raw_doc.get("_schema_version", "MISSING")
+        highlights = raw_doc.get("highlights", []) or []
+
+        # Per-highlight diag
+        hl_diag = []
+        for h in highlights:
+            hl_diag.append({
+                "rank": h.get("rank"),
+                "round_num": h.get("round_num"),
+                "bomb_action": h.get("bomb_action"),
+                "bomb_action_timestamp": h.get("bomb_action_timestamp"),
+                "score_ct_at_round": h.get("score_ct_at_round"),
+                "score_t_at_round": h.get("score_t_at_round"),
+                "n_kills": len(h.get("kills") or []),
+                "label": h.get("label"),
+            })
+
+        return jsonify({
+            "match_id": match_id,
+            "expected_schema": MATCH_DOC_SCHEMA_VERSION,
+            "cached_schema": cached_schema,
+            "schema_match": cached_schema == MATCH_DOC_SCHEMA_VERSION,
+            "match_score": raw_doc.get("score"),
+            "map_name": raw_doc.get("map"),
+            "n_highlights": len(highlights),
+            "highlights": hl_diag,
+            "_help": (
+                "schema_match=false → cache stale, abre demos page pra re-score. "
+                "bomb_action=null em highlight de defuse → scorer não detectou. "
+                "score_ct_at_round=7 stuck em todos → scorer/parser perdeu rounds T-won."
+            ),
+        })
+
     @app.get("/matches")
     def list_matches_endpoint():
         """Lista summary de todos matches locais (sorted desc por mtime)."""
