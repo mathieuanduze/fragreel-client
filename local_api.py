@@ -917,15 +917,33 @@ def create_app(
         # Per-highlight diag
         hl_diag = []
         for h in highlights:
+            kills = h.get("kills") or []
+            # Kill times pra ver se algum kill é DEPOIS do bomb_action_timestamp
+            # (que faria bombIsClosing=false no editor → reaction default 2s).
+            kill_times = [k.get("time") for k in kills if k.get("time") is not None]
+            bomb_ts = h.get("bomb_action_timestamp")
+            last_kill_t = max(kill_times) if kill_times else None
+            kill_after_bomb = (
+                last_kill_t is not None and bomb_ts is not None and last_kill_t > bomb_ts
+            )
             hl_diag.append({
                 "rank": h.get("rank"),
                 "round_num": h.get("round_num"),
                 "bomb_action": h.get("bomb_action"),
-                "bomb_action_timestamp": h.get("bomb_action_timestamp"),
+                "bomb_action_timestamp": bomb_ts,
                 "score_ct_at_round": h.get("score_ct_at_round"),
                 "score_t_at_round": h.get("score_t_at_round"),
-                "n_kills": len(h.get("kills") or []),
+                "n_kills": len(kills),
                 "label": h.get("label"),
+                # Sprint v5.7.18 round 6 — extras pro diag de defuse cut
+                "highlight_start": h.get("start"),
+                "highlight_end": h.get("end"),
+                "last_kill_time": last_kill_t,
+                "kill_after_bomb": kill_after_bomb,  # se true → bombIsClosing=false
+                "bomb_duration_window": (
+                    round(bomb_ts - h.get("start", 0), 2)
+                    if bomb_ts is not None and h.get("start") is not None else None
+                ),
             })
 
         return jsonify({

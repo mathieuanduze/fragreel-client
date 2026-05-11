@@ -475,6 +475,15 @@ def _build_match_doc(
                 "bomb_action_timestamp": getattr(h, "bomb_action_timestamp", None),
                 # Sprint #6.2.1 — plant tick independente de quem plantou
                 "bomb_planted_timestamp": getattr(h, "bomb_planted_timestamp", None),
+                # Sprint v5.7.18 round 6 (Mathieu diag 11/05): scorer
+                # retornava score_ct_at_round/score_t_at_round mas
+                # _build_match_doc NÃO copiava pro dict → match_doc salvo
+                # tinha null → editor HUD fallback pro split do match.score
+                # (final "11-5" repetido em todos highlights) → "7×0 stuck"
+                # virou "11-5 stuck" mas user reportou como 7×0 por aproximação
+                # visual (números fixos). Fix: copy explícito.
+                "score_ct_at_round": getattr(h, "score_ct_at_round", None),
+                "score_t_at_round": getattr(h, "score_t_at_round", None),
             }
             for h in highlights
         ],
