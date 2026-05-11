@@ -92,7 +92,14 @@ log = logging.getLogger("fragreel.local_matches_store")
 #               agora deriva bomb_action por EVENT (any bomb_defused in
 #               round → "defuse"), não por player attribution. Tag oficial
 #               disso é v0.7.4-event-based-bomb-action no scorer.
-MATCH_DOC_SCHEMA_VERSION = "v8"
+#   v9 (11/05): + v5.7.18 round 6 (Mathieu diag-driven 8ª iteração):
+#               score_ct_at_round / score_t_at_round chegavam do scorer
+#               mas api_client._build_match_doc NÃO copiava pro dict da
+#               highlight → match_doc salvo com null → editor HUD usava
+#               fallback de match.score (sempre o final, ex "11-5" stuck).
+#               Match docs v8 têm null nesses fields → re-score com v9
+#               popula corretamente.
+MATCH_DOC_SCHEMA_VERSION = "v9"
 
 
 # ── Storage path ──────────────────────────────────────────────────────────────
