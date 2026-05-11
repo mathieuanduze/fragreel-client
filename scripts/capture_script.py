@@ -252,11 +252,30 @@ Cálculo certo:
   - Total: 13s capture
   - Editor scene termina 12s pós-completion → 1s buffer extra OK"""
 
-V2_BOMB_KILL_MERGE_GAP_S = 5.0
+V2_BOMB_KILL_MERGE_GAP_S = 30.0
 """Se a janela do cluster termina dentro deste gap do início da janela do
 plant/defuse, MERGE em janela contínua. Caso contrário, mantém sub-window
-separada (Remotion edita o cut). Mathieu pediu (25/04): kill 'logo antes'
-do defuse → merge; kill longe (gap > 5s) → separa."""
+separada (Remotion edita o cut).
+
+Sprint v5.7.18 round 7 (Mathieu diag 11/05/2026 9ª iteração):
+Bumped 5 → 30s. Diag mostrou Round 15 defuse com kill at 2019.67 e
+defuse_complete at 2051.47 (gap = 18s entre kill_cluster_end + bomb_window_start).
+Com gap=5s, cluster NÃO merge → 2 .movs concatenados → mov real é só
+~34s (kills 10s + bomb 24s, mas gap 16s NÃO capturado). Editor calc usa
+demo-time contiguo (não sabe do gap) → scene end calc 49.5s mas mov só
+34s → freeze frame OU scene timing desync OU defuse parece "cortar".
+
+Bumpar pra 30s força MERGE em casos comuns:
+  - Player kills enemy → walks to bomb (~10-20s) → defuse → merge
+  - Total window capturada: kill_pre + kill + walk + defuse + post
+  - Sem concat boundary → sem desync visual → sem freeze
+
+Trade-off: captura 15-20s extras quando kill foi longe da defuse (idle
+walk). Disk/render cost trivial vs UX broken.
+
+Mathieu original spec (25/04): "kill 'logo antes' do defuse → merge".
+Interpretation refinada (11/05): "logo antes" inclui walk pra bomb =
+até 30s de gap é "logo antes" do user POV."""
 
 V2_TRADE_DIRECT_MAX_GAP_S = 3.0
 """Window pra considerar 'trade direto' (refrag imediato após teammate

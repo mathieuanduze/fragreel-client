@@ -110,6 +110,16 @@ class HighlightFromApi:
     bomb_action_timestamp: Optional[float] = None
     # Sprint #6.2.1 — plant tick INDEPENDENTE de quem plantou
     bomb_planted_timestamp: Optional[float] = None
+    # Sprint v5.7.18 round 7 (Mathieu diag-driven 9ª iteração — finalmente):
+    # Server scorer retorna esses fields desde v0.7.2 MAS dataclass abaixo
+    # não tinha os atributos → _parse_highlights descartava silenciosamente
+    # (h.get retorna o valor mas HighlightFromApi() ignora kwargs unknown
+    # → atributo simplesmente não existe no objeto) → _build_match_doc
+    # getattr(h, "score_ct_at_round", None) sempre None → match_doc null.
+    # Round 6 fix tentou ler atributo inexistente. Round 7 ADICIONA o
+    # atributo no dataclass + extrai em _parse_highlights.
+    score_ct_at_round: Optional[int] = None
+    score_t_at_round: Optional[int] = None
 
 
 def score_via_api(
@@ -622,6 +632,9 @@ def _parse_highlights(raw: list[dict[str, Any]]) -> list[HighlightFromApi]:
             bomb_action_timestamp=h.get("bomb_action_timestamp"),
             # Sprint #6.2.1 — plant tick independente
             bomb_planted_timestamp=h.get("bomb_planted_timestamp"),
+            # Sprint v5.7.18 round 7 — score per round
+            score_ct_at_round=h.get("score_ct_at_round"),
+            score_t_at_round=h.get("score_t_at_round"),
         )
         for h in raw
     ]

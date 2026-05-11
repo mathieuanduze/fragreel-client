@@ -99,7 +99,15 @@ log = logging.getLogger("fragreel.local_matches_store")
 #               fallback de match.score (sempre o final, ex "11-5" stuck).
 #               Match docs v8 têm null nesses fields → re-score com v9
 #               popula corretamente.
-MATCH_DOC_SCHEMA_VERSION = "v9"
+#   v10 (11/05): + v5.7.18 round 7 (Mathieu 9ª iteração — finalmente raiz):
+#                round 6 fix tentou ler atributo `.score_ct_at_round` MAS
+#                HighlightFromApi dataclass não tinha esse atributo → dado
+#                do scorer era silenciosamente descartado em _parse_highlights
+#                → getattr() sempre retornava None → match_doc null persistia.
+#                Round 7 ADICIONA score_ct_at_round/score_t_at_round no
+#                dataclass + extrai em _parse_highlights. Match docs v9
+#                ainda têm null → re-score com v10 finalmente popula.
+MATCH_DOC_SCHEMA_VERSION = "v10"
 
 
 # ── Storage path ──────────────────────────────────────────────────────────────
