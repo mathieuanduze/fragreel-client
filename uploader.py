@@ -51,7 +51,16 @@ _CROSS_CHECK_ENABLED = os.environ.get("FRAGREEL_API_CROSS_CHECK", "").lower() in
 # em ~/.fragreel/matches/ (servido por local_api /matches/{id}).
 # Default OFF inicialmente (rollout gradual). User opt-in via env var,
 # ou default ON em v0.5.x quando estável.
-_USE_API_ENABLED = os.environ.get("FRAGREEL_USE_API", "").lower() in ("1", "true", "yes")
+# Sprint v5.7.18 round 8 (Mathieu 11/05/2026): Railway trial credits 50%
+# consumed warning. Diag: Sprint I.5 moveu scoring pro local MAS deixou
+# default em Railway (FRAGREEL_USE_API="" → falsy). Users com .exe não
+# setam env var → todo upload ainda hit Railway → trial credit drain.
+#
+# Fix: flipar default → "1" (local path). Quem ainda quer Railway upload
+# (regressão / debug) seta FRAGREEL_USE_API=0 explicitamente.
+# Railway service segue rodando como fallback (uploader linha 322) caso
+# Sprint I.5 path falhe, mas caminho FELIZ agora não toca em Railway.
+_USE_API_ENABLED = os.environ.get("FRAGREEL_USE_API", "1").lower() in ("1", "true", "yes")
 
 MAX_RETRIES = 3
 RETRY_BACKOFF = 5  # segundos entre tentativas
